@@ -944,14 +944,7 @@ async fn insert_run_owned_runner_attempt(
     .execute(&mut **tx)
     .await
     .map_err(persistence)?;
-    insert_model_request_context_event_with_expiry(
-        tx,
-        attempt,
-        ModelRequestEventStage::Accepted,
-        None,
-        None,
-    )
-    .await
+    insert_model_request_context_event(tx, attempt, ModelRequestEventStage::Accepted, None).await
 }
 
 /// Hash covers terminal meaning and full/partial response bytes. It excludes

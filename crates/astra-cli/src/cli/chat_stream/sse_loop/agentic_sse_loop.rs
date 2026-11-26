@@ -82,7 +82,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
 }
 
 pub(crate) struct StreamResultBuild<'a> {
-    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
+    pub(crate) turn_diagnostics: Option<astra_services::session_journal::JournalEvent>,
     pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) session_id: Option<String>,
@@ -109,7 +109,6 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) context_ms: Option<u64>,
     pub(crate) memoria_ms: Option<u64>,
     pub(crate) routing_domain_hint: Option<String>,
-    pub(crate) entity_learn_skipped_no_domain: bool,
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
     pub(crate) llm_rounds: Option<u32>,
@@ -210,7 +209,7 @@ pub(crate) fn stream_interruption_notice(result: &StreamResult) -> Option<String
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     let StreamResultBuild {
-        turn_evaluation,
+        turn_diagnostics,
         qualified_usage,
         tool_health_entries,
         session_id,
@@ -236,7 +235,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         context_ms,
         memoria_ms,
         routing_domain_hint,
-        entity_learn_skipped_no_domain,
         pending_context_assembly_trace,
         turn_observability_events,
         llm_rounds,
@@ -323,7 +321,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     };
 
     StreamResult {
-        turn_evaluation,
+        turn_diagnostics,
         qualified_usage,
         session_id,
         run_id,
@@ -352,7 +350,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         context_ms,
         memoria_ms,
         routing_domain_hint,
-        entity_learn_skipped_no_domain,
         pending_context_assembly_trace,
         turn_observability_events,
         llm_rounds,
@@ -402,7 +399,7 @@ mod tests {
 
     fn make_build_ctx<'a>(tool_health: &'a ToolHealthTracker) -> StreamResultBuild<'a> {
         StreamResultBuild {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             tool_health_entries: &[],
             session_id: Some("sess-1".into()),
@@ -428,7 +425,6 @@ mod tests {
             context_ms: Some(100),
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,

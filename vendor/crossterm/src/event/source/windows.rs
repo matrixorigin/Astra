@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use super::InputBatch;
 use crossterm_winapi::{Console, Handle, InputRecord};
 
 use crate::event::{
@@ -13,11 +14,12 @@ use crate::event::{
     source::EventSource,
     sys::windows::parse::{handle_key_event, handle_mouse_event},
     timeout::PollTimeout,
-    InternalEvent,
+    InternalEvent, TimedEvent,
 };
 
 pub(crate) struct WindowsEventSource {
     console: Console,
+    batch: InputBatch,
     poll: WinApiPoll,
     surrogate_buffer: Option<u16>,
     mouse_buttons_pressed: MouseButtonsPressed,
@@ -28,6 +30,7 @@ impl WindowsEventSource {
         let console = Console::from(Handle::current_in_handle()?);
         Ok(WindowsEventSource {
             console,
+            batch: InputBatch::default(),
 
             #[cfg(not(feature = "event-stream"))]
             poll: WinApiPoll::new(),
@@ -41,14 +44,16 @@ impl WindowsEventSource {
 }
 
 impl EventSource for WindowsEventSource {
-    fn try_read(&mut self, timeout: Option<Duration>) -> std::io::Result<Option<InternalEvent>> {
+    fn try_read(&mut self, timeout: Option<Duration>) -> std::io::Result<Option<TimedEvent>> {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
             if let Some(event_ready) = self.poll.poll(poll_timeout.leftover())? {
                 let number = self.console.number_of_console_input_events()?;
                 if event_ready && number != 0 {
-                    let event = match self.console.read_single_input_event()? {
+                    let record = self.console.read_single_input_event()?;
+                    let received_at = self.batch.consume(1, || number as usize - 1);
+                    let event = match record {
                         InputRecord::KeyEvent(record) => {
                             handle_key_event(record, &mut self.surrogate_buffer)
                         }
@@ -82,7 +87,10 @@ impl EventSource for WindowsEventSource {
                     };
 
                     if let Some(event) = event {
-                        return Ok(Some(InternalEvent::Event(event)));
+                        return Ok(Some(TimedEvent {
+                            event: InternalEvent::Event(event),
+                            received_at,
+                        }));
                     }
                 }
             }

@@ -31,6 +31,15 @@ The tool result quality firewall evaluates tool outputs before they become model
 | Freshness | stale cache, old sync watermark, outdated provider state. |
 | Confidence | tool succeeded but semantic confidence is low. |
 
+## Command outcome and completion
+
+A nonzero shell exit is an observed result with an exit code and output.
+Reflection shows the settled Run status and unresolved or blocked tool
+outcomes. The tool result carries the exit evidence the model can use to
+continue. Explicit verification requires affirmative evidence for the check.
+Recovery guidance preserves uncertainty when the executor cannot confirm
+an exit status.
+
 ## Result envelope
 
 Tool results should be normalized into an envelope:

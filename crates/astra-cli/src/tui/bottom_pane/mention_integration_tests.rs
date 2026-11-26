@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{BottomPane, BottomPaneAction};
 use crate::tui::mention_menu::provider::{FileEntry, FileKind, FileProvider, StaticFileProvider};
+use crate::tui::testing::keys::type_into as type_string;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -27,12 +28,6 @@ fn fresh() -> BottomPane {
         ],
     )));
     bp
-}
-
-fn type_string(bp: &mut BottomPane, s: &str) {
-    for c in s.chars() {
-        let _ = bp.handle_key(key(c));
-    }
 }
 
 #[derive(Debug, Default)]

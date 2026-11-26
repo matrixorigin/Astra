@@ -688,59 +688,13 @@ fn model_request_terminal_fact(terminal: &InferenceInvocationTerminal) -> ModelR
     }
 }
 
+// The caller has inserted or terminalized an unexpired started attempt in the
+// current transaction. Retention only expires settled invocation/attempt pairs.
 async fn insert_model_request_context_event(
     connection: &mut sqlx::MySqlConnection,
     attempt: &InferenceProviderAttemptPlan,
     stage: ModelRequestEventStage,
     terminal: Option<&InferenceInvocationTerminal>,
-) -> ServiceResult<()> {
-    let context_expired_at = sqlx::query(
-        "SELECT context_expired_at
-         FROM inference_provider_attempts
-         WHERE user_id = ? AND attempt_id = ?
-         FOR UPDATE",
-    )
-    .bind(&attempt.user_id)
-    .bind(&attempt.attempt_id)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "lock inference provider attempt for model request context",
-            error,
-        )
-    })?
-    .ok_or_else(|| {
-        ServiceError::conflict(format!(
-            "inference provider attempt {} is unavailable for model request context",
-            attempt.attempt_id
-        ))
-    })?
-    .try_get::<Option<chrono::NaiveDateTime>, _>("context_expired_at")
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "decode inference provider attempt context expiry",
-            error,
-        )
-    })?;
-    insert_model_request_context_event_with_expiry(
-        connection,
-        attempt,
-        stage,
-        terminal,
-        context_expired_at,
-    )
-    .await
-}
-
-async fn insert_model_request_context_event_with_expiry(
-    connection: &mut sqlx::MySqlConnection,
-    attempt: &InferenceProviderAttemptPlan,
-    stage: ModelRequestEventStage,
-    terminal: Option<&InferenceInvocationTerminal>,
-    context_expired_at: Option<chrono::NaiveDateTime>,
 ) -> ServiceResult<()> {
     let fact = match (stage, terminal) {
         (ModelRequestEventStage::Accepted, None) => None,
@@ -776,76 +730,74 @@ async fn insert_model_request_context_event_with_expiry(
         .model_family
         .as_deref()
         .unwrap_or("unspecified");
-    if context_expired_at.is_none() {
-        let session_id = attempt.invocation_input.scope.session_id();
-        let run_id = attempt.invocation_input.scope.run_id();
-        let usage_present = usage.is_some();
-        let insert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
-          event_stage, terminal_status, topology, provider, model_family, purpose,
-          input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-          event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-            [
-                session_id.is_some(),
-                run_id.is_some(),
-                terminal_status.is_some(),
-                usage_present,
-                usage_present,
-                usage_present,
-                usage_present,
-            ],
-        );
-        sqlx::query(insert_sql)
-            .bind(event_id)
-            .bind(&attempt.user_id)
-            .bind(&attempt.attempt_id)
-            .bind(&attempt.invocation_id)
-            .bind(session_id)
-            .bind(run_id)
-            .bind(stage.as_str())
-            .bind(terminal_status)
-            .bind(attempt.request_context.topology.as_str())
-            .bind(&attempt.invocation_input.provider)
-            .bind(model_family)
-            .bind(attempt.invocation_input.purpose.as_str())
-            .bind(checked_optional_i64(
-                usage.map(ModelRequestUsage::total_input_tokens),
-                "model request input_tokens",
-            )?)
-            .bind(checked_optional_i64(
-                usage.map(|usage| usage.output_tokens),
-                "model request output_tokens",
-            )?)
-            .bind(checked_optional_i64(
-                usage.map(|usage| usage.input.cache_read_tokens),
-                "model request cache_read_tokens",
-            )?)
-            .bind(checked_optional_i64(
-                usage.map(|usage| usage.input.cache_creation_tokens),
-                "model request cache_creation_tokens",
-            )?)
-            .bind(event_json)
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "insert model request context event",
-                    error,
-                )
-            })?;
-        let session_id = match &attempt.invocation_input.scope {
-            InferenceInvocationScope::Run { session_id, .. }
-            | InferenceInvocationScope::Session { session_id, .. } => session_id,
-        };
-        // A normal request appends an accepted/terminal pair. Compact once at
-        // the terminal boundary; orphaned accepted rows remain covered by the
-        // existing expiry sweeper.
-        if stage == ModelRequestEventStage::Terminal {
-            compact_model_request_context_scope(connection, &attempt.user_id, session_id).await?;
-        }
+    let session_id = attempt.invocation_input.scope.session_id();
+    let run_id = attempt.invocation_input.scope.run_id();
+    let usage_present = usage.is_some();
+    let insert_sql = matrixone_statement_with_null_shape(
+        "INSERT INTO model_request_context_events
+     (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
+      event_stage, terminal_status, topology, provider, model_family, purpose,
+      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+      event_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        [
+            session_id.is_some(),
+            run_id.is_some(),
+            terminal_status.is_some(),
+            usage_present,
+            usage_present,
+            usage_present,
+            usage_present,
+        ],
+    );
+    sqlx::query(insert_sql)
+        .bind(event_id)
+        .bind(&attempt.user_id)
+        .bind(&attempt.attempt_id)
+        .bind(&attempt.invocation_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(stage.as_str())
+        .bind(terminal_status)
+        .bind(attempt.request_context.topology.as_str())
+        .bind(&attempt.invocation_input.provider)
+        .bind(model_family)
+        .bind(attempt.invocation_input.purpose.as_str())
+        .bind(checked_optional_i64(
+            usage.map(ModelRequestUsage::total_input_tokens),
+            "model request input_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.output_tokens),
+            "model request output_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.input.cache_read_tokens),
+            "model request cache_read_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.input.cache_creation_tokens),
+            "model request cache_creation_tokens",
+        )?)
+        .bind(event_json)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert model request context event",
+                error,
+            )
+        })?;
+    let session_id = match &attempt.invocation_input.scope {
+        InferenceInvocationScope::Run { session_id, .. }
+        | InferenceInvocationScope::Session { session_id, .. } => session_id,
+    };
+    // A normal request appends an accepted/terminal pair. Compact once at
+    // the terminal boundary; orphaned accepted rows remain covered by the
+    // existing expiry sweeper.
+    if stage == ModelRequestEventStage::Terminal {
+        compact_model_request_context_scope(connection, &attempt.user_id, session_id).await?;
     }
     // Count every terminal request, including failures with unavailable
     // usage. Token sums contain observed usage only; coverage remains in the
@@ -2234,17 +2186,8 @@ async fn insert_inference_provider_attempt_admission(
             attempt.invocation_id, attempt.attempt_id
         )));
     }
-    // This row was inserted immediately above in the same transaction, so its
-    // context-expiry fact is exactly NULL. Re-reading and locking it would add
-    // a database round trip without adding any concurrency protection.
-    insert_model_request_context_event_with_expiry(
-        connection,
-        attempt,
-        ModelRequestEventStage::Accepted,
-        None,
-        None,
-    )
-    .await
+    insert_model_request_context_event(connection, attempt, ModelRequestEventStage::Accepted, None)
+        .await
 }
 
 async fn validate_ambiguous_invocation_with_first_attempt_admission(
@@ -2997,14 +2940,10 @@ pub async fn begin_inference_provider_attempt(
     .await;
     match result {
         Ok(result) if result.rows_affected() == 1 => {
-            // The successful insert above owns this new row in the same
-            // transaction. Its expiry is NULL; locking and reading it again
-            // cannot add protection against a concurrent expiry operation.
-            if let Err(error) = insert_model_request_context_event_with_expiry(
+            if let Err(error) = insert_model_request_context_event(
                 &mut tx,
                 attempt,
                 ModelRequestEventStage::Accepted,
-                None,
                 None,
             )
             .await

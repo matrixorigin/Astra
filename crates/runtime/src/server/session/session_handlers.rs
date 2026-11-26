@@ -2177,7 +2177,7 @@ pub(crate) async fn save_session_continuation_handler(
         .map_err(session_context_http_error)
 }
 
-fn ensure_private_continuation_is_sealed(
+pub(crate) fn ensure_private_continuation_is_sealed(
     messages: &[Value],
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if messages

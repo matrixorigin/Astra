@@ -123,10 +123,11 @@ export type RunResumedEvent = {
 
 export type RunFinishedEvent = {
   type: "run_finished";
+  llm_rounds?: number;
   run_id?: string;
   owner_generation?: number;
   /** Original Server journal fact; clients must not re-evaluate partial tool events. */
-  turn_evaluation?: Record<string, unknown> | null;
+  turn_diagnostics?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
   cancellation_origin?: "user" | "runtime" | "unverified";
@@ -1414,6 +1415,7 @@ export type AgentBindingRecord = {
 };
 
 export type RunStatus = {
+  explainRequested?: boolean;
   artifactPublication?: ArtifactPublicationV1;
   runId: string;
   sessionId: string;

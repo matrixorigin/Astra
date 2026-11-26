@@ -1674,6 +1674,7 @@ pub(crate) fn handle_display_view_result(result: ViewResult, bottom_pane: &mut B
         ViewResult::InsertCommand(command) => {
             bottom_pane.start_composer_draft(&format!("{command} "));
         }
+        // History search is inline in ChatComposer and emits no ViewResult.
         _ => {}
     }
 }
@@ -3071,7 +3072,7 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
         ),
         (
             "Ctrl+R",
-            "when idle with an empty composer, restore the last user draft".into(),
+            "search input history; type to filter, repeat for older matches, Enter to insert".into(),
         ),
         (
             "Ctrl+B",

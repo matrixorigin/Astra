@@ -1,4 +1,4 @@
-use super::parser::Parser;
+use super::{parser::Parser, InputBatch};
 #[cfg(feature = "libc")]
 use std::os::unix::prelude::AsRawFd;
 use std::{io, os::unix::net::UnixStream, time::Duration};
@@ -14,7 +14,7 @@ use filedescriptor::{poll, pollfd, POLLIN};
 
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
-use crate::event::{source::EventSource, InternalEvent};
+use crate::event::{source::EventSource, InternalEvent, TimedEvent};
 use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 
 /// Holds a prototypical Waker and a receiver we can wait on when doing select().
@@ -42,6 +42,7 @@ const TTY_BUFFER_SIZE: usize = 1_024;
 
 pub(crate) struct UnixInternalEventSource {
     parser: Parser,
+    batch: InputBatch,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty: FileDesc<'static>,
     winch_signal_receiver: UnixStream,
@@ -64,6 +65,7 @@ impl UnixInternalEventSource {
     pub(crate) fn from_file_descriptor(input_fd: FileDesc<'static>) -> io::Result<Self> {
         Ok(UnixInternalEventSource {
             parser: Parser::default(),
+            batch: InputBatch::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty: input_fd,
             winch_signal_receiver: {
@@ -104,7 +106,7 @@ impl EventSource for UnixInternalEventSource {
         self.parser.set_startup_query(active);
     }
 
-    fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+    fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<TimedEvent>> {
         let timeout = PollTimeout::new(timeout);
 
         fn make_pollfd<F: AsRawFd>(fd: &F) -> pollfd {
@@ -132,7 +134,7 @@ impl EventSource for UnixInternalEventSource {
         while first_poll || timeout.leftover().map_or(true, |t| !t.is_zero()) {
             first_poll = false;
             // check if there are buffered events from the last read
-            if let Some(event) = self.parser.next() {
+            if let Some(event) = self.parser.next_timed() {
                 return Ok(Some(event));
             }
             match poll(&mut fds, self.parser.poll_timeout(timeout.leftover())) {
@@ -153,29 +155,24 @@ impl EventSource for UnixInternalEventSource {
             };
             if fds[0].revents & POLLIN != 0 {
                 loop {
-                    let read_count = match super::read_ready(&self.tty, &mut self.tty_buffer) {
-                        Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                        Ok(count) => count,
+                    match super::read_input(
+                        &self.tty,
+                        &mut self.tty_buffer,
+                        &mut self.batch,
+                        &mut self.parser,
+                    ) {
+                        Ok(()) => {}
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(error) => return Err(error),
-                    };
-                    if read_count > 0 {
-                        self.parser.advance(
-                            &self.tty_buffer[..read_count],
-                            read_count == TTY_BUFFER_SIZE,
-                        );
                     }
 
-                    if let Some(event) = self.parser.next() {
+                    if let Some(event) = self.parser.next_timed() {
                         return Ok(Some(event));
                     }
 
                     if timeout.elapsed() {
                         return Ok(None);
-                    }
-                    if read_count == 0 {
-                        break;
                     }
                 }
             }
@@ -194,9 +191,9 @@ impl EventSource for UnixInternalEventSource {
                 // it's a really long time from the mio, async-std/tokio executor, ...
                 // point of view.
                 let new_size = crate::terminal::size()?;
-                return Ok(Some(InternalEvent::Event(Event::Resize(
-                    new_size.0, new_size.1,
-                ))));
+                return Ok(Some(
+                    InternalEvent::Event(Event::Resize(new_size.0, new_size.1)).into(),
+                ));
             }
 
             #[cfg(feature = "event-stream")]

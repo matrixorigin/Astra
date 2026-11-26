@@ -937,9 +937,22 @@ impl NativeStore {
         target: &str,
         expected_generation: Option<&str>,
     ) -> Result<Credential, CredentialFailure> {
+        self.credential_with_rejected_token(target, expected_generation, None)
+            .await
+    }
+
+    /// Recover from an issuer rejection under the same generation, using a
+    /// concurrent rotation if it already replaced the rejected bearer.
+    pub async fn credential_with_rejected_token(
+        &self,
+        target: &str,
+        expected_generation: Option<&str>,
+        rejected_access_token: Option<&str>,
+    ) -> Result<Credential, CredentialFailure> {
         self.credential_with_lock_wait(
             target,
             expected_generation,
+            rejected_access_token,
             std::time::Duration::from_secs(20),
         )
         .await
@@ -949,6 +962,7 @@ impl NativeStore {
         &self,
         target: &str,
         expected_generation: Option<&str>,
+        rejected_access_token: Option<&str>,
         lock_wait: std::time::Duration,
     ) -> Result<Credential, CredentialFailure> {
         let frozen = self
@@ -971,14 +985,18 @@ impl NativeStore {
         // logout/account changes on the short global state transaction.
         // Fresh credentials need only a shared state read, not the rotation
         // lock. Pending intent still has to wait for its in-flight owner.
-        let diagnostic = if frozen.expires_at
-            <= unix_now().map_err(CredentialFailure::Unavailable)? + 60
-            || frozen.refresh_pending
-        {
-            Some(RotationDiagnostic::new(self, &frozen))
-        } else {
-            None
+        let needs_rotation = |session: &NativeSession, now: i64| {
+            session.expires_at <= now + 60
+                || rejected_access_token == Some(session.access_token.as_str())
         };
+        let diagnostic =
+            if needs_rotation(&frozen, unix_now().map_err(CredentialFailure::Unavailable)?)
+                || frozen.refresh_pending
+            {
+                Some(RotationDiagnostic::new(self, &frozen))
+            } else {
+                None
+            };
         let rotation = if let Some(diagnostic) = &diagnostic {
             let key = frozen.environment.key();
             diagnostic.record("lock", "waiting", None, None, None).await;
@@ -1027,7 +1045,7 @@ impl NativeStore {
         let now = unix_now().map_err(CredentialFailure::Unavailable)?;
         if let Some((rotation, diagnostic)) = rotation
             .zip(diagnostic)
-            .filter(|_| current.expires_at <= now + 60)
+            .filter(|_| needs_rotation(&current, now))
         {
             let client = http_client().map_err(CredentialFailure::Unavailable)?;
             let request = client
@@ -1748,6 +1766,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_fresh_token_rotates_once_under_the_existing_generation() {
+        use std::sync::atomic::Ordering;
+        let fixture = rotation_fixture("A").await;
+        let (_directory, store) = store();
+        let mut current = session("A");
+        current.environment = fixture.environment.clone();
+        let (published, _) = store.publish(current).unwrap();
+        let rejected = Some(published.access_token.as_str());
+        let generation = Some(published.generation.as_str());
+        assert_eq!(
+            store
+                .credential("astra", generation)
+                .await
+                .unwrap()
+                .access_token,
+            published.access_token,
+        );
+        fixture.release.notify_one();
+        let (first, second) = tokio::join!(
+            store.credential_with_rejected_token("astra", generation, rejected),
+            store.credential_with_rejected_token("astra", generation, rejected),
+        );
+        let rotated = first.unwrap();
+        assert_eq!(rotated.generation, published.generation);
+        assert_ne!(rotated.access_token, published.access_token);
+        assert_eq!(rotated.access_token, second.unwrap().access_token);
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn logout_during_rotation_keeps_tombstone_and_revokes_the_orphan() {
         use std::sync::atomic::Ordering;
         let fixture = rotation_fixture("A").await;
@@ -2087,7 +2135,7 @@ mod tests {
         .unwrap();
         FileExt::lock_exclusive(&lock).unwrap();
         let error = store
-            .credential_with_lock_wait("astra", None, std::time::Duration::from_millis(80))
+            .credential_with_lock_wait("astra", None, None, std::time::Duration::from_millis(80))
             .await
             .unwrap_err();
         assert_eq!(error, CredentialFailure::RefreshInProgress);

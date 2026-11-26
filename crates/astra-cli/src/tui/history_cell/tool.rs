@@ -208,6 +208,7 @@ impl ToolCell {
 
     fn bullet(&self) -> Span<'static> {
         let theme = crate::tui::theme::current();
+
         match self.status {
             // Live cells already have a two-column `█ ` gutter. Keeping this
             // span empty aligns the live title with the frozen title after
@@ -588,9 +589,8 @@ impl ToolCell {
             } else {
                 format!("Running {label} ({})", self.elapsed_str())
             };
-            let mut spans = vec![self.bullet()];
-            spans.extend(crate::tui::shimmer::shimmer_spans(&text));
-            Line::from(spans)
+            let style = crate::tui::style::status_style(crate::tui::style::StatusKind::Running);
+            Line::from(vec![self.bullet(), Span::styled(text, style)])
         } else {
             let title = if self.execution_was_rejected() {
                 format!("Did not run {label}")
@@ -1396,8 +1396,10 @@ mod tests {
 
         tool.complete("success", 42, "$ cargo test".into(), None, None);
         let frozen = tool.display_lines(80);
-        assert_eq!(frozen[0].spans[0].content.as_ref(), "● ");
-        assert_eq!(frozen[0].spans[0].content.width(), 2);
+        let marker = &frozen[0].spans[0];
+        assert_eq!(marker.content.as_ref(), "● ");
+        assert_eq!(marker.content.width(), 2);
+        assert_eq!(marker.style.fg, Some(crate::tui::theme::current().success));
     }
 
     #[test]
@@ -1406,6 +1408,12 @@ mod tests {
         let out = render(&t, 80, 3);
         assert!(out.contains("● Failed Bash · 10ms"), "{out}");
         assert!(!out.contains("● Ran Bash"), "{out}");
+        let lines = t.display_lines(80);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "● ");
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(crate::tui::theme::current().error)
+        );
     }
 
     #[test]

@@ -50,6 +50,7 @@ pub(super) enum PreSpawnFailureCode {
     RunAdmissionTimeout,
     RunAdmissionClosed,
     PreSpawnFailure,
+    SessionContextNeedsRepair,
 }
 
 impl PreSpawnFailureCode {
@@ -58,6 +59,7 @@ impl PreSpawnFailureCode {
             Self::RunAdmissionTimeout => "run_admission_timeout",
             Self::RunAdmissionClosed => "run_admission_closed",
             Self::PreSpawnFailure => "pre_spawn_failure",
+            Self::SessionContextNeedsRepair => "session_context_needs_repair",
         }
     }
 }

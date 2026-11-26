@@ -1926,22 +1926,10 @@ pub struct TelemetryState {
 
     /// Selection report from the first turn's tool surface assembly.
     pub first_selection_report: Option<ToolSelectionReport>,
-    /// Budget pressure value from the first turn.
-    pub first_budget_pressure: f64,
     /// Context assembly duration from the first turn (ms).
     pub first_context_assembly_ms: Option<u64>,
     /// Memoria retrieval duration from the first turn (ms).
     pub first_memoria_ms: Option<u64>,
-    /// Logical prompt/input size from the first LLM round: fresh input plus
-    /// cache-read and cache-creation lanes. Kept outside the bounded recent-
-    /// round ring so long turns do not lose their context-growth baseline.
-    ///
-    /// This must not use only fresh input: a cache miss can move an unchanged
-    /// prefix out of the cache-read lane without growing the actual prompt.
-    pub first_round_prompt_tokens: Option<u64>,
-    /// Largest logical prompt/input size observed in this turn. This constant-
-    /// space aggregate remains exact after older round summaries leave the ring.
-    pub max_round_prompt_tokens: Option<u64>,
     /// All skill names selected across all turns.
     pub all_selected_skills: Vec<String>,
     /// Marker that the full skill listing was initialized for the current outer turn.
@@ -2696,7 +2684,7 @@ impl LoopEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OriginalLoopExecutionFacts {
-    pub evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
+    pub evaluation_thresholds: crate::turn::runtime_policy::PolicyThresholds,
     pub loop_entry: LoopEntry,
     pub context_compression_triggered: bool,
     #[serde(
@@ -3661,7 +3649,7 @@ pub struct AgenticLoopState {
     /// Selected once for this execution; model changes resolve against this input.
     pub admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     /// Fixed for this execution, including cooperative owner handoff.
-    pub evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
+    pub evaluation_thresholds: crate::turn::runtime_policy::PolicyThresholds,
     // ── Message context ──
     pub messages: Vec<Value>,
     /// Optional append-only capture for a child run's durable transcript.
@@ -4989,22 +4977,6 @@ impl AgenticLoopState {
     /// alongside `TurnEventBuffer::record_llm_round` so the ring is
     /// populated regardless of `full_llm_capture` setting.
     pub fn push_recent_round(&mut self, summary: RecentRoundSummary) {
-        let logical_prompt_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
-            summary.prompt_tokens,
-            summary.cache_read_tokens,
-            summary.cache_creation_tokens,
-        )
-        .total_input_tokens();
-        self.telemetry
-            .first_round_prompt_tokens
-            .get_or_insert(logical_prompt_tokens);
-        self.telemetry.max_round_prompt_tokens = Some(
-            self.telemetry
-                .max_round_prompt_tokens
-                .map_or(logical_prompt_tokens, |current| {
-                    current.max(logical_prompt_tokens)
-                }),
-        );
         self.recent_rounds.push(summary);
         if self.recent_rounds.len() > RECENT_ROUNDS_RING_CAPACITY {
             let excess = self.recent_rounds.len() - RECENT_ROUNDS_RING_CAPACITY;
@@ -6014,36 +5986,6 @@ pub(crate) mod tests {
         assert!(serde_json::from_value::<ToolLedgerHandoff>(missing).is_err());
         accumulator.record_terminal(sequence, "pending", ToolLedgerResultClass::Succeeded);
         assert!(accumulator.handoff("run", 1).is_err());
-    }
-
-    #[test]
-    fn prompt_growth_telemetry_uses_logical_cache_aware_input() {
-        let mut state = make_test_loop_state();
-        let round = |round, fresh, cache_read, cache_creation| RecentRoundSummary {
-            qualified_usage: None,
-            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            turn: 1,
-            round,
-            provider: "test".to_string(),
-            model: "test-model".to_string(),
-            prompt_tokens: fresh,
-            cache_read_tokens: cache_read,
-            cache_creation_tokens: cache_creation,
-            completion_tokens: 1,
-            tool_calls_returned: 0,
-            tool_call_names: Vec::new(),
-            start_offset_ms: u64::from(round),
-            duration_ms: 1,
-            finish_reason: Some("tool_calls".to_string()),
-        };
-
-        // A cache eviction changes the cost lane but not the prompt extent:
-        // 6,524 fresh + 25,856 cached = 32,380, then 33,904 fresh.
-        state.push_recent_round(round(0, 6_524, 25_856, 0));
-        state.push_recent_round(round(1, 33_904, 0, 0));
-
-        assert_eq!(state.telemetry.first_round_prompt_tokens, Some(32_380));
-        assert_eq!(state.telemetry.max_round_prompt_tokens, Some(33_904));
     }
 
     fn receipt_test_record(

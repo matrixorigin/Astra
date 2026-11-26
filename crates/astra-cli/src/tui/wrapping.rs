@@ -39,6 +39,40 @@ use unicode_width::UnicodeWidthStr;
 
 use super::render::line_utils::push_owned_lines;
 
+/// Visit the visual parts of a logical line. The callback receives the
+/// original grapheme, the rendered part, its row, and whether it is the
+/// first part of that grapheme. Returning false stops the traversal.
+pub(crate) fn walk_data_line(
+    text: &str,
+    width: usize,
+    mut visit: impl FnMut(&str, &str, usize, bool) -> bool,
+) -> bool {
+    let width = width.max(1);
+    let mut row = 0;
+    let mut row_width = 0;
+    let mut column = 0;
+    let mut has_content = false;
+    for grapheme in text.graphemes(true) {
+        let tab_spaces = if grapheme == "\t" { 8 - column % 8 } else { 0 };
+        let parts = if tab_spaces > 0 { tab_spaces } else { 1 };
+        for index in 0..parts {
+            let part = if tab_spaces > 0 { " " } else { grapheme };
+            let cells = part.width();
+            if row_width + cells > width && has_content {
+                row += 1;
+                row_width = 0;
+            }
+            if !visit(grapheme, part, row, index == 0) {
+                return false;
+            }
+            row_width += cells;
+            column += cells;
+            has_content = true;
+        }
+    }
+    true
+}
+
 /// Wrap one logical data line without trimming spaces or splitting graphemes.
 /// Tabs use eight-column stops in the visual projection only. A row limit
 /// keeps compact previews bounded even for a single very long output line.
@@ -46,30 +80,18 @@ pub(crate) fn wrap_data_line(text: &str, width: usize, max_rows: usize) -> (Vec<
     if width == 0 || max_rows == 0 {
         return (Vec::new(), !text.is_empty());
     }
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut row_width = 0;
-    let mut column = 0;
-    for grapheme in text.graphemes(true) {
-        let tab_spaces = if grapheme == "\t" { 8 - column % 8 } else { 0 };
-        let parts = if tab_spaces > 0 { tab_spaces } else { 1 };
-        for _ in 0..parts {
-            let part = if tab_spaces > 0 { " " } else { grapheme };
-            let cells = part.width();
-            if row_width + cells > width && !row.is_empty() {
-                rows.push(std::mem::take(&mut row));
-                if rows.len() == max_rows {
-                    return (rows, true);
-                }
-                row_width = 0;
-            }
-            row.push_str(part);
-            row_width += cells;
-            column += cells;
+    let mut rows = vec![String::new()];
+    let complete = walk_data_line(text, width, |_, part, row, _| {
+        if row >= max_rows {
+            return false;
         }
-    }
-    rows.push(row);
-    (rows, false)
+        if row == rows.len() {
+            rows.push(String::new());
+        }
+        rows[row].push_str(part);
+        true
+    });
+    (rows, !complete)
 }
 
 /// Returns byte-ranges into `text` for each wrapped line, including

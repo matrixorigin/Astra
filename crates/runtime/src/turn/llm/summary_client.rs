@@ -1315,6 +1315,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_compaction_sends_only_provider_visible_history() {
+        use astra_turn_core::cloud_summary::{
+            InlineSummaryHistoryProjection, generate_inline_summary,
+        };
+        use serde_json::json;
+
+        let opening = json!({"role":"user", "content":"Inspect the deployment report"});
+        let mut marked = opening.clone();
+        astra_turn_types::mark_run_user_input(&mut marked, "test-run", true);
+        let history = [
+            marked,
+            json!({"role":"assistant", "content":"The report is available."}),
+        ];
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let app = Router::new().route("/chat/completions", post({
+            let captured = captured.clone();
+            move |axum::Json(body): axum::Json<Value>| async move {
+                *captured.lock().unwrap() = Some(body);
+                summary_provider_response(json!({
+                    "choices":[{"message":{"content":"### Primary Request\nInspect the report\n### Pending Tasks\nRead the report\n### Current Work\nLocate evidence\n### Current State\nReport found"},"finish_reason":"stop"}]
+                }))
+            }
+        }));
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let client = test_client(summary_route(&execution), 512);
+        let summary = generate_inline_summary(
+            &[],
+            &history,
+            InlineSummaryHistoryProjection::Semantic,
+            &client,
+        )
+        .await
+        .expect("accepted inline compaction response");
+        assert!(summary.contains("Report found"));
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one summary request");
+        let projected = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["content"] == opening["content"])
+            .expect("original human content");
+        assert_eq!(projected, &opening);
+        assert!(astra_turn_types::run_user_input_provenance(&history[0]).is_some());
+    }
+
+    #[tokio::test]
     async fn admitted_moonshot_protocol_suppresses_reasoning_without_guessing_model_name() {
         let app = Router::new().route("/chat/completions", post(|axum::Json(body): axum::Json<Value>| async move {
             assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));

@@ -566,8 +566,6 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<&'a mut Vec<astra_turn_types::DeferredToolActivation>>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) resume_restricted_tools: &'a [String],
-    pub(crate) latest_turn_quality_feedback:
-        Option<&'a astra_runtime::self_model::TurnQualityFeedback>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -691,6 +689,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Restored tool replay guard rebuilt from step events on resume.
     pub(crate) idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// When present, these are used instead of converting history pairs.
+    pub(crate) attached_session_cursor: Option<(
+        &'a mut astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
@@ -797,7 +799,6 @@ impl<'a> ChatTurnParams<'a> {
             tool_health_entries: &[],
             resume_restricted_tools: &[],
 
-            latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
             is_plan_subtask: false,
             plan_subtask_id: None,
@@ -835,6 +836,7 @@ impl<'a> ChatTurnParams<'a> {
             consecutive_context_window_errors: 0,
             workspace_observation_quarantine: None,
             idempotency_cache: None,
+            attached_session_cursor: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
             #[cfg(feature = "harness")]

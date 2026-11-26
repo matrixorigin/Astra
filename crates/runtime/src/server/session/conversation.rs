@@ -382,14 +382,17 @@ pub(crate) async fn read_conversation(
         if let Some(input) = decode_loaded_run_opening(&row)?
             .and_then(|opening| opening.input().map(|input| input.original_input.clone()))
         {
-            let source = server_input_source_event_id(session_id, &root.run_id);
-            openings.push(ConversationItem::Opening {
-                id: format!("input:{}:{source}", root.run_id),
-                run_id: root.run_id.clone(),
-                source_event_id: source,
-                created_at: root.created_at.clone(),
-                content: input,
-            });
+            // A background wake has an admitted opening with no human input.
+            if !input.is_empty() {
+                let source = server_input_source_event_id(session_id, &root.run_id);
+                openings.push(ConversationItem::Opening {
+                    id: format!("input:{}:{source}", root.run_id),
+                    run_id: root.run_id.clone(),
+                    source_event_id: source,
+                    created_at: root.created_at.clone(),
+                    content: input,
+                });
+            }
         } else if selected_rank == 1
             && matches!(root.status.as_str(), "running" | "waiting" | "paused")
         {

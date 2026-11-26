@@ -93,15 +93,23 @@ pub type ChatSessionCreation<'a> = futures_util::future::BoxFuture<
     Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)>,
 >;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunAttachmentMode {
+    UntilPause,
+    Follow,
+    ReconcilePause,
+}
+
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
-    /// Verify the provider's Session scope before exposing or controlling a Run.
-    /// Implementations without an authoritative scope store fail closed.
+    /// Verify the Session scope before exposing or controlling a provider Run.
+    /// New scoped controls can require an explicit Session binding.
     async fn authorize_provider_run_scope(
         &self,
         _user_id: String,
         _run_id: String,
         _owner: ProviderRunOwner,
+        _requirement: crate::session_fork_coordinator::ProviderSessionScopeRequirement,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -355,7 +363,7 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
         last_index: u32,
-        _keep_open_on_pause: bool,
+        _mode: RunAttachmentMode,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
             .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)
@@ -1367,6 +1375,8 @@ pub struct ChatRequestData {
     /// Server-derived facts from authenticated Session resolution. Never
     /// accepted from a client transport.
     pub session_admission_facts: Option<SessionAdmissionFacts>,
+    /// Expected canonical head of an explicitly restored client attachment.
+    pub attached_session_cursor: Option<astra_turn_types::SessionCursorV1>,
     pub work_binding: Option<WorkRuntimeBindingRequest>,
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
@@ -1530,9 +1540,9 @@ pub struct ChatRunRecord {
 
 #[derive(Debug)]
 pub struct ChatStreamRecord {
-    /// A durable reader confirms that it drained the observed replay window.
+    /// Highest durable position covered when the attachment finished.
     /// Dropping the sender without confirming leaves observation incomplete.
-    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<i64>>,
     pub session_id: String,
     pub run_id: String,
     /// Retained events for a settled durable run; the HTTP handler replays
@@ -6272,6 +6282,8 @@ pub enum RunAdmissionError {
     InvalidAdmission { field: &'static str },
     #[error("Session is unavailable or not owned by this tenant")]
     SessionUnavailable,
+    #[error("Session requires resume before execution")]
+    SessionInactive,
     #[error("session already has an active run")]
     SessionBusy,
     #[error("collaborator run is unavailable in the authorized session: {run_id}")]
@@ -12399,21 +12411,29 @@ const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, eve
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
-// Select positions using narrow columns before reading any payload, including
-// the latest physical run_finished. Canonical terminal receipt projections are
-// added by the reader. NULL means absent; event index zero remains valid.
-const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
+// Keep the opening and bounded status facts in one statement snapshot. Pivot
+// at most four selected rows so the opening frames are transferred only once.
+const RUN_STATUS_FACTS_SQL: &str = "WITH selected AS (
  SELECT MIN(CASE WHEN event_type='run_started' THEN event_idx END) AS started,
         MIN(CASE WHEN event_type='workspace_bound' THEN event_idx END) AS workspace,
         MIN(CASE WHEN event_type='executor_bound' THEN event_idx END) AS executor,
         MAX(CASE WHEN event_type='run_finished' THEN event_idx END) AS accounting
  FROM agent_run_events WHERE user_id=? AND run_id=?
    AND event_type IN ('run_started','workspace_bound','executor_bound','run_finished')
- ) SELECT e.payload_json,e.event_idx FROM agent_run_events e JOIN selected s
+), status_facts AS (
+ SELECT MAX(CASE WHEN e.event_idx=s.started THEN e.event_idx END) AS started_idx,
+        MAX(CASE WHEN e.event_idx=s.started THEN e.payload_json END) AS started_payload,
+        MAX(CASE WHEN e.event_idx=s.workspace THEN e.event_idx END) AS workspace_idx,
+        MAX(CASE WHEN e.event_idx=s.workspace THEN e.payload_json END) AS workspace_payload,
+        MAX(CASE WHEN e.event_idx=s.executor THEN e.event_idx END) AS executor_idx,
+        MAX(CASE WHEN e.event_idx=s.executor THEN e.payload_json END) AS executor_payload,
+        MAX(CASE WHEN e.event_idx=s.accounting THEN e.event_idx END) AS accounting_idx,
+        MAX(CASE WHEN e.event_idx=s.accounting THEN e.payload_json END) AS accounting_payload
+ FROM agent_run_events e JOIN selected s
  ON e.event_idx IN (s.started,s.workspace,s.executor,s.accounting)
  WHERE e.user_id=? AND e.run_id=?
    AND e.event_type IN ('run_started','workspace_bound','executor_bound','run_finished')
- ORDER BY e.event_idx";
+)";
 
 const RUN_OBSERVATION_EVENTS_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
@@ -14049,34 +14069,39 @@ impl DatabaseRunStateStore {
             .fetch_optional(self.pool.get())
             .await
             .map_err(|source| db_error("load_run_opening_frames", run_id, source))?;
-        row.map(|row| {
-            if row
-                .try_get::<i64, _>("opening_row_present")
-                .map_err(|source| db_error("decode_run_opening_presence", run_id, source))?
-                != 1
-            {
-                return Err(invalid_database_value_error(
-                    "decode_run_opening_frames",
-                    "agent_run_openings",
-                    "run_id",
-                    "immutable Run opening row is missing",
-                ));
-            }
-            let frames: Option<String> = row
-                .try_get("opening_frames")
-                .map_err(|source| db_error("decode_run_opening_frames", run_id, source))?;
-            let mut run = run_record_from_row(row)?;
-            run.events = decode_opening_frames(frames.as_deref()).map_err(|error| {
-                invalid_database_value_error(
-                    "decode_run_opening_frames",
-                    "agent_runs",
-                    "opening_events_json",
-                    &error,
-                )
-            })?;
-            Ok(run)
-        })
-        .transpose()
+        row.map(|row| Self::decode_run_with_opening_frames(row, run_id))
+            .transpose()
+    }
+
+    fn decode_run_with_opening_frames(
+        row: sqlx::mysql::MySqlRow,
+        run_id: &str,
+    ) -> DbStoreResult<DurableRunRecord> {
+        if row
+            .try_get::<i64, _>("opening_row_present")
+            .map_err(|source| db_error("decode_run_opening_presence", run_id, source))?
+            != 1
+        {
+            return Err(invalid_database_value_error(
+                "decode_run_opening_frames",
+                "agent_run_openings",
+                "run_id",
+                "immutable Run opening row is missing",
+            ));
+        }
+        let frames: Option<String> = row
+            .try_get("opening_frames")
+            .map_err(|source| db_error("decode_run_opening_frames", run_id, source))?;
+        let mut run = run_record_from_row(row)?;
+        run.events = decode_opening_frames(frames.as_deref()).map_err(|error| {
+            invalid_database_value_error(
+                "decode_run_opening_frames",
+                "agent_runs",
+                "opening_events_json",
+                &error,
+            )
+        })?;
+        Ok(run)
     }
 
     async fn load_run_metadata_with_columns(
@@ -15936,7 +15961,9 @@ impl DatabaseRunStateStore {
         .await
         .map(|(claim, _)| claim)
         .map_err(|error| match error {
-            RunAdmissionError::SessionUnavailable => "session is not active".to_owned(),
+            RunAdmissionError::SessionUnavailable | RunAdmissionError::SessionInactive => {
+                "session is not active".to_owned()
+            }
             RunAdmissionError::Persistence(reason) => reason,
             error => error.to_string(),
         })
@@ -16078,6 +16105,7 @@ impl DatabaseRunStateStore {
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         let independent = run_requires_independent_admission(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        use crate::storage::IndependentRunSessionAdmission;
         let session_admission = if independent {
             crate::storage::admit_independent_run_creation(
                 &mut tx,
@@ -16093,7 +16121,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
             )
             .await
-            .map(|()| Some(None))
+            .map(|()| IndependentRunSessionAdmission::Active(None))
         }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
@@ -16102,7 +16130,13 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let session_capture_override = session_admission.ok_or(RunAdmissionError::SessionBusy)?;
+        let session_capture_override = match session_admission {
+            IndependentRunSessionAdmission::Active(capture) => capture,
+            IndependentRunSessionAdmission::Busy => return Err(RunAdmissionError::SessionBusy),
+            IndependentRunSessionAdmission::Inactive => {
+                return Err(RunAdmissionError::SessionInactive);
+            }
+        };
         let provider_owner = record
             .opening
             .loaded()?
@@ -18835,7 +18869,7 @@ impl RunStateStore for DatabaseRunStateStore {
         source_key: &str,
     ) -> Result<Option<RunGuidancePreflight>, String> {
         let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, RunProjection::Control)
             .await
             .map_err(|e| e.to_string())?
         else {
@@ -20709,31 +20743,53 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunStatusSnapshot>, String> {
-        let Some(mut run) = self
-            .load_run_metadata_with_opening_frames(user_id, run_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
+        let sql = format!(
+            "{RUN_STATUS_FACTS_SQL} SELECT {AGENT_RUN_RECOVERY_COLUMNS},
+             opening_events_json AS opening_frames,
+             CAST(agent_run_openings.run_id IS NOT NULL AS SIGNED) AS opening_row_present,
+             status_facts.* FROM {AGENT_RUN_FULL_SOURCE} CROSS JOIN status_facts
+             WHERE agent_runs.user_id = ? AND agent_runs.run_id = ?"
+        );
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
-            .map_err(|source| db_error("acquire_run_status_facts", run_id, source).to_string())?;
-        let rows = sqlx::query(RUN_STATUS_FACTS_SELECT_SQL)
+            .map_err(|source| db_error("acquire_run_status", run_id, source).to_string())?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(run_id)
             .bind(user_id)
             .bind(run_id)
-            .fetch_all(connection.connection_mut())
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_optional(connection.connection_mut())
             .await
-            .map_err(|source| db_error("load_run_status_facts", run_id, source).to_string())?;
+            .map_err(|source| db_error("load_run_status", run_id, source).to_string())?;
         connection.release();
-        run.events.extend(
-            rows.iter()
-                .map(|row| decode_run_event_payload(row, run_id))
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?,
-        );
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut facts = Vec::new();
+        for (index, payload) in [
+            ("started_idx", "started_payload"),
+            ("workspace_idx", "workspace_payload"),
+            ("executor_idx", "executor_payload"),
+            ("accounting_idx", "accounting_payload"),
+        ] {
+            if let Some(payload) =
+                run_row_optional_string(&row, "decode_run_status", "agent_run_events", payload)
+                    .map_err(|error| error.to_string())?
+            {
+                let event_idx =
+                    run_row_non_negative_i64(&row, "decode_run_status", "agent_run_events", index)
+                        .map_err(|error| error.to_string())?;
+                facts.push(
+                    decode_run_event_payload_at(&payload, event_idx, run_id)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let mut run =
+            Self::decode_run_with_opening_frames(row, run_id).map_err(|error| error.to_string())?;
+        run.events.extend(facts);
         run.events.extend(
             self.canonical_terminal_projection_events(&run, &[(-1, run.last_event_idx)], false)
                 .await?,
@@ -26616,10 +26672,18 @@ fn decode_run_event_payload(
     let table = "agent_run_events";
     let payload = run_row_string(row, operation, table, "payload_json")?;
     let event_idx = run_row_non_negative_i64(row, operation, table, "event_idx")?;
-    let mut value = serde_json::from_str::<serde_json::Value>(&payload).map_err(|source| {
+    decode_run_event_payload_at(&payload, event_idx, run_id)
+}
+
+fn decode_run_event_payload_at(
+    payload: &str,
+    event_idx: i64,
+    run_id: &str,
+) -> DbStoreResult<serde_json::Value> {
+    let mut value = serde_json::from_str::<serde_json::Value>(payload).map_err(|source| {
         DatabaseRunStateStoreError::Json {
             operation: "decode_run_event_payload",
-            entity: format!("{table}.payload_json:{run_id}:{event_idx}"),
+            entity: format!("agent_run_events.payload_json:{run_id}:{event_idx}"),
             source,
         }
     })?;
@@ -28300,11 +28364,13 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 for key in [
                     "run_id",
                     "owner_generation",
-                    "turn_evaluation",
+                    "llm_rounds",
+                    "turn_diagnostics",
                     "last_request_context",
                     "status",
                     "cancellation_origin",
                     "context_not_saved",
+                    "canonical_context_cursor",
                     "outcome",
                     "finish_reason",
                     "error",
@@ -38671,6 +38737,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            llm_rounds: None,
             last_request_context: None,
             tool_ledger: None,
         };
@@ -38843,6 +38910,17 @@ mod tests {
             committed.receipt.error_kind,
             Some(astra_core::ErrorKind::Unknown)
         );
+        let status = store
+            .load_run_status_snapshot(&user, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, request.status);
+        assert_eq!(
+            status.last_event_idx,
+            committed.completion_first() + i64::from(committed.completion_count()) - 1
+        );
+        assert_eq!(status.accounting.unwrap()["error_code"], "business_failure");
         for kind in [None, Some(astra_core::ErrorKind::Network)] {
             assert!(
                 store
@@ -39107,6 +39185,13 @@ mod tests {
         assert!(
             store
                 .load_run_observation("foreign", &run_id, 4)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_run_status_snapshot("foreign", &run_id)
                 .await
                 .unwrap()
                 .is_none()
@@ -41154,6 +41239,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            llm_rounds: None,
             last_request_context: None,
             tool_ledger: None,
         };
@@ -46070,6 +46156,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             execution_authentication: None,
             session_admission_facts: None,
+            attached_session_cursor: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -46287,6 +46374,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             execution_authentication: None,
             session_admission_facts: None,
+            attached_session_cursor: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -46412,6 +46500,7 @@ mod tests {
                     session_id: None,
                     execution_authentication: None,
                     session_admission_facts: None,
+                    attached_session_cursor: None,
                     work_binding: None,
                     run_start_idempotency: None,
                     agent_id: None,

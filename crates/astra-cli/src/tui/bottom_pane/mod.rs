@@ -76,6 +76,25 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MAX_PENDING_INTENTS: usize = 64;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
+enum UnsentDraft {
+    Returned(String),
+    Parked(String),
+}
+
+impl UnsentDraft {
+    fn text(&self) -> &str {
+        match self {
+            Self::Returned(text) | Self::Parked(text) => text,
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Returned(text) | Self::Parked(text) => text,
+        }
+    }
+}
+
 enum ModelCatalogState {
     Ready(Vec<astra_services::ModelListItemResponse>),
 }
@@ -134,7 +153,7 @@ pub(crate) struct BottomPane {
     /// submissions, not guidance for the previous run.
     queued_next_turn_submissions: std::collections::VecDeque<NextTurnSubmission>,
     /// Recovery is editable input, not authority for automatic next-turn replay.
-    restored_drafts: std::collections::VecDeque<String>,
+    restored_drafts: std::collections::VecDeque<UnsentDraft>,
     applied_user_intent_ids: std::collections::HashSet<String>,
     /// Typed actions emitted while a retained projection refreshes. These are
     /// not user-input events: for example, a live agent transcript upgrades
@@ -523,6 +542,15 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
+        if self
+            .session_attachment
+            .as_ref()
+            .is_some_and(|(id, previous_epoch)| {
+                id.as_deref() != session_id || *previous_epoch != epoch
+            })
+        {
+            self.composer.cancel_history_search();
+        }
         let mut count = 0usize;
         let mut bytes = 0usize;
         let mut lost_edits = false;
@@ -766,11 +794,27 @@ impl BottomPane {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub fn handle_paste(&mut self, text: &str) {
+        self.handle_session_paste(text, &[]);
+    }
+
     /// Handle a bracketed-paste payload. Multi-line pastes get
     /// collapsed into a `[Pasted #N · M lines]` placeholder; short
     /// pastes are inserted verbatim. After the paste lands, popup
     /// state is resynced because paste can newly trigger `/`, `@`, `$`.
-    pub fn handle_paste(&mut self, text: &str) {
+    pub(crate) fn handle_session_paste(
+        &mut self,
+        text: &str,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) {
+        let now = std::time::Instant::now();
+        self.dismiss_closed_views_at(now);
+        if self.has_active_view() {
+            // The explicit paste belongs to the focused view; a parked
+            // composer's old unbracketed tail must not capture later keys.
+            self.composer.release_paste_focus_at(now);
+        }
         if self
             .active_view_mut()
             .is_some_and(|view| view.handle_paste(text))
@@ -779,6 +823,7 @@ impl BottomPane {
         }
         self.composer.handle_paste(text);
         self.sync_popups();
+        self.refresh_history_suggestions(history);
     }
 
     /// Project an intent that was accepted by the active run's control plane.
@@ -1637,7 +1682,12 @@ impl BottomPane {
         for input in inputs {
             let text = input.as_ref();
             if !text.trim().is_empty() {
-                self.restored_drafts.push_back(text.to_owned());
+                let draft = if self.composer.is_history_search_active() {
+                    UnsentDraft::Parked(text.to_owned())
+                } else {
+                    UnsentDraft::Returned(text.to_owned())
+                };
+                self.restored_drafts.push_back(draft);
             }
         }
         self.restore_next_draft();
@@ -1650,13 +1700,21 @@ impl BottomPane {
                 && !parse_submission(text).is_command()
                 && crate::cli::turn::turn_entry::shell_input_body(text).is_none()
         };
-        if self.restored_drafts.is_empty() || self.composer.paste_burst_active() {
+        if self.restored_drafts.is_empty()
+            || self.composer.paste_burst_active()
+            || self.composer.is_history_search_active()
+        {
             return false;
         }
         let mut raw = self.composer.text();
+        let had_visible_draft = !raw.is_empty();
         let mut changed = false;
-        let compatible = if raw.is_empty() {
-            raw = self.restored_drafts.pop_front().expect("nonempty drafts");
+        let compatible = if !had_visible_draft {
+            raw = self
+                .restored_drafts
+                .pop_front()
+                .expect("nonempty drafts")
+                .into_text();
             changed = true;
             conversation(&raw)
         } else {
@@ -1666,14 +1724,13 @@ impl BottomPane {
             // Keep the first fragment's composer encoding and paste placeholders.
             // Only later fragments lose their leading literal escape; they no
             // longer occupy a command boundary in the combined conversation.
-            while self
-                .restored_drafts
-                .front()
-                .is_some_and(|text| conversation(text))
-            {
+            while self.restored_drafts.front().is_some_and(|draft| {
+                (!had_visible_draft || matches!(draft, UnsentDraft::Returned(_)))
+                    && conversation(draft.text())
+            }) {
                 let next = self.restored_drafts.pop_front().expect("checked front");
                 raw.push_str("\n\n");
-                raw.push_str(parse_submission(&next).text());
+                raw.push_str(parse_submission(next.text()).text());
                 changed = true;
             }
         }
@@ -2473,7 +2530,14 @@ impl BottomPane {
     }
 
     fn pop_active_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        let view = self.view_stack.remove(self.active_view_index()?);
+        self.pop_active_view_at(std::time::Instant::now())
+    }
+
+    fn pop_active_view_at(&mut self, now: std::time::Instant) -> Option<Box<dyn BottomPaneView>> {
+        let mut view = self.view_stack.remove(self.active_view_index()?);
+        if let Some(tail) = view.pending_paste_tail_at(now) {
+            self.composer.discard_paste_tail_at(now, tail);
+        }
         if let Some(tab_id) = view.conversation_tab_id()
             && !self
                 .view_stack
@@ -2519,8 +2583,6 @@ impl BottomPane {
     }
 
     pub fn sync_popups(&mut self) {
-        let text = self.composer.text();
-
         // Suppress all popups while the user is browsing history with
         // Up/Down — otherwise a history entry starting with '/' or '@'
         // opens a menu that captures arrow keys and blocks further
@@ -2532,12 +2594,15 @@ impl BottomPane {
             return;
         }
 
+        let text = self.composer.text();
+
         // Completion owns command names, never their arguments. Otherwise
         // selecting a menu item would discard the user's remaining input.
         if !self.has_active_view()
             && is_open_for(&text, &self.slash_items)
             && !self.slash_items.is_empty()
         {
+            self.composer.dismiss_history_suggestions();
             self.close_mention();
             self.skill_popup = None;
             match self.slash_menu.as_mut() {
@@ -2555,6 +2620,7 @@ impl BottomPane {
         if !self.has_active_view() && self.file_provider.is_some() {
             let cursor = self.composer.cursor_byte();
             if let Some(token) = extract_mention_at(&text, cursor) {
+                self.composer.dismiss_history_suggestions();
                 self.slash_menu = None;
                 self.skill_popup = None;
                 self.mention_range = Some((token.at_byte, token.end_byte));
@@ -2576,6 +2642,7 @@ impl BottomPane {
             && !text.chars().any(char::is_whitespace)
             && !self.skill_items.is_empty()
         {
+            self.composer.dismiss_history_suggestions();
             self.slash_menu = None;
             self.close_mention();
             let popup = self
@@ -2883,6 +2950,17 @@ impl BottomPane {
         cell.desired_height(width)
     }
 
+    pub(crate) fn set_composer_frame_allowed(&mut self, allowed: bool) {
+        self.composer.set_frame_allowed(allowed);
+    }
+
+    pub(crate) fn history_suggestions_height(&self) -> u16 {
+        if self.has_active_view() {
+            return 0;
+        }
+        self.composer.history_suggestions_height()
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
             let mut h = view.desired_height(width);
@@ -2916,6 +2994,7 @@ impl BottomPane {
             + queue_h
             + next_turn_queue_h
             + popup_h
+            + self.history_suggestions_height()
             + 2
             + self.notice_lines(width).len() as u16
     }
@@ -2944,6 +3023,8 @@ impl BottomPane {
         let next_turn_queue = take(self.next_turn_submission_height());
         let context = take(1);
         let footer = take(1);
+        // Ordinary history suggestions yield to the queue and status rows.
+        let popup = popup + take(self.history_suggestions_height());
         let heights = [
             approval,
             queue,
@@ -2961,6 +3042,8 @@ impl BottomPane {
         })
     }
 
+    // Ctrl+R stays inside the composer; it never opens a view stack overlay.
+
     /// Top-level key routing. Dispatches to named phase handlers so
     /// each concern reads as a single paragraph:
     ///
@@ -2971,31 +3054,81 @@ impl BottomPane {
     /// 5. Popup navigation (slash / skill / mention menus)
     /// 6. Composer (text input)
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
+        self.handle_key_at(key, std::time::Instant::now())
+    }
+
+    pub(crate) fn handle_key_at(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> BottomPaneAction {
+        self.handle_session_key_at(key, now, &[])
+    }
+
+    pub(crate) fn handle_session_key_at(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> BottomPaneAction {
+        self.dismiss_closed_views_at(now);
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
-        let ordinary_char = matches!(key.code, KeyCode::Char(c)
-            if !c.is_control()
-                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let ordinary_char = super::event::is_text_key(&key);
+        let paste_control =
+            key.modifiers.is_empty() && matches!(key.code, KeyCode::Enter | KeyCode::Tab);
+        if ordinary_char {
+            self.composer.flush_paste_burst_at(now);
+            match self.composer.plain_paste_input_at(now) {
+                Some(paste_burst::GuardedInput::Discard) => return BottomPaneAction::Consumed,
+                Some(paste_burst::GuardedInput::Insert) if self.has_active_view() => {
+                    return self.route_to_composer(key, now, history);
+                }
+                None if self.has_active_view() && self.composer.release_paste_focus_at(now) => {
+                    self.sync_popups();
+                }
+                _ => {}
+            }
+        }
+        if self.has_active_view() && paste_control {
+            self.composer.flush_paste_burst_at(now);
+            if self.composer.paste_input_pending_at(now) {
+                let consumed = match key.code {
+                    KeyCode::Enter => self.composer.consume_guarded_enter_at(now),
+                    KeyCode::Tab => self.composer.consume_guarded_tab_at(now),
+                    _ => false,
+                };
+                if consumed {
+                    return BottomPaneAction::Consumed;
+                }
+            }
+        }
         let cancel = key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
         if !self.has_active_view()
             && !ordinary_char
             && !cancel
             && !chat_composer::ChatComposer::is_explicit_followup_key(key)
-            && self.composer.flush_pending_paste()
+            && self.composer.flush_pending_paste_at(now)
         {
             self.sync_popups();
+            self.refresh_history_suggestions(history);
         }
-        let action = self.handle_key_inner(key);
+        let action = self.handle_key_inner(key, now, history);
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
         action
     }
 
-    fn handle_key_inner(&mut self, key: KeyEvent) -> BottomPaneAction {
-        if let Some(a) = self.handle_ctrl_keys(key) {
+    fn handle_key_inner(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> BottomPaneAction {
+        if let Some(a) = self.handle_ctrl_keys(key, now) {
             return a;
         }
         // A slash is an explicit command-palette gesture. Let it reclaim
@@ -3009,12 +3142,20 @@ impl BottomPane {
                 .active_view()
                 .is_some_and(|view| view.slash_reclaims_focus())
         {
-            self.pop_active_view();
+            self.pop_active_view_at(now);
             self.start_composer_draft("/");
             return BottomPaneAction::Consumed;
         }
-        if let Some(a) = self.handle_active_view_key(key) {
+        if let Some(a) = self.handle_active_view_key(key, now) {
             return a;
+        }
+        if key.code == KeyCode::Char('r')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.composer.is_history_search_active()
+        {
+            self.composer.start_history_search(now, history);
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
         }
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT {
             return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
@@ -3047,7 +3188,14 @@ impl BottomPane {
         // approval can interpret Enter. The textarea consumes it atomically.
         if key.code == KeyCode::Enter
             && key.modifiers.is_empty()
-            && self.composer.consume_guarded_enter()
+            && self.composer.consume_guarded_enter_at(now)
+        {
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
+        }
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && self.composer.consume_guarded_tab_at(now)
         {
             self.sync_popups();
             return BottomPaneAction::Consumed;
@@ -3061,12 +3209,19 @@ impl BottomPane {
         // With no modal or popup owning Esc, a draft is the visible thing to
         // dismiss. Do this after popup dismissal so the first Esc closes the
         // popup and a later Esc clears the underlying composer text.
-        if key.code == KeyCode::Esc && !self.composer.is_empty() {
-            self.composer.clear_draft();
-            self.sync_popups();
+        if key.code == KeyCode::Esc
+            && !self.composer.is_empty()
+            && !self.composer.is_history_search_active()
+        {
+            // A burst hides the preview. Esc cancels the pending input,
+            // not a suggestion the user cannot see.
+            if self.composer.was_buffering_at(now) || !self.composer.dismiss_history_suggestions() {
+                self.composer.clear_draft_at(now);
+                self.sync_popups();
+            }
             return BottomPaneAction::Consumed;
         }
-        if let Some(a) = self.handle_slash_menu_key(key) {
+        if let Some(a) = self.handle_slash_menu_key(key, now) {
             return a;
         }
         if let Some(a) = self.handle_skill_popup_key(key) {
@@ -3078,10 +3233,14 @@ impl BottomPane {
         if key.code == KeyCode::BackTab {
             return BottomPaneAction::CyclePermissionMode;
         }
-        self.route_to_composer(key)
+        self.route_to_composer(key, now, history)
     }
 
-    fn handle_ctrl_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+    fn handle_ctrl_keys(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<BottomPaneAction> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+C state machine: view.on_ctrl_c → composer clear →
         // interrupt if task active → quit.
@@ -3097,15 +3256,18 @@ impl BottomPane {
                         // already report `is_complete()` after handling it.
                         let completed = view.is_complete();
                         if completed {
-                            self.pop_active_view();
+                            self.pop_active_view_at(now);
                         }
                         return Some(BottomPaneAction::Consumed);
                     }
                     CancellationEvent::Escalate => {}
                 }
             }
+            if self.composer.cancel_history_search_at(now) {
+                return Some(BottomPaneAction::Consumed);
+            }
             if !self.composer.is_empty() {
-                self.composer.clear_draft();
+                self.composer.clear_draft_at(now);
                 self.sync_popups();
                 return Some(BottomPaneAction::Consumed);
             }
@@ -3223,18 +3385,22 @@ impl BottomPane {
         }
     }
 
-    fn handle_active_view_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+    fn handle_active_view_key(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<BottomPaneAction> {
         let view = self.active_view_mut()?;
-        view.handle_key(key);
+        view.handle_key_at(key, now);
         if let Some(request) = view.take_action_request() {
             if request.disposition == ViewActionDisposition::Close {
-                self.pop_active_view();
+                self.pop_active_view_at(now);
             }
             return Some(BottomPaneAction::ViewAction(request.action));
         }
         if view.is_complete() {
             let completion = view.completion();
-            self.pop_active_view();
+            self.pop_active_view_at(now);
             return Some(match completion {
                 Some(vc) => BottomPaneAction::ViewCompleted {
                     result: vc.result,
@@ -3271,7 +3437,11 @@ impl BottomPane {
     /// Slash menu navigation. Submit keys with no matches fall through to
     /// the composer so the raw draft gets submitted as-is (avoids a
     /// silent no-op).
-    fn handle_slash_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+    fn handle_slash_menu_key(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<BottomPaneAction> {
         self.slash_menu.as_mut()?;
         match key.code {
             KeyCode::Up => {
@@ -3350,7 +3520,7 @@ impl BottomPane {
                     // Apply the same paste guard as ordinary composer queueing.
                     // A due burst can change the completion or add arguments;
                     // refresh the menu before choosing a command from it.
-                    if self.composer.handle_key(key) != ComposerAction::QueueFollowUp {
+                    if self.composer.handle_key_at(key, now) != ComposerAction::QueueFollowUp {
                         return Some(BottomPaneAction::Consumed);
                     }
                     self.sync_popups();
@@ -3436,9 +3606,19 @@ impl BottomPane {
         }
     }
 
-    fn route_to_composer(&mut self, key: KeyEvent) -> BottomPaneAction {
-        let composer_action = self.composer.handle_key(key);
+    fn route_to_composer(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> BottomPaneAction {
+        let composer_action = self.composer.handle_key_at(key, now);
+        let edited = composer_action == ComposerAction::Edited;
         let action = match composer_action {
+            ComposerAction::Recall(drafts) => {
+                self.park_drafts(drafts);
+                BottomPaneAction::Consumed
+            }
             ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
                 self.slash_menu = None;
@@ -3458,30 +3638,63 @@ impl BottomPane {
             }
             ComposerAction::Interrupt => BottomPaneAction::Interrupt,
             ComposerAction::Quit => BottomPaneAction::Quit,
-            ComposerAction::Consumed => BottomPaneAction::Consumed,
+            ComposerAction::Consumed | ComposerAction::Edited => BottomPaneAction::Consumed,
             ComposerAction::Unhandled => BottomPaneAction::Escalate(key),
         };
         self.sync_popups();
+        if edited {
+            self.refresh_history_suggestions(history);
+        }
         action
     }
 
+    fn refresh_history_suggestions(
+        &mut self,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) {
+        if !self.has_active_view()
+            && self.slash_menu.is_none()
+            && self.skill_popup.is_none()
+            && self.mention_menu.is_none()
+        {
+            self.composer.refresh_history_suggestions(history);
+        }
+    }
+
+    fn dismiss_closed_views_at(&mut self, now: std::time::Instant) -> bool {
+        let mut changed = false;
+        while self
+            .active_view()
+            .is_some_and(|view| view.is_complete() && view.completion().is_none())
+        {
+            self.pop_active_view_at(now);
+            changed = true;
+        }
+        changed
+    }
+
+    #[cfg(test)]
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
+        self.pre_draw_session_tick(now, &[])
+    }
+
+    pub(crate) fn pre_draw_session_tick(
+        &mut self,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> bool {
         let mut changed = self.approval_queue.prune_closed() > 0;
         self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
+            changed |= view.is_in_paste_burst();
             view.pre_draw_tick(now);
         }
-        let dismiss_completed_view = self
-            .active_view()
-            .is_some_and(|view| view.is_complete() && view.completion().is_none());
-        if dismiss_completed_view {
-            self.pop_active_view();
-            changed = true;
-        }
+        changed |= self.dismiss_closed_views_at(now);
         // Flush paste burst buffer when idle timeout expires.
-        if self.composer.flush_paste_burst() {
+        if self.composer.flush_paste_burst_at(now) {
             self.sync_popups();
             self.restore_next_draft();
+            self.refresh_history_suggestions(history);
             changed = true;
         }
         if self
@@ -3496,10 +3709,15 @@ impl BottomPane {
 
     /// A command/view starts another draft without discarding ongoing editing.
     pub(crate) fn start_composer_draft(&mut self, text: &str) {
-        for draft in self.composer.take_recoverable_drafts().into_iter().rev() {
-            self.restored_drafts.push_front(draft);
-        }
+        let drafts = self.composer.take_recoverable_drafts();
+        self.park_drafts(drafts);
         self.replace_composer_text(text);
+    }
+
+    fn park_drafts(&mut self, drafts: Vec<String>) {
+        for draft in drafts.into_iter().rev() {
+            self.restored_drafts.push_front(UnsentDraft::Parked(draft));
+        }
     }
 
     pub fn replace_composer_text(&mut self, text: &str) {
@@ -3516,6 +3734,7 @@ impl BottomPane {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.composer.clear_painted_history_suggestions();
         if let Some(view) = self.active_view() {
             // Stack optional footers under the view area:
             //   [view]
@@ -3576,14 +3795,17 @@ impl BottomPane {
         self.footer.render_context_bar(chunks[3], buf);
         self.composer
             .render(chunks[4], buf, self.has_pending_composer_queue());
-        if chunks[5].width > 0 && chunks[5].height > 0 {
-            if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render_composer(menu, chunks[5], buf);
-            } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[5], buf);
-            } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[5], buf);
-            }
+        if let Some(ref menu) = self.slash_menu {
+            slash_popup_render::render_composer(menu, chunks[5], buf);
+        } else if let Some(ref menu) = self.mention_menu {
+            mention_popup_render::render(menu, chunks[5], buf);
+        } else if let Some(ref popup) = self.skill_popup {
+            popup.render(chunks[5], buf);
+        } else if chunks[5].is_empty() {
+            self.composer
+                .render_compact_history_suggestion(chunks[4], buf);
+        } else {
+            self.composer.render_history_suggestions(chunks[5], buf);
         }
         self.footer.render(chunks[6], buf);
     }
@@ -3611,6 +3833,7 @@ impl BottomPane {
         }
         if let Some(next) = self.restored_drafts.front() {
             let preview: String = next
+                .text()
                 .chars()
                 .take(60)
                 .map(|ch| if ch.is_control() { ' ' } else { ch })

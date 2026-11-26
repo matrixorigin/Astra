@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{BottomPane, BottomPaneAction};
 use crate::tui::slash_menu::SlashItem;
+use crate::tui::testing::keys::type_into as type_string;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -62,12 +63,6 @@ fn ranked_items() -> Vec<SlashItem> {
         SlashItem::simple("/agent-create", "create a new agent"),
         SlashItem::simple("/exit", "exit astra"),
     ]
-}
-
-fn type_string(bp: &mut BottomPane, s: &str) {
-    for c in s.chars() {
-        let _ = bp.handle_key(key(c));
-    }
 }
 
 fn fresh() -> BottomPane {
@@ -155,6 +150,21 @@ fn esc_dismisses_menu_without_clearing_draft() {
     let _ = bp.handle_key(special(KeyCode::Esc));
     assert!(!bp.slash_menu_is_open());
     assert_eq!(bp.composer.text(), "/he", "draft preserved after Esc");
+}
+
+#[test]
+fn ctrl_k_and_ctrl_y_edit_the_draft_without_opening_the_menu() {
+    let mut bp = fresh();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    bp.composer.set_text("keep this suffix\nnext line");
+    for _ in 0.."this suffix\nnext line".chars().count() {
+        let _ = bp.handle_key(special(KeyCode::Left));
+    }
+    let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert!(!bp.slash_menu_is_open());
+    assert_eq!(bp.composer.text(), "keep \nnext line");
+    let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(bp.composer.text(), "keep this suffix\nnext line");
 }
 
 // ─── Filtering ────────────────────────────────────────────────────
@@ -315,14 +325,7 @@ fn command_arguments_and_literal_slashes_are_submitted_unchanged() {
                 if paste {
                     bp.handle_paste(text);
                 } else {
-                    for c in text.chars() {
-                        let event = if c == '\n' {
-                            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
-                        } else {
-                            key(c)
-                        };
-                        let _ = bp.handle_key(event);
-                    }
+                    type_string(&mut bp, text);
                 }
                 assert!(!bp.slash_menu_is_open(), "{text:?}, paste={paste}");
                 let submit = if followup {

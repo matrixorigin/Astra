@@ -288,6 +288,16 @@ pub(super) async fn chat_stream_handler(
         Ok(principal) => principal,
         Err((status, mut error)) => {
             mark_attempt_rejected(&mut error.0);
+            if status == StatusCode::UNAUTHORIZED {
+                if let Some(metadata) = error
+                    .0
+                    .metadata
+                    .as_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    metadata.insert("http_status".into(), serde_json::json!(401));
+                }
+            }
             return sse_error_response_from_error_with_request_id(
                 status,
                 error.0,

@@ -66,6 +66,20 @@ use crate::cli::chat_stream::edge_executor::{
 /// recovery, not an operation required to leave an active policy state.
 const PLAN_MODE_ESCAPE_HATCHES: &[&str] = &["exit_plan_mode"];
 
+fn append_deferred_tool_invocation_carrier(
+    turn_schemas: &mut Vec<Value>,
+    inject_tools: bool,
+    restricted_tools: &HashSet<String>,
+) {
+    if inject_tools
+        && !restricted_tools.contains(crate::cli::cli_config::cli_context::NO_TOOLS_POLICY_MARKER)
+    {
+        turn_schemas.push(
+            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(),
+        );
+    }
+}
+
 /// Per-phase stderr timings for `/chat/stream`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
     false
@@ -604,6 +618,18 @@ fn active_workspace_notice(
     ))
 }
 
+pub(super) fn is_runtime_reconciliation_turn(
+    message: &str,
+    semantic_query_override: Option<&str>,
+    runtime_required_texts: &[String],
+) -> bool {
+    message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
+        && semantic_query_override.is_some()
+        && runtime_required_texts
+            .iter()
+            .any(|text| !text.trim().is_empty())
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedChatTurnPayload {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -715,12 +741,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // are not treated as catalog authority.
     attach_typed_edge_skill_catalog(&mut payload, ctx.ephemeral_prefix);
 
-    if ctx.message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
-        && ctx.semantic_query_override.is_some()
-        && !runtime_required_texts.is_empty()
-        && let Some(edge_profile) = payload
-            .get_mut("edge_profile")
-            .and_then(Value::as_object_mut)
+    if is_runtime_reconciliation_turn(
+        ctx.message,
+        ctx.semantic_query_override,
+        ctx.runtime_required_texts,
+    ) && let Some(edge_profile) = payload
+        .get_mut("edge_profile")
+        .and_then(Value::as_object_mut)
     {
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN
@@ -908,11 +935,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // target is re-admitted by the shared carrier resolver before policy and
     // execution.  Keeping this one small schema stable replaces the old
     // selected-full-schema injection that churned `tools[]` across rounds.
-    if inject_tools {
-        turn_schemas.push(
-            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(),
-        );
-    }
+    append_deferred_tool_invocation_carrier(&mut turn_schemas, inject_tools, ctx.restricted_tools);
 
     // Plan mode is enforced at permission/tool preflight time, not by
     // mutating `restricted_tools` here. Keeping schema filtering out of
@@ -1274,6 +1297,10 @@ fn inject_runtime_turn_overrides(
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
+    pub(crate) attached_session_cursor: Option<(
+        &'a astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     pub server_admission_dispatched: &'a mut bool,
     pub prior_admission_ambiguous: &'a mut bool,
     pub completion_checks: Option<&'a astra_turn_types::CompletionCheckDeclarations>,
@@ -1401,6 +1428,10 @@ fn chat_turn_sse_fetch_ui(
 /// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
 struct ChatTurnPostPayloadRequest<'a> {
+    pub(crate) attached_session_cursor: Option<(
+        &'a astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     server_admission_dispatched: &'a mut bool,
     prior_admission_ambiguous: &'a mut bool,
     api: &'a astra_thin_client::ThinClient,
@@ -1472,6 +1503,7 @@ async fn chat_turn_post_payload_after_prepare(
     astra_core::ClassifiedError,
 > {
     let ChatTurnPostPayloadRequest {
+        attached_session_cursor,
         server_admission_dispatched,
         prior_admission_ambiguous,
         api,
@@ -1496,13 +1528,17 @@ async fn chat_turn_post_payload_after_prepare(
     let prepared = prepare_chat_turn_payload(prepare).await;
     validate_local_workspace_host_for_tool_surface(&executor).await?;
     let execution_time_budget = execution_time_budget_clock.map(|budget| budget.remaining());
-    let server_payload = server_loop_admission_payload_with_execution_time_budget(
+    let mut server_payload = server_loop_admission_payload_with_execution_time_budget(
         prepared.payload,
         &server_message,
         server_explain,
         execution_time_budget,
     )
     .map_err(str::to_string)?;
+    if let Some((cursor, _)) = attached_session_cursor {
+        server_payload["attached_session_cursor"] =
+            serde_json::to_value(cursor).map_err(|error| error.to_string())?;
+    }
 
     if let Some(tx) = stream_event_tx {
         let _ = tx.try_send(
@@ -1535,6 +1571,12 @@ async fn chat_turn_post_payload_after_prepare(
             if cancel_token.is_some_and(|token| token.is_cancelled()) {
                 return Err(astra_thin_client::ThinClientError::InvalidInput(
                     "turn cancelled before Server admission dispatch".into(),
+                ));
+            }
+            if attached_session_cursor.is_some_and(|(_, owner)| !owner.is_current()) {
+                return Err(astra_thin_client::ThinClientError::InvalidInput(
+                    "Server attachment account changed before dispatch; restore the session again"
+                        .into(),
                 ));
             }
             let mut payload = server_payload.clone();
@@ -1594,6 +1636,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     ctx: ChatTurnSseFetchRequest<'_>,
 ) -> Result<TurnResult, astra_core::ClassifiedError> {
     let ChatTurnSseFetchRequest {
+        attached_session_cursor,
         server_admission_dispatched,
         prior_admission_ambiguous,
         completion_checks,
@@ -1657,6 +1700,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     let (resp, prep_line, stream_json_exchange) =
         chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
+            attached_session_cursor,
             server_admission_dispatched,
             prior_admission_ambiguous,
             api,
@@ -1803,10 +1847,10 @@ pub(crate) async fn fetch_chat_turn_sse(
 #[cfg(test)]
 mod tests {
     use super::{
-        PrepareChatTurnRequest, PrepareTurnTelemetry, attach_typed_edge_skill_catalog,
-        build_retained_history_turns, chat_turn_budget_pressure, inject_runtime_turn_overrides,
-        msg_content, prepare_chat_turn_payload, retained_history_messages,
-        runtime_filter_turn_schemas_and_report,
+        PrepareChatTurnRequest, PrepareTurnTelemetry, append_deferred_tool_invocation_carrier,
+        attach_typed_edge_skill_catalog, build_retained_history_turns, chat_turn_budget_pressure,
+        inject_runtime_turn_overrides, msg_content, prepare_chat_turn_payload,
+        retained_history_messages, runtime_filter_turn_schemas_and_report,
         server_loop_admission_payload_with_execution_time_budget,
         surface_report_from_visible_schemas,
     };
@@ -1819,6 +1863,18 @@ mod tests {
         EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
         EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
+
+    #[test]
+    fn no_tools_policy_omits_the_deferred_invocation_carrier() {
+        let mut schemas = Vec::new();
+        let restricted = std::collections::HashSet::from([String::from(
+            crate::cli::cli_config::cli_context::NO_TOOLS_POLICY_MARKER,
+        )]);
+
+        append_deferred_tool_invocation_carrier(&mut schemas, true, &restricted);
+
+        assert!(schemas.is_empty());
+    }
 
     #[tokio::test]
     async fn host_preflight_uses_only_the_resolved_writer_surface() {

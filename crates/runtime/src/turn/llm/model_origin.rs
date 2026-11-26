@@ -220,6 +220,9 @@ pub(crate) fn public_summary_history(
         .iter()
         .filter_map(|message| {
             let mut public = message.clone();
+            if let Some(object) = public.as_object_mut() {
+                object.remove(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD);
+            }
             if let Some(object) = public.as_object_mut()
                 && object.get("role").and_then(Value::as_str) == Some("assistant")
             {
@@ -682,16 +685,16 @@ mod tests {
             [astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] =
             json!("private-provider-id");
         attest(&old, &mut group[0]);
-        let messages = vec![
-            json!({"role":"user","content":"work"}),
-            group[0].clone(),
-            group[1].clone(),
-        ];
+        let opening = json!({"role":"user","content":"work"});
+        let mut marked = opening.clone();
+        astra_turn_types::mark_run_user_input(&mut marked, "previous-run", true);
+        let messages = vec![marked, group[0].clone(), group[1].clone()];
         let public = public_summary_history(&messages).unwrap();
         let encoded = json!(&public).to_string();
         assert!(!encoded.contains("private-reasoning"));
         assert!(!encoded.contains("private-signature"));
         assert!(!encoded.contains("private-provider-id"));
+        assert_eq!(public[0], opening);
         assert_eq!(public[2]["content"], "found");
         assert_eq!(messages[1]["reasoning_content"], "private-reasoning");
     }

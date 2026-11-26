@@ -157,6 +157,17 @@ A model-selection or reasoning-level refusal rejects that invocation, not a
 healthy provider. Withdraw capacity only for provider readiness, transport,
 protocol, or authority failures established at their owning boundary.
 
+Built-in and provider tools share argument checks before invocation. Required
+string data can be blank if a matching schema branch declares `minLength: 0`.
+File content and replacement text use that contract. Required control strings
+remain nonblank. A rejected blank is reconsidered only if its field or array
+item declares the opt-in. Preflight checks the constraints it encounters while
+validating the submitted arguments and their enclosing schema branches. For
+numeric bounds, it reuses the range checks when both operands are stored as
+JSON integers within ±2⁵³. The usual argument checks still apply to
+previously accepted inputs, including optional blank data. Replacement
+anchors must include non-whitespace text.
+
 ### Optimizations never become authority
 
 Prompt caching, semantic read-result caching, batching, and compaction may

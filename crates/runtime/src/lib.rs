@@ -1,3 +1,6 @@
+// Server model-selection futures exceed the default layout-query depth in
+// Rust 1.97 Linux release builds; use the compiler-recommended crate budget.
+#![recursion_limit = "256"]
 // Clippy 1.94 tightened several lints; clean up incrementally rather than blocking CI.
 #![allow(unstable_name_collisions)]
 #![allow(
@@ -251,7 +254,6 @@ pub use astra_turn_core::{
     },
     tail_persist::build_turn_hook_args,
     tool_surface_subset::{plan_tool_subset_for_result_turn, resolve_preferred_tool_status},
-    turn_metrics::build_tool_result_quality_event_payload,
     view::{
         RetrievalPlan, build_recent_retrieval_tail, compose_retrieval_view,
         extract_latest_user_query, plan_retrieval_inputs,

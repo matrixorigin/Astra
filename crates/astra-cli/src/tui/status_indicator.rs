@@ -412,12 +412,17 @@ fn render_for_with_bash_hint(
                 "—".into()
             }
         };
-        let value = format!(
-            "reported input {} / output {} tok",
-            display(usage.total_input()),
-            display(usage.completion),
-        );
+        let input = display(usage.total_input());
+        let output = display(usage.completion);
+        let value = format!("reported input {input} / output {output} tok");
+        let before = used;
         append_field(&mut spans, &mut used, width, &value, dim, text_style);
+        if used == before {
+            // Keep the latest provider-reported snapshot visible on medium
+            // widths instead of dropping token telemetry altogether.
+            let compact = format!("reported in {input} / out {output} tok");
+            append_field(&mut spans, &mut used, width, &compact, dim, text_style);
+        }
     }
     if !approval_pending
         && !matches!(state, IndicatorState::AwaitingApproval { .. })
@@ -981,6 +986,26 @@ mod tests {
         );
         indicator.begin_dispatch(start);
         assert!(!text_of(&indicator.render(120).unwrap()).contains("reported input"));
+    }
+
+    #[test]
+    fn token_counter_compacts_before_dropping_reported_usage() {
+        let start = Instant::now();
+        let mut indicator = StatusIndicator::new();
+        indicator.begin_turn(start);
+        indicator.set_state(IndicatorState::Thinking { started_at: start });
+        indicator.set_reported_usage(TokenAccounting::from_fields(100, 900, 200, 20));
+        let text = text_of(
+            &indicator
+                .render_at_with_context(start + Duration::from_secs(3), 46, false, false)
+                .unwrap(),
+        );
+        assert!(text.contains("reported in 1.2k / out 20 tok"), "{text}");
+        assert!(!text.contains("reported input"), "{text}");
+        assert!(
+            text.contains("3s"),
+            "elapsed must survive compaction: {text}"
+        );
     }
 
     #[test]

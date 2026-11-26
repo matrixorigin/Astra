@@ -159,6 +159,16 @@ struct ScoredItem {
     indices: Vec<u32>,
 }
 
+pub(crate) fn fuzzy_atom(query: &str) -> Atom {
+    Atom::new(
+        query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    )
+}
+
 /// Public fuzzy-score helper: rank a single `haystack` against a user
 /// `needle`. Returns `None` if there is no match, or a score where
 /// larger = better.
@@ -183,13 +193,7 @@ pub fn score_token(needle: &str, haystack: &str) -> Option<u32> {
     }
 
     let mut matcher = Matcher::new(Config::DEFAULT);
-    let atom = Atom::new(
-        &n,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-        false,
-    );
+    let atom = fuzzy_atom(&n);
     let mut buf = Vec::new();
     let hay = Utf32Str::new(&h, &mut buf);
     atom.score(hay, &mut matcher)
@@ -203,13 +207,7 @@ fn score_one(
     item_idx: usize,
     item: &SlashItem,
 ) -> Option<ScoredItem> {
-    let atom = Atom::new(
-        token,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-        false,
-    );
+    let atom = fuzzy_atom(token);
 
     let name_lower = item.name.trim_start_matches('/').to_ascii_lowercase();
 

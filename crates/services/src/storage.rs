@@ -1318,17 +1318,21 @@ impl SessionExecutionActivity {
     }
 }
 
-/// New independent executions check occupancy in their existing owned Session
-/// read, before inserting a Run. Excluding the requested Run key permits only
-/// the unique-key replay path; a duplicate never returns a new execution grant.
-/// Return the capture override from the same locked read. The outer `None`
-/// means occupied; the inner `None` uses the runtime's default.
+pub(crate) enum IndependentRunSessionAdmission {
+    Active(Option<bool>),
+    Busy,
+    Inactive,
+}
+
+/// Check occupancy and capture options in the existing locked Session read.
+/// Excluding this Run key still permits unique-key replay without granting a
+/// duplicate execution.
 pub(crate) async fn admit_independent_run_creation<T>(
     tx: &mut T,
     session_id: &str,
     user_id: &str,
     run_id: &str,
-) -> Result<Option<Option<bool>>, sqlx::Error>
+) -> Result<IndependentRunSessionAdmission, sqlx::Error>
 where
     T: TransactionConnection,
 {
@@ -1361,11 +1365,15 @@ where
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     let status: String = row.try_get("status")?;
-    if status != "active" {
-        return Err(sqlx::Error::RowNotFound);
+    match status.as_str() {
+        "active" => {}
+        "ended" | "closed" | astra_core::STATUS_CANCELLED | astra_core::STATUS_PAUSED => {
+            return Ok(IndependentRunSessionAdmission::Inactive);
+        }
+        _ => return Err(sqlx::Error::RowNotFound),
     }
     if row.try_get::<i64, _>("execution_active")? != 0 {
-        return Ok(None);
+        return Ok(IndependentRunSessionAdmission::Busy);
     }
     let capture = match row.try_get::<Option<i64>, _>("full_llm_capture_override")? {
         None => None,
@@ -1377,7 +1385,7 @@ where
             ));
         }
     };
-    Ok(Some(capture))
+    Ok(IndependentRunSessionAdmission::Active(capture))
 }
 
 /// Read live Run owners under an existing Session fence. Old unknown tool
