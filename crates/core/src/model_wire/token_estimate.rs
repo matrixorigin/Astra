@@ -107,6 +107,9 @@ pub fn measure_message(message: &Value) -> MessageTokenEstimate {
         ..Default::default()
     };
     for (key, value) in object {
+        if canonical && key == super::RUN_USER_INPUT_PROVENANCE_FIELD {
+            continue;
+        }
         if canonical && key == super::responses::CONTINUATION_KEY {
             result.transport_metadata_bytes = json_string_bytes(value);
             if let Some(items) = value.get("items").and_then(Value::as_array) {

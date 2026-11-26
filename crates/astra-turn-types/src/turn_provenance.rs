@@ -2,6 +2,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+pub use astra_core::model_wire::RUN_USER_INPUT_PROVENANCE_FIELD;
+
+/// Canonical ownership of an admitted human message, independent of its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunUserInputProvenance<'a> {
+    pub run_id: &'a str,
+    pub opening: bool,
+}
+
+pub fn mark_run_user_input(message: &mut Value, run_id: &str, opening: bool) {
+    if !run_id.is_empty()
+        && crate::is_human_user_message(message)
+        && let Some(object) = message.as_object_mut()
+    {
+        object.insert(
+            RUN_USER_INPUT_PROVENANCE_FIELD.to_string(),
+            json!({"run_id": run_id, "opening": opening}),
+        );
+    }
+}
+
+pub fn run_user_input_provenance(message: &Value) -> Option<RunUserInputProvenance<'_>> {
+    let raw = message.get(RUN_USER_INPUT_PROVENANCE_FIELD)?;
+    if !crate::is_human_user_message(message) {
+        return None;
+    }
+    let provenance = RunUserInputProvenance::deserialize(raw).ok()?;
+    (!provenance.run_id.is_empty()).then_some(provenance)
+}
+
 pub const TURN_MESSAGE_PROVENANCE_FIELD: &str = "_astra_turn_provenance";
 pub const TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION: u8 = 1;
 

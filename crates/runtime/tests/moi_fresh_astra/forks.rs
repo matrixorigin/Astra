@@ -725,6 +725,42 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
             "REVIEW-ANSWER",
         )
         .await;
+    let intent_path = format!("/chat/runs/{run}/intents");
+    let status_path = format!(
+        "{intent_path}/scope-check?expected_session_id={}",
+        fixture.parent
+    );
+    let intent = json!({
+        "intent_id": "scope-check",
+        "delivery": "guide_current_run",
+        "input": {"content": "Provider scope check."}
+    })
+    .to_string();
+    for scope in ["moi-contract-workspace", "other-workspace"] {
+        for (method, path, route, body) in [
+            (
+                "POST",
+                &intent_path,
+                "/chat/runs/{run_id}/intents",
+                intent.as_str(),
+            ),
+            (
+                "GET",
+                &status_path,
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                "",
+            ),
+        ] {
+            let (status, error) = response(
+                &fixture.app,
+                signed_in_scope(method, path, route, body, scope),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {error}");
+            assert_eq!(error["error_code"], "session_fork_forbidden");
+        }
+    }
+
     let (cursor_status, cursor_error) = control(
         &fixture.app,
         "GET",
@@ -775,7 +811,8 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
 #[ignore = "real disposable MatrixOne; first provider chat creates a scoped session"]
 async fn provider_fork_review_scopes_new_ordinary_chat_session() {
     let fixture = ReviewFixture::new().await;
-    let mut first = fixture.moi.payload("NEW-ORDINARY-HISTORY");
+    let opening = "NEW-ORDINARY-HISTORY\n".repeat(6144);
+    let mut first = fixture.moi.payload(&opening);
     first.as_object_mut().unwrap().remove("session_id");
     let (status, body) = post(&fixture.app, "/chat/stream", &first).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -789,6 +826,42 @@ async fn provider_fork_review_scopes_new_ordinary_chat_session() {
         .find(|event| event["type"] == "session_info")
         .and_then(|event| event["session_id"].as_str())
         .expect("new session id");
+    let run_id = parsed
+        .iter()
+        .find(|event| event["type"] == "run_finished")
+        .and_then(|event| event["run_id"].as_str())
+        .expect("new Run ID");
+    let intent_path = format!("/chat/runs/{run_id}/intents");
+    let status_path = format!("{intent_path}/scope-check?expected_session_id={session_id}");
+    let submit = json!({
+        "intent_id": "scope-check",
+        "delivery": "guide_current_run",
+        "input": {"content": "Provider scope check."}
+    })
+    .to_string();
+    let (owner, other_status) = tokio::join!(
+        control(
+            &fixture.app,
+            "POST",
+            &intent_path,
+            "/chat/runs/{run_id}/intents",
+            &submit
+        ),
+        response(
+            &fixture.app,
+            signed_in_scope(
+                "GET",
+                &status_path,
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                "",
+                "other-workspace",
+            )
+        ),
+    );
+    assert_eq!(owner.0, StatusCode::CONFLICT, "{}", owner.1);
+    assert_eq!(owner.1["error_code"], "run_intent_run_terminal");
+    assert_eq!(other_status.0, StatusCode::FORBIDDEN, "{}", other_status.1);
+    assert_eq!(other_status.1["error_code"], "session_fork_forbidden");
     let mut other = fixture.moi.payload("OTHER-WORKSPACE");
     other["session_id"] = json!(session_id);
     let response = fixture

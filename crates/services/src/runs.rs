@@ -102,13 +102,14 @@ pub enum RunAttachmentMode {
 
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
-    /// Verify the provider's Session scope before exposing or controlling a Run.
-    /// Implementations without an authoritative scope store fail closed.
+    /// Verify the Session scope before exposing or controlling a provider Run.
+    /// New scoped controls can require an explicit Session binding.
     async fn authorize_provider_run_scope(
         &self,
         _user_id: String,
         _run_id: String,
         _owner: ProviderRunOwner,
+        _requirement: crate::session_fork_coordinator::ProviderSessionScopeRequirement,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -18858,7 +18859,7 @@ impl RunStateStore for DatabaseRunStateStore {
         source_key: &str,
     ) -> Result<Option<RunGuidancePreflight>, String> {
         let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, RunProjection::Control)
             .await
             .map_err(|e| e.to_string())?
         else {

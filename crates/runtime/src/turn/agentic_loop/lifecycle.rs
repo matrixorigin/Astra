@@ -6509,6 +6509,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_run_provenance_does_not_trigger_pre_turn_compaction() {
+        let history = (0..1_000)
+            .flat_map(|index| {
+                [
+                    json!({"role":"user", "content":format!("Question {index}")}),
+                    json!({"role":"assistant", "content":format!("Answer {index}")}),
+                ]
+            })
+            .chain([json!({"role":"user", "content":"Current question"})])
+            .collect::<Vec<_>>();
+        let baseline_chars = crate::turn::cloud::compaction::serialized_message_chars(&history);
+        let baseline_tokens = crate::prompts::estimate_tokens(&history, 0, 3_900);
+        for marked in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            state.max_turn_input_tokens = 64_000;
+            state.last_llm_context_manifest_trace = Some(json!({
+                "wire":{"budget":{"estimated_system_tokens":3_900}}
+            }));
+            state.record_prompt_measurement(Some(34_500));
+            state.messages = history.clone();
+            if marked {
+                for (index, pair) in state.messages.chunks_mut(2).enumerate() {
+                    astra_turn_types::mark_run_user_input(
+                        &mut pair[0],
+                        &format!("{index:064x}"),
+                        true,
+                    );
+                }
+            }
+            let original = state.messages.clone();
+            let (pressure, estimated) = estimate_context_pressure_with_measurement(&state);
+            super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+
+            prepare_turn_iteration(&mut host, &mut state, 0)
+                .await
+                .unwrap();
+
+            assert!(
+                host.compaction_events.is_empty(),
+                "ordinary history must fit before first inference (marked={marked}, pressure={pressure}, estimated={estimated})"
+            );
+            assert_eq!(
+                crate::prompts::estimate_tokens(&state.messages, 0, 3_900),
+                baseline_tokens
+            );
+            assert_eq!(
+                crate::turn::cloud::compaction::serialized_message_chars(&state.messages),
+                baseline_chars,
+                "the secondary compaction budget must use the same visible history"
+            );
+            assert_eq!(state.messages, original, "keep canonical provenance intact");
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_turn_with_low_pressure_skips_compaction() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();

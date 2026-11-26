@@ -653,6 +653,13 @@ impl AgenticRunLifecycleService {
             Some(run.run_generation),
             &facts.hooks,
         );
+        let opening_message = &run
+            .opening
+            .loaded()
+            .map_err(invalid_resume)?
+            .and_then(astra_services::runs::DurableRunOpening::input)
+            .ok_or_else(|| invalid_resume("original user input is missing"))?
+            .original_input;
         let mut state = Self::assemble_loop_state(environment, facts);
         if let Some(origins) = canonical.authorized_session_ids.as_ref() {
             host.set_private_reasoning_origins(origins.clone());
@@ -863,14 +870,7 @@ impl AgenticRunLifecycleService {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             agent_id: run.agent_id.clone(),
-            user_message: run
-                .opening
-                .loaded()
-                .unwrap()
-                .and_then(astra_services::runs::DurableRunOpening::input)
-                .ok_or_else(|| invalid_resume("original user input is missing"))?
-                .original_input
-                .clone(),
+            user_message: opening_message.clone(),
             #[cfg(feature = "e2e-hooks")]
             test_post_loop_settlement_delay_ms: 0,
             host,

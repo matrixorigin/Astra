@@ -431,6 +431,12 @@ When a current request supplies an empty `message` and a nonempty `user_intent`,
 the intent is its human prompt. Initial conversation history and the task profile
 use that same effective input. A nonempty `message` remains the prompt text.
 
+Run intent submission and status lookup accept the request-bound Provider
+authentication used by other Run control routes. Provider control requires
+the authenticated Provider and scope to match the immutable Run admission.
+The Session scope is checked separately. An unbound ordinary Session still
+requires a matching Run owner.
+
 Queued run intents use persisted event indices, including gaps, rather than
 positions within a filtered control page. A page with a missing or invalid
 durable index is rejected in full: no intent is delivered and its cursor stays
@@ -441,6 +447,34 @@ After durable acknowledgement, a guidance batch freezes semantic evidence on
 its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
+
+After guidance is applied, the normal model request projects one boundary before
+the active Run's first retained guidance. Its runtime frame identifies the
+boundary by its one-based occurrence among matching user text blocks, including
+literal copies in human inputs and blocks grouped by the provider. The runtime
+counts those occurrences using the selected wire protocol. Responses joins the
+text parts of each message into a single block. The preceding
+human input is the opening when retained. Canonical Run provenance survives
+compaction and recovery, and missing inputs use compacted context.
+
+The boundary and frame are wire-only and count toward the active request budget.
+Append-only requests place the frame after the first retained guidance. The
+first guidance extends the sent prefix, and subsequent guidance in the same
+Run keeps that projection stable. When the Run ends, the next request omits
+both blocks. This can lose exact prefix reuse at the former boundary, while
+retaining the original conversation and avoiding context growth from completed
+Runs.
+
+The model uses the canonical conversation and tool results. It can answer a
+follow-up in an interim update while continuing with tools, and honors the
+user's latest scope, replacement, or stop instruction. Guidance remains a
+human-authored message. The primary model and existing runtime settlement
+checks decide when the Run finishes.
+
+Signed provider guidance requires the Run's Session to have an authenticated
+provider scope proof or fork manifest. The control lookup reads the Session ID
+from the Run row and verifies the existing Session binding. Legacy unbound
+Sessions retain ordinary conversation and existing control behavior.
 
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The
