@@ -315,7 +315,7 @@ mod tests {
                 } else {
                     profile
                 };
-                let _config = crate::tui::testing::configure_terminal(
+                let _config = crate::test_utils::configure_terminal(
                     &mut child,
                     &format!("theme = {theme:?}"),
                 );

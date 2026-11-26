@@ -648,7 +648,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
         "background_override" => "background = \"#ffffff\"",
         _ => "",
     };
-    let _config = crate::tui::testing::configure_terminal(&mut command, settings);
+    let _config = crate::test_utils::configure_terminal(&mut command, settings);
     match case {
         "light" | "fragmented" => {
             command.env("COLORFGBG", "15;0");

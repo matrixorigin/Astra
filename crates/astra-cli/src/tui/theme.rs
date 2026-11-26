@@ -844,7 +844,7 @@ mod tests {
             if let Some(bg) = bg {
                 settings.push_str(&format!("\nbackground = {bg:?}"));
             }
-            let _config = crate::tui::testing::configure_terminal(&mut child, &settings);
+            let _config = crate::test_utils::configure_terminal(&mut child, &settings);
             if no_color {
                 child.env("NO_COLOR", "1");
             }
@@ -880,7 +880,7 @@ mod tests {
         );
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         let _config =
-            crate::tui::testing::configure_terminal(&mut command, "background = \"#ffffff\"");
+            crate::test_utils::configure_terminal(&mut command, "background = \"#ffffff\"");
         let output = command
             .args(["--exact", &test, "--nocapture"])
             .env(CASE, "1")
