@@ -28,6 +28,15 @@ pub fn budget_pressure_for_chat_turn_with_input_budget(
     effective_input_budget_tokens: u64,
 ) -> f64 {
     let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
+    budget_pressure_for_input_estimate(estimated as u64, effective_input_budget_tokens)
+}
+
+#[must_use]
+pub fn budget_pressure_for_input_estimate(
+    estimated_input_tokens: u64,
+    effective_input_budget_tokens: u64,
+) -> f64 {
+    let estimated = estimated_input_tokens.min(usize::MAX as u64) as usize;
     if effective_input_budget_tokens == 0 {
         return budget_pressure_for_estimate(estimated, &prompts::ContextBudget::default());
     }

@@ -589,6 +589,8 @@ current cursor. A committed Context advance exposes `canonical_context_cursor`
 on the Run's `run_finished` event, including replay. If an admitted Run cannot
 load its attached Context, its terminal replay retains
 `session_context_needs_repair` and the Run identity.
+For Provider `context.task_ref` retries, the expected cursor is part of the
+request identity. Changing it returns `provider_task_ref_request_mismatch`.
 
 `POST /chat` and `POST /chat/stream` own their Server execution. The request
 field `conversation_authority` is unsupported and rejected as

@@ -3,6 +3,7 @@ use crate::cli::tool_result_status::{
     tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
+use astra_runtime::turn::chat_turn_budget_pressure::budget_pressure_for_input_estimate;
 use astra_services::session_journal::{JournalEvent, ToolCallDisposition};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -5160,6 +5161,11 @@ impl SseStreamObserver for CliSseObserver<'_> {
         let estimate_changed = estimate != self.last_server_context_estimate;
         if estimate_changed {
             if let Some(estimate) = estimate {
+                self.executor
+                    .set_budget_pressure(budget_pressure_for_input_estimate(
+                        estimate.used_tokens,
+                        estimate.limit_tokens,
+                    ));
                 self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowEstimated(
                     estimate,
                 ));
@@ -9965,6 +9971,86 @@ mod tests {
                 2,
                 "only original admission and exact-run cancel; no tools, callbacks, Session lookup or replay"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_context_budget_reaches_the_edge_tool_before_execution() {
+        let workspace = tempdir().unwrap();
+        let file = workspace.path().join("budget.txt");
+        let content = "Tool budget fixture.\n";
+        let file_bytes = crate::edge_tools::per_tool_output_limit("") / 2;
+        std::fs::write(&file, content.repeat(file_bytes / content.len())).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut permissions),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        let context = |run_id, used_tokens| {
+            serde_json::json!({
+                "type":"context_meta", "run_id":run_id,
+                "context_manifest_trace":{"wire":{"budget":{
+                    "estimated_input_tokens":used_tokens, "effective_input_limit":100_000,
+                }}},
+            })
+        };
+        for (used_tokens, child_tokens, expects_outline) in
+            [(95_000, 1_000, true), (1_000, 95_000, false)]
+        {
+            let tool = serde_json::json!({
+                "type":"tool_request", "session_id":"budget-session", "run_id":"budget-run",
+                "turn_chain_id":"budget-chain", "request_id":format!("budget-{used_tokens}"),
+                "schema_admitted_by_server":true, "execution_timeout_ms":300_000,
+                "execution_deadline_unix_ms":4_102_444_800_000_u64,
+                "tool":"read_file", "args":{"path":file},
+            });
+            let wire = format!(
+                "data: {{\"type\":\"session_info\",\"session_id\":\"budget-session\",\"run_id\":\"budget-run\"}}\n\ndata: {}\n\ndata: {}\n\ndata: {tool}\n\ndata: [DONE]\n\n",
+                context("budget-run", used_tokens),
+                context("child-run", child_tokens),
+            );
+            let mut chunks = futures_util::stream::iter(vec![Ok::<_, String>(wire.into_bytes())]);
+            let (result, abort) = super::consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await;
+            assert!(abort.is_none(), "unexpected abort: {abort:?}");
+            let [result] = result.tool_results.as_slice() else {
+                panic!("expected one Edge result")
+            };
+            assert_eq!(result.status, "completed", "{}", result.output);
+            assert_eq!(result.output.starts_with("File is large"), expects_outline);
         }
     }
 

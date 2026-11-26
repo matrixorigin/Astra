@@ -10855,7 +10855,7 @@ impl AgenticRunLifecycleService {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
-        let request_identity = json!({
+        let mut request_identity = json!({
             "version": 1,
             "completion_checks": request.completion_checks,
             "message": request.message,
@@ -10904,6 +10904,9 @@ impl AgenticRunLifecycleService {
             "interaction_mode": request.interaction_mode,
             "interactive_client": request.interactive_client,
         });
+        if let Some(cursor) = request.attached_session_cursor.as_ref() {
+            request_identity["attached_session_cursor"] = json!(cursor);
+        }
         let request_fingerprint = format!(
             "{:x}",
             Sha256::digest(astra_core::canonical_json_string(&request_identity).as_bytes())

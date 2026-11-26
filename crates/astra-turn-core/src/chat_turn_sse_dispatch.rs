@@ -1990,6 +1990,14 @@ fn apply_one_event(
             accum.attempt_error_supersession_eligible = false;
         }
         "context_meta" => {
+            // Descendant progress cannot replace the physical root's context budget.
+            if event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|run_id| Some(run_id) != accum.root_identity.run_id())
+            {
+                return;
+            }
             if let Some(t) = event.get("system_prompt_tokens").and_then(|v| v.as_u64()) {
                 accum.system_prompt_tokens = Some(t as u32);
             }
