@@ -75,8 +75,10 @@ pub enum ExplainAnalyzeDecisionDetailV1 {
 }
 
 impl ExplainAnalyzeDecisionDetailV1 {
-    pub fn failure(tag: &str, outcome: ExplainAnalyzeOutcomeV1) -> Option<Self> {
-        let error_kind = astra_core::ErrorKind::parse_tag(tag)?;
+    pub fn failure(
+        error_kind: astra_core::ErrorKind,
+        outcome: ExplainAnalyzeOutcomeV1,
+    ) -> Option<Self> {
         Self::is_reportable_failure(error_kind, Some(outcome))
             .then_some(Self::Failure { error_kind })
     }
@@ -817,22 +819,28 @@ mod tests {
         event.start_elapsed_ms = Some(0);
         event.duration_ms = Some(event.elapsed_ms);
         event.outcome = Some(ExplainAnalyzeOutcomeV1::Failed);
-        event.decision_detail =
-            ExplainAnalyzeDecisionDetailV1::failure("rate_limit", ExplainAnalyzeOutcomeV1::Failed);
+        event.decision_detail = ExplainAnalyzeDecisionDetailV1::failure(
+            astra_core::ErrorKind::RateLimit,
+            ExplainAnalyzeOutcomeV1::Failed,
+        );
         assert!(event.is_valid());
-        let wire = serde_json::to_value(&event).unwrap();
+        let mut wire = serde_json::to_value(&event).unwrap();
         assert_eq!(
             wire["decision_detail"],
             serde_json::json!({"kind":"failure","error_kind":"rate_limit"})
         );
         event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         assert!(!event.is_valid());
-        for tag in ["unknown", "provider message with private data"] {
-            assert!(
-                ExplainAnalyzeDecisionDetailV1::failure(tag, ExplainAnalyzeOutcomeV1::Failed)
-                    .is_none()
-            );
-        }
+        assert!(
+            ExplainAnalyzeDecisionDetailV1::failure(
+                astra_core::ErrorKind::Unknown,
+                ExplainAnalyzeOutcomeV1::Failed,
+            )
+            .is_none()
+        );
+        wire["decision_detail"]["error_kind"] =
+            serde_json::json!("provider message with private data");
+        assert!(serde_json::from_value::<ExplainAnalyzeEventV1>(wire).is_err());
     }
 
     #[test]

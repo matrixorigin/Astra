@@ -1411,7 +1411,7 @@ mod tests {
             None,
         );
         provider.decision_detail = astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(
-            "rate_limit",
+            astra_core::ErrorKind::RateLimit,
             ExplainAnalyzeOutcomeV1::Failed,
         );
         graph.apply(provider);

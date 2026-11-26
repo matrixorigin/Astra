@@ -622,12 +622,14 @@ fn render_node(
     multiple_clocks: bool,
     verbose: bool,
 ) -> String {
-    let state = node_state(node.terminal_observed, node.outcome);
-    let state_class = state_class(state);
+    let terminal_outcome = node
+        .outcome
+        .filter(|_| node.terminal_observed && !node.conflicted);
+    let state_class = state_class(node_state(node.terminal_observed, terminal_outcome));
     let outcome = if node.conflicted {
         "conflicting facts"
     } else if node.terminal_observed {
-        outcome_label(node.outcome)
+        outcome_label(terminal_outcome)
     } else {
         "incomplete"
     };
@@ -664,16 +666,15 @@ fn render_node(
         axis.label,
         index,
     );
-    if let Some(detail) = &node.decision_detail {
+    if node.conflicted {
+        body.push_str("<p class=\"detail-line\"><span class=\"chip warning-chip\">conflicting facts were retained for review</span></p>");
+    } else if let Some(detail) = &node.decision_detail {
         body.push_str(&format!(
             "<p class=\"detail-line\">{}</p>",
             escape_html(&decision_detail_line(detail), MAX_TEXT_CHARS)
         ));
-    } else if node.outcome == Some(ExplainAnalyzeOutcomeV1::Failed) {
+    } else if terminal_outcome == Some(ExplainAnalyzeOutcomeV1::Failed) {
         body.push_str("<p class=\"detail-line\">Failure reason was not recorded.</p>");
-    }
-    if node.conflicted {
-        body.push_str("<p class=\"detail-line\"><span class=\"chip warning-chip\">conflicting facts were retained for review</span></p>");
     }
     if let Some(usage) = &node.usage {
         body.push_str(&format!(
@@ -1139,6 +1140,36 @@ mod tests {
         let html = render(&[tool], false, false);
         assert!(html.contains("outcome unavailable"));
         assert!(html.contains("<span>Turn wall time</span><strong>—</strong>"));
+    }
+
+    #[test]
+    fn conflicting_terminals_render_the_same_status_in_either_order() {
+        let success = finished(
+            event(
+                "call",
+                "call",
+                None,
+                "Run tool",
+                ExplainAnalyzeTransitionV1::Started,
+                0,
+                None,
+                None,
+            ),
+            20,
+        );
+        let mut failure = success.clone();
+        failure.event_id.push_str("-failed");
+        failure.outcome = Some(ExplainAnalyzeOutcomeV1::Failed);
+        assert!(
+            render(std::slice::from_ref(&failure), false, false)
+                .contains("Failure reason was not recorded.")
+        );
+
+        let success_first = render(&[success.clone(), failure.clone()], false, false);
+        let failure_first = render(&[failure, success], false, false);
+        assert!(success_first.contains("conflicting facts"));
+        assert!(!failure_first.contains("Failure reason was not recorded."));
+        assert_eq!(success_first, failure_first);
     }
 
     #[test]
