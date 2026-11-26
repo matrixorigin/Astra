@@ -1084,6 +1084,8 @@ async fn held_chat_and_readonly_rounds_have_bounded_total_sql() {
 // test processes keep nine schema/fixture lifecycles from sharing one timeout;
 // each group retains the strict-online-ci 60-second limit.
 async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)]) {
+    const WARM_INPUT: &str = "Remember the first turn.";
+    const WARM_REPLY: &str = "Warm context ready.";
     require_system_e2e_env();
     let capture = SqlCapture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
@@ -1137,10 +1139,7 @@ async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)
         if warm_context {
             responses.insert(
                 0,
-                answer(
-                    json!({"role":"assistant", "content":"Warm context ready."}),
-                    "stop",
-                ),
+                answer(json!({"role":"assistant", "content":WARM_REPLY}), "stop"),
             );
         }
         let release = Arc::new(tokio::sync::Notify::new());
@@ -1202,7 +1201,7 @@ async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
                     json!({
-                        "message":"Remember the first turn.", "session_id":b.ctx.session_id,
+                        "message":WARM_INPUT, "session_id":b.ctx.session_id,
                         "model_selection":seeded_model_selection(&b.ctx)
                     })
                     .to_string(),
@@ -1215,7 +1214,7 @@ async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)
                 .iter()
                 .find(|event| event["type"] == "run_finished" && event["status"] == "completed")
                 .expect(&body);
-            assert!(body.contains("Warm context ready."), "{body}");
+            assert!(body.contains(WARM_REPLY), "{body}");
             // Shutdown drain would reject the measured turn. The complete SSE
             // response settles the warm-up turn; separately await its observer.
             wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
@@ -1328,10 +1327,18 @@ async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)
         let observations = b.ctx.memoria.observations.lock().await;
         assert_eq!(observations.len(), 1 + usize::from(warm_context));
         let messages = observations.last().unwrap()["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], json!({"role": "user", "content": message}));
-        assert_eq!(messages[1]["role"], "assistant");
-        assert!(!messages[1]["content"].as_str().unwrap().is_empty());
+        let mut expected_messages = Vec::new();
+        if warm_context {
+            expected_messages.extend([
+                json!({"role":"user","content":WARM_INPUT}),
+                json!({"role":"assistant","content":WARM_REPLY}),
+            ]);
+        }
+        expected_messages.extend([
+            json!({"role":"user","content":message}),
+            json!({"role":"assistant","content":"Discovery complete."}),
+        ]);
+        assert_eq!(messages, &expected_messages);
         drop(observations);
         // Explicit cold-replay verification follows the ordinary request's
         // complete drain and stopped SQL capture; it is not ordinary execution.

@@ -2415,6 +2415,20 @@ fn observer_preceding_exchange<'a>(
         return Ok(None);
     }
 
+    // A completed memory-tool turn is excluded from extraction as a whole.
+    // Its receipt cannot be replayed as dialogue, but it must not suppress
+    // independent input in the next turn.
+    let is_memory_tool_message = astra_turn_core::observer::is_memory_tool_message;
+    if is_memory_tool_message(prior_assistant)
+        || earlier
+            .iter()
+            .rev()
+            .take_while(|message| !is_human_user_message(message))
+            .any(is_memory_tool_message)
+    {
+        return Ok(None);
+    }
+
     // Check the public evidence regardless of how the assistant ended its
     // reply. A trailing instruction can follow the question being answered.
     let prior_user = earlier.last().ok_or(())?;
@@ -3439,9 +3453,9 @@ mod tests {
             json!({"role":"user","content":"Remember the release date."}),
             json!({
                 "role":"assistant",
-                "tool_calls":[{"function":{"name":"memory","arguments":"{}"}}]
+                "tool_calls":[{"id":"memory-call","function":{"name":"memory","arguments":"{}"}}]
             }),
-            json!({"role":"tool","name":"memory","content":"{\"memory_id\":\"m1\"}"}),
+            json!({"role":"tool","tool_call_id":"memory-call","content":"{\"memory_id\":\"m1\"}"}),
             json!({"role":"assistant","content":"Stored. Memory m1 is active."}),
             json!({"role":"user","content":"Rust ownership prevents data races."}),
             json!({"role":"assistant","content":"That is a useful fact."}),
