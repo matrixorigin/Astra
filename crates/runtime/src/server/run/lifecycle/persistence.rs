@@ -2391,9 +2391,9 @@ fn fire_server_loop_observer(
     });
 }
 
-/// Use only the adjacent public dialogue that gave a new user reply its
-/// referent. Do not skip over a tool or a rewritten history boundary.
-fn observer_preceding_question<'a>(
+/// Retain the adjacent public exchange so the extractor can interpret a reply
+/// with its context. Do not cross tool or rewritten history boundaries.
+fn observer_preceding_exchange<'a>(
     state: &'a AgenticLoopState,
     session_id: &str,
     current_input: &str,
@@ -2408,15 +2408,15 @@ fn observer_preceding_question<'a>(
     let Some((prior_assistant, earlier)) = state.messages[..index].split_last() else {
         return Ok(None);
     };
-    let Some(question) = prior_assistant["content"].as_str().map(str::trim) else {
+    let Some(reply) = prior_assistant["content"].as_str().map(str::trim) else {
         return Ok(None);
     };
-    if prior_assistant["role"] != "assistant" || !question.ends_with(['?', '？']) {
+    if prior_assistant["role"] != "assistant" || reply.is_empty() {
         return Ok(None);
     }
 
-    // A question is present. Losing its context would turn the reply into a
-    // standalone statement, so skip observation if the evidence is unsafe.
+    // Check the public evidence regardless of how the assistant ended its
+    // reply. A trailing instruction can follow the question being answered.
     let prior_user = earlier.last().ok_or(())?;
     if !is_human_user_message(prior_user)
         || is_runtime_owned_message(prior_assistant)
@@ -2438,13 +2438,10 @@ fn observer_preceding_question<'a>(
         }
     }
     let opening = prior_user["content"].as_str().ok_or(())?.trim();
-    if opening.is_empty()
-        || opening.chars().nth(OBSERVER_MESSAGE_CHARS).is_some()
-        || question.chars().nth(OBSERVER_MESSAGE_CHARS).is_some()
-    {
+    if opening.is_empty() {
         return Err(());
     }
-    Ok(Some((opening, question)))
+    Ok(Some((opening, reply)))
 }
 
 fn build_server_loop_observer_request(
@@ -2523,10 +2520,10 @@ fn build_server_loop_observer_request(
     let mut messages = Vec::with_capacity(4);
     let mut exchange_bytes = "[user]: \n[assistant]: \n".len() + content.len() + answer.len();
     if applied.is_empty()
-        && let Some((opening, question)) =
-            observer_preceding_question(state, session_id, user_message).ok()?
+        && let Some((opening, reply)) =
+            observer_preceding_exchange(state, session_id, user_message).ok()?
     {
-        exchange_bytes += "[user]: \n[assistant]: \n".len() + opening.len() + question.len();
+        exchange_bytes += "[user]: \n[assistant]: \n".len() + opening.len() + reply.len();
         if exchange_bytes.saturating_sub(answer.len()) > OBSERVER_EXCHANGE_BYTES {
             return None;
         }
@@ -2534,7 +2531,7 @@ fn build_server_loop_observer_request(
             answer = "";
         }
         messages.push(message("user", opening.to_owned()));
-        messages.push(message("assistant", question.to_owned()));
+        messages.push(message("assistant", reply.to_owned()));
     }
     messages.push(message("user", content));
     if !answer.is_empty() {
@@ -3401,6 +3398,12 @@ mod tests {
         assert_eq!(
             dialogue,
             ["I prefer Rust.", "Use Go instead?", "Yes.", "Okay."]
+        );
+        state.messages[1]["content"] = json!("Use Go instead? Reply yes or no.");
+        let request = build(&state).unwrap();
+        assert_eq!(
+            request.messages[1]["content"],
+            "Use Go instead? Reply yes or no."
         );
         state
             .messages

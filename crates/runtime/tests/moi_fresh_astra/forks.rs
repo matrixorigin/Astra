@@ -2038,13 +2038,16 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let edit_path = format!("/sessions/{edge_session_id}");
-    let update = json!({"metadata": edge_session["metadata"]}).to_string();
-    let (status, _) = response(
+    let mut metadata = edge_session["metadata"].clone();
+    metadata["label"] = json!("updated by the client");
+    let update = json!({"metadata": metadata}).to_string();
+    let (status, updated) = response(
         &app,
         edge_request("PUT", &edit_path, &update, "moi-contract-workspace"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "public metadata must round-trip");
+    assert_eq!(updated["metadata"]["label"], "updated by the client");
     let (status, _) = response(
         &app,
         edge_request(

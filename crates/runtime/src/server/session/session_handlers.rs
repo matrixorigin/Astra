@@ -1298,36 +1298,31 @@ pub(crate) async fn update_session_handler(
     Json(request): Json<SessionUpdateRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let principal = state.auth_service.current_principal(&headers).await?;
-    let user = principal.user;
-    if request.status.as_deref() == Some("closed")
-        && let astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
-            principal.origin
-        && context.provider_id == "moi"
-    {
-        // This existing update route uses legacy bearer authentication. Its
-        // close transition can schedule memory maintenance, just like /close.
-        authorize_session_lifecycle_scope(
-            &state,
-            &user.user_id,
-            &session_id,
-            &astra_services::runs::ProviderRunOwner {
+    // This existing update route uses legacy bearer authentication. Its
+    // close transition can schedule memory maintenance, just like /close.
+    let provider_owner = match principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context)
+            if context.provider_id == "moi" && request.status.as_deref() == Some("closed") =>
+        {
+            Some(astra_services::runs::ProviderRunOwner {
                 provider_id: context.provider_id,
                 provider_scope_id: context.provider_scope_id,
-            },
-        )
-        .await?;
-    }
+            })
+        }
+        _ => None,
+    };
     let session = state
         .session_service
-        .update_session(
+        .update_session_with_provider_scope(
             session_id,
-            user.user_id,
+            principal.user.user_id,
             SessionUpdateRequestData {
                 title: request.title,
                 metadata: request.metadata,
                 metadata_patch: request.metadata_patch,
                 status: request.status,
             },
+            provider_owner.as_ref(),
         )
         .await?;
     Ok(Json(SessionResponse::from(session)))
@@ -1896,7 +1891,7 @@ async fn authorize_session_lifecycle_scope(
         session_id,
         Some(owner),
         Some(&state.fernet_encryptor),
-        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ForkSource,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::BoundConversation,
     )
     .await
     .map_err(session_fork_http_error)
@@ -1910,28 +1905,32 @@ pub(crate) async fn close_session_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = session_lifecycle_user(
-        &state,
-        &session_id,
-        &method,
-        &uri,
-        &headers,
-        "/sessions/{session_id}/close",
-        &body,
-    )
-    .await?;
-    let owner_id = user.user_id.clone();
+    let auth = state
+        .auth_service
+        .current_principal_for_request_with_provenance(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/sessions/{session_id}/close",
+                &body,
+            ),
+        )
+        .await?;
+    let provider_owner = fork_provider_scope(&auth, true)?;
     let session = state
         .session_service
-        .update_session(
+        .update_session_with_provider_scope(
             session_id.clone(),
-            owner_id.clone(),
+            auth.principal.user.user_id,
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
                 metadata_patch: None,
                 status: Some("closed".to_string()),
             },
+            provider_owner.as_ref(),
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);

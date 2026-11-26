@@ -1161,6 +1161,46 @@ pub async fn authorize_provider_fork_session<'e, E>(
 where
     E: sqlx::Executor<'e, Database = MySql>,
 {
+    authorize_provider_session_scope(
+        executor,
+        user_id,
+        session_id,
+        required,
+        encryptor,
+        requirement,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn authorize_provider_session_update(
+    executor: impl sqlx::Executor<'_, Database = MySql>,
+    user_id: &str,
+    session_id: &str,
+    owner: &crate::runs::ProviderRunOwner,
+    encryptor: Option<&crate::auth::FernetTokenEncryptor>,
+) -> Result<(), SessionForkCoordinatorError> {
+    authorize_provider_session_scope(
+        executor,
+        user_id,
+        session_id,
+        Some(owner),
+        encryptor,
+        ProviderSessionScopeRequirement::BoundConversation,
+        true,
+    )
+    .await
+}
+
+async fn authorize_provider_session_scope(
+    executor: impl sqlx::Executor<'_, Database = MySql>,
+    user_id: &str,
+    session_id: &str,
+    required: Option<&crate::runs::ProviderRunOwner>,
+    encryptor: Option<&crate::auth::FernetTokenEncryptor>,
+    requirement: ProviderSessionScopeRequirement,
+    require_existing_session: bool,
+) -> Result<(), SessionForkCoordinatorError> {
     // Local identities cannot address request-signed provider Sessions. Their
     // ordinary admission already validates Session ownership and lifecycle.
     if required.is_none() && !provider_session_namespace(user_id) {
@@ -1178,16 +1218,21 @@ where
          FROM agent_sessions s LEFT JOIN session_forks f
            ON f.isolation_domain = ? AND f.owner_user_id = s.user_id
           AND f.child_session_id = s.session_id AND f.child_branch_id = ?
-         WHERE s.user_id = ? AND s.session_id = ?",
+         WHERE s.user_id = ? AND s.session_id = ?
+           AND (NOT ? OR s.delete_requested_at IS NULL)",
     )
     .bind(&key.isolation_domain)
     .bind(&key.branch_id)
     .bind(user_id)
     .bind(session_id)
+    .bind(require_existing_session)
     .fetch_optional(executor)
     .await
     .map_err(|source| database_error("load_provider_session_scope", source))?;
     let Some(row) = row else {
+        if require_existing_session {
+            return Err(SessionForkCoordinatorError::NotFound);
+        }
         if user_id.starts_with("external_authorized:moi:") {
             return Ok(());
         }

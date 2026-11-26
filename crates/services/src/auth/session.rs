@@ -266,6 +266,23 @@ pub trait SessionService: Send + Sync {
         request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Update a Session using the workspace from the verified request.
+    async fn update_session_with_provider_scope(
+        &self,
+        session_id: String,
+        user_id: String,
+        request: SessionUpdateRequestData,
+        provider_owner: Option<&crate::runs::ProviderRunOwner>,
+    ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        if provider_owner.is_some() {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider session authority is unavailable",
+            ));
+        }
+        self.update_session(session_id, user_id, request).await
+    }
+
     /// Ensure a continuation can use an active session. Implementations may
     /// avoid rewriting an already active session while preserving its fence.
     async fn ensure_session_active(
@@ -1249,16 +1266,65 @@ impl SessionService for DatabaseSessionService {
         user_id: String,
         request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.update_session_with_provider_scope(session_id, user_id, request, None)
+            .await
+    }
+
+    async fn update_session_with_provider_scope(
+        &self,
+        session_id: String,
+        user_id: String,
+        request: SessionUpdateRequestData,
+        provider_owner: Option<&crate::runs::ProviderRunOwner>,
+    ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let existing = self
-            .fetch_session_for_user(&pool, &session_id, &user_id)
-            .await?
-            .ok_or_else(|| {
-                error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Session {session_id} 不存在"),
-                )
+        let has_changes = request.title.is_some()
+            || request.metadata.is_some()
+            || request.metadata_patch.is_some()
+            || request.status.is_some();
+        let not_found = || {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        };
+        if let Some(owner) = provider_owner {
+            // The scope lookup establishes row existence and ownership in the
+            // same read. The existing write fence still guards the mutation.
+            crate::session_fork_coordinator::authorize_provider_session_update(
+                &pool,
+                &user_id,
+                &session_id,
+                owner,
+                self.scope_encryptor.as_deref(),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::SessionForkCoordinatorError::NotFound => not_found(),
+                crate::SessionForkCoordinatorError::Forbidden => error_response_coded(
+                    StatusCode::FORBIDDEN,
+                    "Session is outside the authorized scope",
+                    "session_fork_forbidden",
+                ),
+                _ => {
+                    tracing::warn!(%error, "Session scope lookup failed");
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Session scope is temporarily unavailable",
+                        "session_fork_dependency_unavailable",
+                    )
+                }
             })?;
+        }
+        if provider_owner.is_none() || !has_changes {
+            let existing = self
+                .fetch_session_for_user(&pool, &session_id, &user_id)
+                .await?
+                .ok_or_else(not_found)?;
+            if !has_changes {
+                return Ok(existing);
+            }
+        }
 
         let SessionUpdateRequestData {
             title,
@@ -1284,10 +1350,6 @@ impl SessionService for DatabaseSessionService {
                 "reserved session metadata key",
                 "session_metadata_invalid",
             ));
-        }
-
-        if title.is_none() && metadata.is_none() && metadata_patch.is_none() && status.is_none() {
-            return Ok(existing);
         }
 
         // A disconnected cancel request can drop this future before BEGIN

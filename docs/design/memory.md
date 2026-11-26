@@ -392,7 +392,9 @@ account status at dispatch. The authority lookup has a ten-second deadline,
 and the Memoria request has a separate 30-second deadline.
 
 After the owning Server settles a Run, it can send one best-effort observation
-using public inputs from one contiguous part of that Run. Consecutive user
+using bounded public conversation evidence. A new Run can retain the
+verified adjacent public exchange from its Session to preserve the meaning of
+a reply. Consecutive user
 inputs stay together. If acknowledged guidance follows a public assistant
 reply, the observer sends the exchange as one content string containing
 ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
