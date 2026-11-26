@@ -85,6 +85,28 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
 }
 
 #[test]
+fn ctrl_r_skips_replayed_and_local_copies_of_a_match() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use std::sync::Arc;
+
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    for entry in ["other review", "//exit review"] {
+        pane.composer.set_text(entry);
+        pane.composer.clear_and_submit();
+    }
+    let history: Vec<Arc<dyn HistoryCell>> = (0..2)
+        .map(|_| Arc::new(UserCell::new("/exit review")) as Arc<dyn HistoryCell>)
+        .collect();
+    let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    pane.handle_session_key_at(search, Instant::now(), &history);
+    pane.handle_session_paste("review", &history);
+    pane.handle_session_key_at(search, Instant::now(), &history);
+    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(pane.composer.text(), "other review");
+}
+
+#[test]
 fn ctrl_r_paste_filters_without_touching_suspended_draft() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
@@ -1939,6 +1961,8 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         &history,
     );
 
+    assert!(render(&pane).contains("> ship canary build"));
+
     for (at, code, expected) in [
         (75, KeyCode::Up, "ship staging build"),
         (80, KeyCode::End, "ship staging build"),
@@ -2062,6 +2086,12 @@ fn pasted_fuzzy_history_query_scrolls_to_older_matches() {
             &history,
         );
     }
+    // The scroll has not drawn its new rows yet.
+    pane.handle_session_key_at(
+        key(KeyCode::Tab),
+        start + Duration::from_millis(15),
+        &history,
+    );
     assert_eq!(pane.composer.text(), "部署境");
     let text = render(&pane).replace(' ', "");
     assert!(text.contains(">部署环境1"), "{text}");
@@ -2114,14 +2144,17 @@ fn typed_history_suggestions_refresh_after_a_fast_input_burst() {
     ));
     assert_eq!(pane.composer.text(), "ship canary build");
 
-    // A navigation key may force the first flush before any frame does.
+    // A navigation key may force the first flush, then the first frame
+    // presents the default match before navigation can select it.
     let mut pane = start_burst();
     assert!(matches!(
         pane.handle_session_key_at(key(KeyCode::Up), at(70), &history),
         BottomPaneAction::Consumed
     ));
     assert_eq!(pane.composer.text(), "shi");
-    assert!(render(&pane).contains("ship staging build"));
+    assert!(render(&pane).contains("> ship canary build"));
+    pane.handle_session_key_at(key(KeyCode::Up), at(71), &history);
+    assert!(render(&pane).contains("> ship staging build"));
 
     // An early paste control is still literal input, never acceptance or
     // submission, regardless of whether a frame already flushed the bytes.
@@ -2159,6 +2192,41 @@ fn typed_history_suggestions_refresh_after_a_fast_input_burst() {
         assert!(pane.composer.is_empty());
         assert!(!render(&pane).contains("canary"));
     }
+}
+
+#[test]
+fn long_chinese_prefix_keeps_its_history_match() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use crate::tui::testing::render::buffer_to_string;
+    use std::{sync::Arc, time::Duration};
+
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let candidate = format!("{}继续部署", "部".repeat(43));
+    let history: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(UserCell::new(candidate.clone()))];
+    let area = Rect::new(0, 0, 120, 8);
+    let render = |pane: &BottomPane| {
+        let mut buffer = Buffer::empty(area);
+        pane.render(area, &mut buffer);
+        buffer_to_string(&buffer)
+    };
+    let start = Instant::now();
+    pane.handle_session_paste(&"部".repeat(42), &history);
+    let text = render(&pane);
+    assert!(text.replace(' ', "").contains("继续部署"), "{text}");
+    pane.handle_session_key_at(
+        KeyEvent::new(KeyCode::Char('部'), KeyModifiers::NONE),
+        start + Duration::from_millis(30),
+        &history,
+    );
+    let text = render(&pane);
+    assert!(text.replace(' ', "").contains("继续部署"), "{text}");
+    pane.handle_session_key_at(
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        start + Duration::from_millis(60),
+        &history,
+    );
+    assert_eq!(pane.composer.text(), candidate);
 }
 
 #[test]

@@ -7,6 +7,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ use crate::tui::file_writer::TuiFileWriter;
 const HISTORY_MAX_ENTRIES: usize = 500;
 const HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS: usize = 4096;
 const HISTORY_SUGGESTION_SCAN_BYTES: usize = 256 * 1024;
-const HISTORY_SUGGESTION_QUERY_BYTES: usize = 128;
+const HISTORY_FUZZY_QUERY_BYTES: usize = 128;
 const HISTORY_SUGGESTION_ROWS: u16 = 4;
 
 /// Duration the `·` prefix glows after the user submits a message.
@@ -39,6 +41,8 @@ struct HistorySearch {
     query: Option<TextArea>,
     entries: Vec<HistoryEntry>,
     match_index: Option<usize>,
+    /// The candidate indices the last frame actually displayed.
+    painted: Cell<Option<(usize, usize)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -579,114 +583,159 @@ impl ChatComposer {
         if query.is_empty() {
             return None;
         }
+
+        let matches_query = |entry: &HistoryEntry| {
+            let Some(text) = self.history_entry_text(entry) else {
+                return false;
+            };
+            let session = matches!(entry, HistoryEntry::Session(_));
+            // A semantic leading slash gains one slash when recalled.
+            let escaped_match = session
+                && text.starts_with('/')
+                && query
+                    .strip_prefix('/')
+                    .is_some_and(|suffix| text.starts_with(suffix));
+            if !escaped_match && !text.contains(query) {
+                return false;
+            }
+            if session {
+                let trimmed = text.trim_start();
+                // The composer cannot recall these literally as conversation.
+                if crate::cli::turn::turn_entry::shell_input_body(trimmed).is_some()
+                    || (trimmed.starts_with('/') && trimmed != text)
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        let mut previous = None;
         search
             .entries
             .iter()
             .enumerate()
             .skip(after)
+            .filter(|(_, entry)| matches_query(entry))
             .find_map(|(index, entry)| {
-                let text = self.history_entry_text(entry)?;
-                // A semantic leading slash gains one slash when recalled.
-                let escaped_match = matches!(entry, HistoryEntry::Session(_))
-                    && text.starts_with('/')
-                    && query
-                        .strip_prefix('/')
-                        .is_some_and(|suffix| text.starts_with(suffix));
-                (text.contains(query) || escaped_match).then_some(index)
+                if after == 0 {
+                    return Some(index);
+                }
+                // Deduplicate only when cycling to another matching entry.
+                let seen = previous.get_or_insert_with(|| {
+                    search.entries[..after]
+                        .iter()
+                        .filter(|entry| matches_query(entry))
+                        .filter_map(|entry| self.recalled_entry_text(entry))
+                        .collect::<HashSet<_>>()
+                });
+                let recalled = self.recalled_entry_text(entry)?;
+                (!seen.contains(recalled.as_ref())).then_some(index)
             })
     }
 
-    fn history_entries(
-        &self,
+    fn recent_session_history(
         history: &[Arc<dyn HistoryCell>],
-        query: Option<&str>,
-    ) -> Vec<HistoryEntry> {
-        const MAX_SUGGESTIONS: usize = 8;
-        let mut fuzzy = query.map(|query| {
-            (
-                crate::tui::slash_menu::menu::fuzzy_atom(query),
-                Matcher::default(),
-                Vec::new(),
-            )
-        });
-        // Budget both the bytes inspected and the work of fuzzy scoring a long query.
-        let mut remaining_bytes =
-            HISTORY_SUGGESTION_SCAN_BYTES / query.map_or(1, |query| query.len().div_ceil(8).max(1));
-        let mut score = |text: &str| {
-            let Some((query, (atom, matcher, buffer))) = query.zip(fuzzy.as_mut()) else {
-                return Some((false, false, 0));
-            };
-            if text.len() > remaining_bytes {
-                return None;
-            }
-            remaining_bytes -= text.len();
-            if text.trim_start().starts_with(['/', '!', '$']) {
-                return None;
-            }
-            let rank = atom.score(Utf32Str::new(text, buffer), matcher)?;
-            let prefix = text
-                .get(..query.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query));
-            Some((prefix && text.len() == query.len(), prefix, rank))
-        };
-        let mut entries = Vec::new();
-        let mut seen_messages = std::collections::HashSet::new();
-        let recent_messages = history
+    ) -> impl Iterator<Item = (&Arc<dyn HistoryCell>, &str)> {
+        history
             .iter()
             .rev()
             .take(HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS)
             .filter_map(|cell| Some((cell, Self::session_message(cell.as_ref())?)))
-            .take(HISTORY_MAX_ENTRIES);
-        for (cell, text) in recent_messages {
-            let Some(rank) = score(text) else {
-                continue;
-            };
-            let trimmed = text.trim_start();
-            // The composer has no literal spelling for shell passthrough or
-            // a slash-prefixed message with significant leading whitespace.
-            if crate::cli::turn::turn_entry::shell_input_body(text).is_none()
-                && (!trimmed.starts_with('/') || trimmed == text)
-                && seen_messages.insert(text)
-            {
-                entries.push((rank, HistoryEntry::Session(Arc::clone(cell))));
-            }
-        }
-        for (index, raw) in self
-            .history
+            .take(HISTORY_MAX_ENTRIES)
+    }
+
+    fn recent_local_history(&self) -> impl Iterator<Item = (usize, &str)> {
+        self.history
             .iter()
             .enumerate()
             .rev()
             .take(HISTORY_MAX_ENTRIES)
-        {
-            let Some(rank) = score(raw) else {
-                continue;
-            };
-            let duplicate = if raw.starts_with('/') {
-                raw.strip_prefix('/')
-                    .is_some_and(|text| text.starts_with('/') && seen_messages.contains(text))
-            } else {
-                !seen_messages.insert(raw.as_str())
-            };
-            if !duplicate {
+            .map(|(index, text)| (index, text.as_str()))
+    }
+
+    fn suggestion_entries(
+        &self,
+        history: &[Arc<dyn HistoryCell>],
+        query: &str,
+    ) -> Vec<HistoryEntry> {
+        const MAX_SUGGESTIONS: usize = 8;
+        let fuzzy = query.len() <= HISTORY_FUZZY_QUERY_BYTES;
+        // Longer queries still get prefix matches, within the same byte budget.
+        let mut remaining = HISTORY_SUGGESTION_SCAN_BYTES;
+        if fuzzy {
+            remaining /= query.len().div_ceil(8).max(1);
+        }
+        let mut matcher = None;
+        let mut score = |text: &str| {
+            if text.len() > remaining {
+                return None;
+            }
+            let prefix = text
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query));
+            if prefix {
+                remaining -= text.len();
+                return Some((text.len() == query.len(), true, 0));
+            }
+            if !fuzzy {
+                remaining -= query.len().min(text.len());
+                return None;
+            }
+            remaining -= text.len();
+            if text.trim_start().starts_with(['/', '!', '$']) {
+                return None;
+            }
+            let (atom, matcher, buffer) = matcher.get_or_insert_with(|| {
+                (
+                    crate::tui::slash_menu::menu::fuzzy_atom(query),
+                    Matcher::default(),
+                    Vec::new(),
+                )
+            });
+            atom.score(Utf32Str::new(text, buffer), matcher)
+                .map(|rank| (false, false, rank))
+        };
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        for (cell, text) in Self::recent_session_history(history) {
+            if let Some(rank) = score(text)
+                && seen.insert(text)
+            {
+                entries.push((rank, HistoryEntry::Session(Arc::clone(cell))));
+            }
+        }
+        for (index, text) in self.recent_local_history() {
+            if let Some(rank) = score(text)
+                && seen.insert(text)
+            {
                 entries.push((rank, HistoryEntry::Local(index)));
             }
         }
-        if query.is_some() {
-            // Stable sort preserves the source order among equally ranked matches.
-            entries.sort_by_key(|&(rank, _)| std::cmp::Reverse(rank));
-            entries.truncate(MAX_SUGGESTIONS);
-        }
-        entries.into_iter().map(|(_, entry)| entry).collect()
+        // Stable sort preserves the source order among equally ranked matches.
+        entries.sort_by_key(|&(rank, _)| std::cmp::Reverse(rank));
+        entries
+            .into_iter()
+            .take(MAX_SUGGESTIONS)
+            .map(|(_, entry)| entry)
+            .collect()
     }
 
     pub(super) fn start_history_search(&mut self, now: Instant, history: &[Arc<dyn HistoryCell>]) {
         self.textarea.flush_pending_paste_at(now);
         let mut query = TextArea::new();
         self.textarea.swap_paste_burst(&mut query);
+        let entries = Self::recent_session_history(history)
+            .map(|(cell, _)| HistoryEntry::Session(Arc::clone(cell)))
+            .chain(
+                self.recent_local_history()
+                    .map(|(index, _)| HistoryEntry::Local(index)),
+            )
+            .collect();
         self.history_search = Some(HistorySearch {
             query: Some(query),
-            entries: self.history_entries(history, None),
+            entries,
             match_index: None,
+            painted: Cell::default(),
         });
     }
 
@@ -695,7 +744,7 @@ impl ChatComposer {
             return;
         }
         let input = self.textarea.text();
-        if input.len() > HISTORY_SUGGESTION_QUERY_BYTES {
+        if input.len() >= HISTORY_SUGGESTION_SCAN_BYTES {
             self.history_search = None;
             return;
         }
@@ -707,11 +756,12 @@ impl ChatComposer {
             && !query.starts_with(['/', '!', '$'])
             && !input.contains(['\n', '\r', '\t'])
         {
-            let entries = self.history_entries(history, Some(query));
+            let entries = self.suggestion_entries(history, query);
             (!entries.is_empty()).then_some(HistorySearch {
                 query: None,
                 entries,
                 match_index: Some(0),
+                painted: Cell::default(),
             })
         } else {
             None
@@ -840,6 +890,7 @@ impl ChatComposer {
         if key.modifiers.is_empty()
             && let Some(search) = &mut self.history_search
             && let Some(index) = search.match_index
+            && let Some((start, end)) = search.painted.get()
         {
             match key.code {
                 KeyCode::Up => {
@@ -850,7 +901,7 @@ impl ChatComposer {
                     search.match_index = Some(index.saturating_sub(1));
                     return ComposerAction::Consumed;
                 }
-                KeyCode::Tab => {
+                KeyCode::Tab if (start..end).contains(&index) => {
                     if let Some(drafts) = self.accept_history_match() {
                         return ComposerAction::Recall(drafts);
                     }
@@ -1127,33 +1178,40 @@ impl ChatComposer {
         }
     }
 
-    fn history_suggestions(&self) -> Option<(&[HistoryEntry], usize)> {
+    fn history_suggestions(&self) -> Option<(&HistorySearch, usize)> {
         let search = self.history_search.as_ref()?;
         if search.query.is_some() || self.textarea.paste_burst_active() {
             return None;
         }
-        Some((&search.entries, search.match_index?))
+        Some((search, search.match_index?))
+    }
+
+    pub(super) fn clear_painted_history_suggestions(&self) {
+        if let Some(search) = &self.history_search {
+            search.painted.set(None);
+        }
     }
 
     pub(super) fn history_suggestions_height(&self) -> u16 {
-        self.history_suggestions().map_or(0, |(entries, _)| {
-            (entries.len() as u16).min(HISTORY_SUGGESTION_ROWS) + 1
+        self.history_suggestions().map_or(0, |(search, _)| {
+            (search.entries.len() as u16).min(HISTORY_SUGGESTION_ROWS) + 1
         })
     }
 
     pub(super) fn render_history_suggestions(&self, area: Rect, buf: &mut Buffer) {
-        let Some((entries, selected)) = self.history_suggestions() else {
+        let Some((search, selected)) = self.history_suggestions() else {
             return;
         };
-        if area.is_empty() {
+        if area.height == 0 || area.width <= 2 {
             return;
         }
         let theme = crate::tui::theme::current();
-        let rows = usize::from(area.height.min(HISTORY_SUGGESTION_ROWS)).min(entries.len());
+        let rows = usize::from(area.height.min(HISTORY_SUGGESTION_ROWS)).min(search.entries.len());
         let first = (selected + 1).saturating_sub(rows);
-        let width = usize::from(area.width.saturating_sub(2));
-        for (row, index) in (first..first + rows).rev().enumerate() {
-            let Some(text) = self.history_entry_text(&entries[index]) else {
+        let end = first + rows;
+        let width = usize::from(area.width - 2);
+        for (row, index) in (first..end).rev().enumerate() {
+            let Some(text) = self.history_entry_text(&search.entries[index]) else {
                 continue;
             };
             let (marker, style) = if index == selected {
@@ -1164,6 +1222,7 @@ impl ChatComposer {
             let line = Line::styled(format!("{marker}{}", history_preview(text, width)), style);
             buf.set_line(area.x, area.y + row as u16, &line, area.width);
         }
+        search.painted.set(Some((first, end)));
         if area.height > rows as u16 {
             let hint = Line::styled(
                 "  History · ↑↓ select · Tab insert",
@@ -1175,22 +1234,30 @@ impl ChatComposer {
 
     /// Preserve a preview when the terminal has no row for the list.
     pub(super) fn render_compact_history_suggestion(&self, area: Rect, buf: &mut Buffer) {
-        let Some((entries, selected)) = self.history_suggestions() else {
+        let Some((search, selected)) = self.history_suggestions() else {
             return;
         };
-        let Some(text) = self.history_entry_text(&entries[selected]) else {
+        let Some(text) = self.history_entry_text(&search.entries[selected]) else {
             return;
         };
         if let Some((x, y)) = self.cursor_position(area) {
             let right = composer_content_area(area, self.frame_allowed).right();
             let width = usize::from(right.saturating_sub(x));
+            // A clamped cursor may occupy the last cell of the typed text.
+            if width <= 1 {
+                return;
+            }
             let preview = match text.strip_prefix(self.textarea.text()) {
                 Some(suffix) => history_preview(suffix, width),
                 None if width > 3 => format!(" → {}", history_preview(text, width - 3)),
                 None => return,
             };
+            if preview.trim().is_empty() {
+                return;
+            }
             let dim = Style::default().fg(crate::tui::theme::current().dim);
             buf.set_stringn(x, y, preview, width, dim);
+            search.painted.set(Some((selected, selected + 1)));
         }
     }
 

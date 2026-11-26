@@ -3732,6 +3732,7 @@ impl BottomPane {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.composer.clear_painted_history_suggestions();
         if let Some(view) = self.active_view() {
             // Stack optional footers under the view area:
             //   [view]
