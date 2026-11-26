@@ -2305,9 +2305,17 @@ pub enum SessionEndWriteError {
 
 /// A complete append-order read. Its observations can be reused only if the
 /// same file generation and version are still current under the write lock.
+/// When supported, an unlocked file handle pins that generation until drop.
 pub struct JournalSnapshot {
     events: Vec<JournalEvent>,
-    version: Option<(JournalFileIdentity, JournalFileVersion)>,
+    generation: Option<JournalSnapshotGeneration>,
+}
+
+struct JournalSnapshotGeneration {
+    version: (JournalFileIdentity, JournalFileVersion),
+    // Keep the unlinked inode alive so its identity cannot be recycled while
+    // this snapshot is eligible for reuse. The shared lock is already released.
+    _file: std::fs::File,
 }
 
 impl JournalSnapshot {
@@ -2703,10 +2711,13 @@ impl JournalWriter {
         };
         let owned;
         // Journal writers append under the file lock; maintenance retires the
-        // inode. A matching version means the validated prefix is still current.
-        let (current_events, malformed_lines, append_offset) = match snapshot
-            .and_then(|snapshot| snapshot.version.as_ref().map(|version| (snapshot, version)))
-        {
+        // inode. The snapshot pins that inode until this version check.
+        let (current_events, malformed_lines, append_offset) = match snapshot.and_then(|snapshot| {
+            snapshot
+                .generation
+                .as_ref()
+                .map(|generation| (snapshot, &generation.version))
+        }) {
             Some((snapshot, version))
                 if journal_snapshot_version(&file)
                     .is_ok_and(|current| current.as_ref() == Some(version)) =>
@@ -2931,7 +2942,7 @@ impl JournalWriter {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(JournalSnapshot {
                         events: Vec::new(),
-                        version: None,
+                        generation: None,
                     });
                 }
                 Err(error) => return Err(error),
@@ -2962,7 +2973,12 @@ impl JournalWriter {
                 content.len(),
                 events.len(),
             );
-            return Ok(JournalSnapshot { events, version });
+            FileExt::unlock(&file)?;
+            let generation = version.map(|version| JournalSnapshotGeneration {
+                version,
+                _file: file,
+            });
+            return Ok(JournalSnapshot { events, generation });
         }
 
         Err(std::io::Error::new(
@@ -12400,6 +12416,57 @@ mod turn_event_buffer_tests {
             CanonicalCommitCasOutcome::Conflict(_)
         ));
         assert_eq!(writer.complete_append_order_snapshot().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn canonical_cas_revalidates_after_journal_deletion_and_recreation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let sid = "canonical-cas-recreated-journal";
+        let lease = SessionExecutionLease::try_acquire(sid).unwrap();
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(sid), None))
+            .unwrap();
+        let snapshot = writer.validated_append_order_snapshot().unwrap();
+        let original = writer.path().metadata().unwrap();
+
+        // Deletion must proceed while the snapshot is alive: it pins the
+        // inode, not its lock. A new journal cannot recycle that inode.
+        delete_session(sid).unwrap();
+        let existing = canonical_cas_test_commit(sid, "existing");
+        writer
+            .append(&canonical_cas_test_event(sid, "existing", existing.clone()))
+            .unwrap();
+        let recreated = writer.path().metadata().unwrap();
+        assert_ne!(
+            (original.dev(), original.ino()),
+            (recreated.dev(), recreated.ino())
+        );
+
+        let candidate = canonical_cas_test_commit(sid, "candidate");
+        let event = canonical_cas_test_event(sid, "candidate", candidate.clone());
+        assert!(matches!(
+            writer.append_canonical_commit_cas(
+                &lease,
+                None,
+                1,
+                &candidate,
+                &[event],
+                Some(&snapshot)
+            ),
+            CanonicalCommitCasOutcome::Conflict(_)
+        ));
+        let events = writer.complete_append_order_snapshot().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.last().unwrap().conversation_commit.as_ref(),
+            Some(&existing)
+        );
     }
 
     #[test]
