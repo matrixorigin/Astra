@@ -94,10 +94,6 @@ impl BackgroundTaskCounts {
             && self.monitors == 0
     }
 
-    pub(crate) fn has_local_agent_rows(self) -> bool {
-        self.local_agents > 0 || self.failed_local_agents > 0 || self.unavailable_local_agents > 0
-    }
-
     pub(crate) fn from_rows(
         rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
     ) -> Self {
@@ -429,14 +425,7 @@ impl StatusLine {
             && !counts.is_empty()
         {
             let mut parts = background_task_count_parts(counts);
-            parts.push(
-                if counts.has_local_agent_rows() {
-                    "Ctrl+T tasks"
-                } else {
-                    crate::tui::background_shortcut::background_task_open_hint()
-                }
-                .to_owned(),
-            );
+            parts.push(crate::tui::background_shortcut::background_task_open_hint().to_owned());
             let style = if counts.failed_total() > 0 {
                 Style::default().fg(theme.error)
             } else if counts.waiting > 0

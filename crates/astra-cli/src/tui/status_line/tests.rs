@@ -71,7 +71,7 @@ fn restored_agent_counts_do_not_claim_live_work_or_hide_other_attention() {
     .plain();
     assert!(footer.contains("1 local agent"), "{footer}");
     assert!(footer.contains("2 local agents unavailable"), "{footer}");
-    assert!(footer.contains("Ctrl+T tasks"), "{footer}");
+    assert!(footer.contains("Shift+↓ manage"), "{footer}");
 }
 
 // ─── Left-side state ──────────────────────────────────────────────
@@ -808,7 +808,7 @@ fn bg_footer_keeps_fanout_detail_in_the_task_surface() {
 
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("2 local agents · Ctrl+T tasks"),
+        plain.contains("2 local agents · Shift+↓ manage"),
         "the footer should expose one compact task pill and its primary route; got {plain:?}"
     );
     assert!(

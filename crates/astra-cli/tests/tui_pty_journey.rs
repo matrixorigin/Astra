@@ -518,6 +518,12 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
     astra.wait_for("Which option should I choose?", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("Working", UI_TRANSITION_TIMEOUT);
 
+    astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[1;2B"); // Shift+Down opens the background manager.
+    astra.wait_for("Background tasks", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
     astra.paste_and_submit("/tasks");
     astra.wait_for_screen(
         "running task in the background list",
@@ -2286,9 +2292,46 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x15]); // Ctrl+U clears the restored draft.
-    astra.write(b"/exit\r");
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_save_updates_composer_tips_in_the_current_terminal() {
+    let _journey = pty_journey_lock().lock().await;
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), "http://127.0.0.1:9");
+    astra.wait_for("· Tip", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/config");
+    astra.wait_for("Settings · type to filter", UI_TRANSITION_TIMEOUT);
+    astra.write(b"tips");
+    astra.wait_for("› Show terminal tips", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("› On", UI_TRANSITION_TIMEOUT);
+    astra.write(b" ");
+    astra.wait_for("› Off", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("› Show terminal tips", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+    astra.wait_for("Save changes?", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("Saved config to", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "composer with tips disabled",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains("Message Astra") && !line.contains("· Tip"))
+        },
+    );
+    let config = std::fs::read_to_string(home.path().join(".astra/config/runtime.toml")).unwrap();
+    assert!(config.contains("show_tips = false"));
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2305,7 +2348,7 @@ async fn settled_explain_report_expands_evidence_and_prepares_a_follow_up() {
     astra.paste_and_submit("/explain on");
     astra.wait_for("Explain on · report after each turn", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit("Record the execution evidence.");
-    astra.wait_for("Working", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
     assert!(!astra.current_screen().contains("Explain Analyze"));
 
     mock.release_held_response();
@@ -2496,15 +2539,24 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"/allow prompt\r");
-    astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
-    astra.write(b"request_a_write_and_wait_for_my_approval\r");
+    astra.paste_and_submit("request_a_write_and_wait_for_my_approval");
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
 
     astra.write(&[0x0f]); // Ctrl+O while approval owns the bottom pane.
-    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("write_file", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "transcript with approval suspended",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            (screen.contains("Main conversation · Transcript")
+                || screen.contains("Transcript · Root"))
+                && screen.contains("Enter details · / search")
+                && !screen.contains("Approval · Write File")
+        },
+    );
+    assert!(
+        mock.tool_results().is_empty(),
+        "viewing transcript must not act on the tool"
+    );
 
     astra.write(&[0x0f]);
     astra.wait_for("Approval · Write File", UI_TRANSITION_TIMEOUT);
@@ -2513,7 +2565,7 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     assert_committed_mock_write(&mock, home.path());
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
-    astra.write(b"/exit\r");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
@@ -3727,7 +3779,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
         astra.select_completed_conversation("Mock child review");
         astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
         astra.write(&[0x0f]);
-        astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
+        astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     }
     assert_eq!(
         mock.received_requests().len(),
@@ -3735,6 +3787,8 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
         "Server owns child execution"
     );
     assert!(mock.tool_results().is_empty());
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
