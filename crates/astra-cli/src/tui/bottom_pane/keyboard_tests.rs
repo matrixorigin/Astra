@@ -303,6 +303,89 @@ fn normal_typing_still_submits_without_a_paste_delay() {
 }
 
 #[test]
+fn a_pause_in_an_unbracketed_paste_does_not_submit_its_prefix() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let now = Instant::now();
+    for (i, ch) in "abc".chars().enumerate() {
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(i as u64),
+        );
+    }
+    // Let the burst flush, then deliver a later segment within its Enter grace.
+    pane.pre_draw_tick(now + std::time::Duration::from_millis(11));
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        now + std::time::Duration::from_millis(20),
+    );
+    assert!(matches!(
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(30),
+        ),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "abcd\n");
+    assert!(matches!(
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(200),
+        ),
+        BottomPaneAction::SubmitInput(ref text) if text == "abcd\n"
+    ));
+}
+
+#[test]
+fn bracketed_paste_after_canceled_search_does_not_drop_new_input() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("parked");
+    let now = Instant::now();
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        now,
+    );
+    for (i, ch) in "abc".chars().enumerate() {
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(i as u64 + 1),
+        );
+    }
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        now + std::time::Duration::from_millis(4),
+    );
+    pane.handle_paste("P");
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        now + std::time::Duration::from_millis(5),
+    );
+    assert_eq!(pane.composer.text(), "parkedPx");
+}
+
+#[test]
+fn bracketed_paste_flushes_existing_keys_and_allows_a_fresh_enter() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let now = Instant::now();
+    for (i, ch) in "abc".chars().enumerate() {
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(i as u64),
+        );
+    }
+    pane.handle_paste("P");
+    assert!(matches!(
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(3),
+        ),
+        BottomPaneAction::SubmitInput(ref text) if text == "abcP"
+    ));
+}
+
+#[test]
 fn history_search_stays_visible_in_narrow_terminals() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();

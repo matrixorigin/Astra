@@ -115,7 +115,7 @@ impl PasteBurstDetector {
                 Some(GuardedInput::Discard)
             }
             (true, _) => Some(GuardedInput::Insert),
-            (false, Some(_)) => {
+            (false, Some((_, GuardedInput::Discard))) => {
                 self.paste_guard = None;
                 None
             }

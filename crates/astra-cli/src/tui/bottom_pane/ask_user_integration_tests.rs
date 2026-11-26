@@ -561,6 +561,59 @@ fn fresh_question_input_releases_an_unflushed_composer_paste() {
 }
 
 #[test]
+fn bracketed_question_paste_releases_the_parked_composers_canceled_tail() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    bp.composer.set_text("parked draft");
+    let now = std::time::Instant::now();
+    bp.handle_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        now,
+    );
+    for (i, ch) in "abc".chars().enumerate() {
+        bp.handle_key_at(
+            key(ch),
+            now + std::time::Duration::from_millis(i as u64 + 1),
+        );
+    }
+    bp.handle_key_at(
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        now + std::time::Duration::from_millis(4),
+    );
+    let mut rx = enqueue(&mut bp, single_question(true));
+    bp.handle_paste("P");
+    bp.handle_key_at(key('x'), now + std::time::Duration::from_millis(5));
+    bp.handle_key_at(
+        special(KeyCode::Enter),
+        now + std::time::Duration::from_millis(25),
+    );
+    let AskUserResponse::Submitted(answers) = rx.try_recv().unwrap() else {
+        panic!("expected an answer");
+    };
+    assert_eq!(answers.answers[0].answers, ["Px"]);
+    assert_eq!(bp.composer.text(), "parked draft");
+}
+
+#[test]
+fn bracketed_question_paste_can_be_submitted_immediately() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let mut rx = enqueue(&mut bp, single_question(true));
+    let now = std::time::Instant::now();
+    bp.handle_key_at(key('x'), now);
+    bp.handle_paste("P");
+    let action = bp.handle_key_at(
+        special(KeyCode::Enter),
+        now + std::time::Duration::from_millis(1),
+    );
+    assert!(matches!(action, BottomPaneAction::ViewCompleted { .. }));
+    let AskUserResponse::Submitted(answers) = rx.try_recv().unwrap() else {
+        panic!("expected an answer");
+    };
+    assert_eq!(answers.answers[0].answers, ["xP"]);
+}
+
+#[test]
 fn canceling_a_question_discards_its_tail_even_if_another_question_opens() {
     let mut bp = BottomPane::new();
     bp.composer = super::chat_composer::ChatComposer::new_ephemeral();

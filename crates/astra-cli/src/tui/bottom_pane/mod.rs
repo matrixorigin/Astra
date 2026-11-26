@@ -769,6 +769,12 @@ impl BottomPane {
     /// pastes are inserted verbatim. After the paste lands, popup
     /// state is resynced because paste can newly trigger `/`, `@`, `$`.
     pub fn handle_paste(&mut self, text: &str) {
+        if self.has_active_view() {
+            // The explicit paste belongs to the focused view; a parked
+            // composer's old unbracketed tail must not capture later keys.
+            self.composer
+                .release_paste_focus_at(std::time::Instant::now());
+        }
         if self
             .active_view_mut()
             .is_some_and(|view| view.handle_paste(text))

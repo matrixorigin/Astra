@@ -31755,9 +31755,7 @@ mod tests {
                     "/tmp/project inspect this",
                 )
                 .unwrap();
-                for ch in draft.chars() {
-                    pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-                }
+                crate::tui::testing::keys::type_into(&mut pane, draft);
                 assert!(pane.return_user_intent(
                     "returned-literal",
                     astra_turn_types::UserIntentStatus::Returned,

@@ -359,6 +359,9 @@ impl TextArea {
 
     pub(super) fn insert_str(&mut self, s: &str) {
         self.flush_pending_paste();
+        // Explicit text insertion (bracketed paste or yank) starts a new
+        // input gesture; it cannot be the tail of earlier unbracketed keys.
+        self.paste_burst.release_focus();
         self.insert_str_raw(s);
     }
 
