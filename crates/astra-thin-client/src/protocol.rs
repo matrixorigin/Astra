@@ -102,6 +102,8 @@ impl ChatStreamRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SessionCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,

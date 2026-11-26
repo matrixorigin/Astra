@@ -88,10 +88,12 @@ pub(crate) async fn execute(
     };
     // A distinct real session keeps evaluation usage out of the measured agent
     // session. There is no agent run, local workspace, tool set, or chat turn.
+    let client_session_ref = format!("session-judge-{}", uuid::Uuid::new_v4());
     let session = match api
         .create_session(
             Some(token),
             &SessionCreateRequest {
+                client_session_ref: Some(client_session_ref),
                 title: Some("Evidence judgment".into()),
                 metadata: Some(serde_json::Map::from_iter([
                     ("purpose".into(), json!("verification_judge")),
@@ -387,8 +389,15 @@ mod tests {
         assert_eq!(result["judgment"]["answers"]["0"]["decision"], "no");
         assert_eq!(body["timeout_ms"], 37_000);
         assert!(body.get("tools").is_none());
-        let metadata: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(!metadata.to_string().contains("quoted evidence"));
+        let session_create: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let client_ref = session_create["client_session_ref"]
+            .as_str()
+            .expect("judgment session must carry provider idempotency identity");
+        let uuid = client_ref
+            .strip_prefix("session-judge-")
+            .expect("judgment identity must use the session-judge namespace");
+        uuid::Uuid::parse_str(uuid).expect("judgment identity suffix must be a UUID");
+        assert!(!session_create.to_string().contains("quoted evidence"));
     }
 
     #[tokio::test]
