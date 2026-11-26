@@ -832,24 +832,24 @@ fn compact_view<'a>(
                 .unwrap_or(0) as u16,
         )
         .saturating_add(u16::from(multi_agent.is_some()));
-    let history_rows = bottom_pane.history_suggestions_height();
+    let extra_picker_rows = bottom_pane.extra_picker_rows();
     bottom_pane.set_composer_frame_allowed(true);
     let framed_bottom_h = bottom_pane
         .desired_height(width)
-        .saturating_sub(history_rows);
-    // Keep part of the candidate list ahead of optional frame chrome.
-    let minimum_history_rows = history_rows.saturating_sub(1).min(2);
+        .saturating_sub(extra_picker_rows);
+    // Keep a useful slice of the candidate list ahead of the optional frame.
+    let minimum_picker_rows = extra_picker_rows.saturating_sub(1).min(2);
     bottom_pane.set_composer_frame_allowed(
         height
             >= framed_bottom_h
                 .saturating_add(required_rows)
-                .saturating_add(minimum_history_rows),
+                .saturating_add(minimum_picker_rows),
     );
 
     let desired = bottom_pane.desired_height(width);
     let bottom_h = height
         .saturating_sub(required_rows)
-        .clamp(desired.saturating_sub(history_rows), desired);
+        .clamp(desired.saturating_sub(extra_picker_rows), desired);
     let available = height.saturating_sub(bottom_h);
     let status = status
         .filter(|_| available > 0 && !bottom_pane.has_active_view())
@@ -887,10 +887,16 @@ fn compact_view<'a>(
     }
     let spacer = u16::from((status.is_some() || task_board.is_some()) && auxiliary > 0);
     auxiliary -= spacer;
-    // Tips yield before live output and fit as a single complete line.
-    let tip = (height >= 12 && auxiliary >= 3)
-        .then(|| bottom_pane.tip_line(width, status.is_some()))
-        .flatten();
+    // A tip uses a spare row so streaming output keeps its full viewport.
+    let content_rows = match &active {
+        ActiveView::Empty => 0,
+        ActiveView::Hint(_) => 1,
+        ActiveView::Active { lines, parked, .. } => lines.len() + parked.len(),
+    };
+    let tip =
+        (height >= 12 && auxiliary >= 3 && content_rows < usize::from(active_min + auxiliary))
+            .then(|| bottom_pane.tip_line(width, status.is_some()))
+            .flatten();
     auxiliary -= u16::from(tip.is_some());
     let active_rows = usize::from(active_min + auxiliary);
     let active: RenderableItem<'_> = match active {
@@ -1211,6 +1217,9 @@ mod compact_surface_tests {
         };
         let first = draw(&mut pane, 24);
         assert!(first.contains("Tip  Ctrl+Q queues input"), "{first}");
+        pane.set_tips_enabled(false);
+        assert!(!draw(&mut pane, 24).contains("Tip"));
+        pane.enable_tips(started_at);
         assert!(pane.pre_draw_tick(started_at + std::time::Duration::from_secs(24)));
         let second = draw(&mut pane, 24);
         assert!(

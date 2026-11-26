@@ -600,14 +600,15 @@ fn fit_clusters(
             + usize::from(!left.is_empty() && !right.is_empty()) * 3
     };
     let essential_left = mode_index + 1 + usize::from(pending_mode);
-    if total(left, right) > available {
-        for index in (essential_left..left.len()).rev() {
-            let segment = &mut left[index];
+    let mut excess = total(left, right).saturating_sub(available);
+    if excess > 0 {
+        for segment in left.iter_mut().skip(essential_left).rev() {
             if let Some(end) = segment.compact_end {
+                excess = excess.saturating_sub(segment.text.width() - segment.text[..end].width());
                 segment.text.truncate(end);
-            }
-            if total(left, right) <= available {
-                return;
+                if excess == 0 {
+                    return;
+                }
             }
         }
     }

@@ -1760,7 +1760,7 @@ impl BottomPaneView for TranscriptView {
         let visible_end = (render_scroll + max_visible).min(self.lines.len());
         if self.lines.is_empty() && y < bottom {
             let message = if self.snapshot.items.is_empty() {
-                "  No messages recorded for this run yet."
+                "  No conversation yet."
             } else if self.filter != TranscriptFilter::All {
                 "  No matching items · F changes the filter"
             } else {

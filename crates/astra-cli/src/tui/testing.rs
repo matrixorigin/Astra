@@ -13,6 +13,25 @@
 #![cfg(test)]
 #![allow(dead_code)]
 
+/// Give a subprocess fresh terminal defaults and an isolated project directory.
+pub(crate) fn configure_terminal(
+    command: &mut std::process::Command,
+    settings: &str,
+) -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("terminal config root");
+    let config_dir = root.path().join("config");
+    std::fs::create_dir(&config_dir).expect("terminal config directory");
+    std::fs::write(
+        config_dir.join("runtime.toml"),
+        format!("[tui]\n{settings}\n"),
+    )
+    .expect("write terminal config");
+    command
+        .env("ASTRA_LOCAL_STATE_ROOT", root.path())
+        .current_dir(root.path());
+    root
+}
+
 pub(crate) mod keys {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};

@@ -71,6 +71,10 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub explain: ExplainConfig,
 
+    /// Preferences for the local terminal interface.
+    #[serde(default, skip_serializing_if = "TuiConfig::is_empty")]
+    pub tui: TuiConfig,
+
     /// Local `web_fetch` network policy. User-level only: the project layer
     /// cannot set it (see [`USER_ONLY_SECTIONS`]).
     #[serde(default)]
@@ -180,6 +184,112 @@ impl ExplainConfig {
     /// Resolve the format used for the next report publication.
     pub fn effective_report_format(&self) -> ExplainReportFormat {
         self.report_format.unwrap_or_default()
+    }
+}
+
+/// Local terminal presentation preferences.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_tips: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<TuiThemeProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glyphs: Option<TuiGlyphProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground: Option<TuiColor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<TuiColor>,
+}
+
+impl TuiConfig {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn show_tips(&self) -> bool {
+        self.show_tips.unwrap_or(true)
+    }
+}
+
+/// Colour profile selected before initializing the terminal.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiThemeProfile {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    DarkAnsi,
+    LightAnsi,
+    Plain,
+}
+
+impl TuiThemeProfile {
+    pub(crate) const OPTIONS: &[&str] =
+        &["auto", "dark", "light", "dark-ansi", "light-ansi", "plain"];
+}
+
+/// Glyph profile selected before rendering the terminal.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiGlyphProfile {
+    #[default]
+    Unicode,
+    Ascii,
+}
+
+impl TuiGlyphProfile {
+    pub(crate) const OPTIONS: &[&str] = &["unicode", "ascii"];
+}
+
+/// Explicit sRGB or automatic terminal color selection.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
+pub enum TuiColor {
+    #[default]
+    Auto,
+    Rgb(u8, u8, u8),
+}
+
+impl TuiColor {
+    pub fn rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::Auto => None,
+            Self::Rgb(r, g, b) => Some((r, g, b)),
+        }
+    }
+}
+
+impl TryFrom<String> for TuiColor {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let error = "Enter #RRGGBB or auto";
+        let hex = value.strip_prefix('#').ok_or(error)?;
+        if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(error);
+        }
+        let color = u32::from_str_radix(hex, 16).map_err(|_| error)?;
+        Ok(Self::Rgb(
+            (color >> 16) as u8,
+            (color >> 8) as u8,
+            color as u8,
+        ))
+    }
+}
+
+impl From<TuiColor> for String {
+    fn from(color: TuiColor) -> Self {
+        match color {
+            TuiColor::Auto => "auto".to_string(),
+            TuiColor::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        }
     }
 }
 
@@ -320,6 +430,7 @@ impl Default for RuntimeConfig {
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
             explain: ExplainConfig::default(),
+            tui: TuiConfig::default(),
             web_fetch: WebFetchConfig::default(),
         }
     }
@@ -1335,8 +1446,6 @@ impl RuntimeConfig {
                 .enabled_categories
                 .push(TraceCategory::LlmExchanges);
         }
-        // ASTRA_FORK_INHERIT_PREFIX is intentionally ignored: fork capture
-        // and eligible inheritance are always on.
     }
 
     /// Get configuration as TOML string.

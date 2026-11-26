@@ -52,7 +52,7 @@ pub(crate) fn render_composer(
         .min(MAX_VISIBLE_ROWS);
     let (start, end) = window_around(selected, matches.len(), usize::from(slots));
     let visible = &matches[start..end];
-    let name_width = visible
+    let name_width = matches
         .iter()
         .map(|item| item.name.width())
         .max()

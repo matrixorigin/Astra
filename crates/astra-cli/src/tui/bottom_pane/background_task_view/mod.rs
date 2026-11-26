@@ -947,7 +947,7 @@ mod tests {
 
         let list = render(&view, 100, 5);
         assert!(list.contains("running"), "{list}");
-        assert!(list.contains("stale snapshot"), "{list}");
+        assert!(list.contains("stale · running"), "{list}");
         assert!(!list.contains("1 running"), "{list}");
         assert!(list.contains("restored long command"), "{list}");
 

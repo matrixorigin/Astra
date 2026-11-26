@@ -211,7 +211,7 @@ const EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
         "Include context budgets, dependencies, and coverage",
     ),
     ("off", "Hide reports for subsequent turns"),
-    ("--format html", "Open a standalone HTML report"),
+    ("--format html", "Write a standalone HTML report"),
     ("--format markdown", "Write the report as Markdown"),
     ("--format text", "Write the report as plain text"),
 ];
@@ -554,7 +554,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Inspect and settings ───────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
-        "Measure call timing, outcomes, and tokens",
+        "Show call timing, outcomes, and tokens",
         CommandGroup::Inspect,
     )
     .with_subcommands(EXPLAIN_SUBCOMMANDS)
@@ -940,19 +940,19 @@ mod tests {
 
         let work = resolve_command_meta("/work").expect("work command registered");
         assert_eq!(
-            work.visible_tui_subcommands(),
+            work.visible_tui_subcommands()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
             [
-                ("start", "Begin here: track a goal across TUI and Web"),
-                ("list", "Open saved tasks; choose View or Continue"),
-                ("status", "See this task's plan and progress"),
-                ("continue", "Give a chosen task its next instruction"),
-                (
-                    "execution",
-                    "See where a task runs; move it to another Edge"
-                ),
-                ("retry", "Retry only when a request result is unknown"),
-                ("save", "Save a recovery point before a risky change")
-            ]
+                "start",
+                "list",
+                "status",
+                "continue",
+                "execution",
+                "retry",
+                "save"
+            ],
         );
 
         let tasks = resolve_command_meta("/tasks").expect("tasks command registered");

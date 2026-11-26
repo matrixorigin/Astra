@@ -13,8 +13,8 @@ use super::fanout_header::{
 use unicode_width::UnicodeWidthStr;
 
 use super::types::{
-    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStatusExt, format_elapsed,
-    pluralize_with_count,
+    BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStatusExt, LiveControlState,
+    format_elapsed, pluralize_with_count,
 };
 
 pub(crate) enum BackgroundTaskListEntry<'a> {
@@ -99,7 +99,7 @@ pub(crate) fn render_list(
     let (mut running, mut waiting, mut stopping, mut failed, mut interrupted, mut stale) =
         (0, 0, 0, 0, 0, 0);
     for row in rows {
-        if row.live_control == super::types::LiveControlState::StaleHandle {
+        if row.live_control == LiveControlState::StaleHandle {
             stale += 1;
             continue;
         }
@@ -227,11 +227,25 @@ pub(crate) fn render_list(
                 };
                 let width = usize::from(area.width);
                 let elapsed = format_elapsed(row.elapsed_ms);
-                let mut meta = format!("{}  {}  {elapsed}", row.kind.as_str(), row.status.label());
+                let prefix = if row.live_control == LiveControlState::StaleHandle {
+                    "stale · "
+                } else {
+                    ""
+                };
+                let mut meta = format!(
+                    "{}  {prefix}{}  {elapsed}",
+                    row.kind.as_str(),
+                    row.status.label()
+                );
+                let exit = row
+                    .exit_code
+                    .map(|code| format!("  exit {code}"))
+                    .unwrap_or_default();
                 // Keep a recognizable title alongside status and duration as
                 // the pane narrows. Full identity and facts are in details.
                 let budget = width.saturating_sub(marker.width() + index.width() + 16);
                 for extra in [
+                    exit,
                     control,
                     ownership.to_string(),
                     activity,

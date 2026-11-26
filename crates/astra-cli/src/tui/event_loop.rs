@@ -5761,7 +5761,7 @@ fn explain_mode_observes_graph(mode: crate::cli::session::session_state::Explain
 
 /// Keep every freshly replayed ChatWidget on the same Explain presentation
 /// snapshot as SessionState. Resume and Work/session rebinding construct a new
-/// widget, so setting only the mode or live-row count would otherwise silently
+/// widget, so setting only the mode would otherwise silently
 /// restore the renderer's default report format.
 fn sync_explain_presentation(
     chat_widget: &mut chat_widget::ChatWidget,
@@ -10005,6 +10005,7 @@ pub(crate) async fn run_tui_session(
     let (file_writer, file_writer_runtime, mut file_write_errors) = super::file_writer::spawn();
     let mut reported_file_write_errors = std::collections::HashSet::new();
     let mut bottom_pane = BottomPane::new();
+    bottom_pane.set_tips_enabled(astra_config::RuntimeConfig::cached().tui.show_tips());
     bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
     bottom_pane.set_file_writer(file_writer.clone());
     // ── Enter TUI ───────────────────────────────────────────────────────
@@ -14325,7 +14326,8 @@ pub(crate) async fn run_tui_session(
                                             .await;
                                         let msg = match result {
                                             Ok(outcome) => {
-                                                if outcome.save.is_some() {
+                                                if let Some(show_tips) = outcome.show_tips {
+                                                    bottom_pane.set_tips_enabled(show_tips);
                                                     sync_explain_presentation(
                                                         &mut chat_widget,
                                                         &state,

@@ -534,9 +534,7 @@ impl BottomPane {
             pending_model_setup_read: None,
             interrupt_pending: false,
             staged_permission_mode: None,
-            tip_rotation: (!std::env::var("ASTRA_TUI_TIPS")
-                .is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")))
-            .then(|| (std::time::Instant::now(), 0)),
+            tip_rotation: None,
         }
     }
 
@@ -2964,6 +2962,14 @@ impl BottomPane {
         self.composer.history_suggestions_height()
     }
 
+    pub(crate) fn extra_picker_rows(&self) -> u16 {
+        if self.has_active_view() {
+            0
+        } else {
+            self.popup_height().saturating_sub(1) + self.history_suggestions_height()
+        }
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
             let mut h = view.desired_height(width);
@@ -3682,6 +3688,15 @@ impl BottomPane {
     #[cfg(test)]
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
         self.pre_draw_session_tick(now, &[])
+    }
+
+    pub(crate) fn set_tips_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.tip_rotation
+                .get_or_insert_with(|| (std::time::Instant::now(), 0));
+        } else {
+            self.tip_rotation = None;
+        }
     }
 
     #[cfg(test)]

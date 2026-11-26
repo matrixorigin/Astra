@@ -696,7 +696,7 @@ mod tests {
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(text.contains("durable root answer"), "{text}");
         assert!(
-            text.contains("Main conversation · session-1 · Transcript"),
+            text.contains("Transcript · Root · session-1"),
             "the transcript must identify the session being inspected: {text}"
         );
         assert_eq!(

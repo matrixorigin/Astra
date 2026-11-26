@@ -126,7 +126,12 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     assert(visible.some(line => line.includes(draft ? 'DRAFT_SENTINEL' : 'Message Astra')), 'live composer not visible: ' + context);
     assert.equal(all.filter(line => line.includes('RESIZE_HISTORY_SENTINEL')).length, 1,
       'pre-existing history was lost or duplicated: ' + context);
-    assert.equal((all.join('').match(/history/g) || []).length, 20, 'history text was damaged: ' + context);
+    const history = all.join('').replace(/\s/g, '').match(/RESIZE_HISTORY_SENTINEL((?:history)+)/);
+    assert.equal(history?.[1], 'history'.repeat(20), 'history text was damaged: ' + context);
+    const tips = all.filter(line => /^  Tip  /.test(line));
+    assert.equal(tips.length, visible.filter(line => /^  Tip  /.test(line)).length,
+      'a tip leaked into scrollback: ' + context);
+    if (draft) assert.equal(tips.length, 0, 'tips should yield to a draft: ' + context);
     assert.equal(all.filter(line => line.includes('Workspace trusted')).length, 1,
       'committed startup history was lost or duplicated: ' + context);
     assert(!Buffer.concat(output).includes(Buffer.from('\x1b[3J')), 'resize purged native scrollback');

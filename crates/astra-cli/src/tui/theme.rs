@@ -9,9 +9,8 @@
 //!
 //! Callers should go through [`current()`] rather than instantiating
 //! directly. `current()` caches the selected theme once per process. It uses
-//! terminal capability and background hints, while `ASTRA_TUI_THEME` gives a
-//! user an explicit escape hatch for a multiplexer or remote terminal whose
-//! capability environment is incomplete.
+//! terminal capability and background hints. The `/config` editor provides
+//! explicit profiles for a multiplexer or remote terminal.
 
 use std::sync::OnceLock;
 
@@ -83,34 +82,7 @@ pub(crate) struct Theme {
     pub stall_error: Color,
 }
 
-/// Rendering colour capability selected for the whole TUI lifetime.
-///
-/// This is deliberately a small presentation choice, not a second theme
-/// framework: all renderers continue to consume the same semantic slots from
-/// [`Theme`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThemeProfile {
-    Auto,
-    Dark,
-    Light,
-    DarkAnsi,
-    LightAnsi,
-    Plain,
-}
-
-impl ThemeProfile {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "dark" => Some(Self::Dark),
-            "light" => Some(Self::Light),
-            "dark-ansi" | "ansi-dark" => Some(Self::DarkAnsi),
-            "light-ansi" | "ansi-light" => Some(Self::LightAnsi),
-            "plain" | "none" | "no-color" => Some(Self::Plain),
-            _ => None,
-        }
-    }
-}
+pub(crate) use astra_config::runtime_config::TuiThemeProfile as ThemeProfile;
 
 impl Theme {
     /// Preset for dark-backgrounded terminals (the previous default).
@@ -563,11 +535,10 @@ fn theme_for_stream(stream: supports_color::Stream) -> Theme {
     if std::env::var_os("NO_COLOR").is_some() {
         return Theme::plain();
     }
-    let profile = std::env::var("ASTRA_TUI_THEME")
-        .ok()
-        .as_deref()
-        .and_then(ThemeProfile::parse)
-        .unwrap_or(ThemeProfile::Auto);
+    let profile = astra_config::RuntimeConfig::cached()
+        .tui
+        .theme
+        .unwrap_or_default();
     match profile {
         ThemeProfile::Auto => Theme::auto_for_stream(stream),
         _ => Theme::for_profile(profile),
@@ -581,7 +552,7 @@ pub(crate) fn set_for_tests(theme: Theme) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Theme, ThemeProfile, color_to_rgb, current, perceived_lightness};
+    use super::{Theme, color_to_rgb, current, perceived_lightness};
     use ratatui::style::Color;
 
     #[test]
@@ -625,20 +596,6 @@ mod tests {
             assert_ne!(theme.diff_del_bg, Color::Reset, "{theme:?}");
             assert_ne!(theme.diff_add_bg, theme.diff_del_bg, "{theme:?}");
         }
-    }
-
-    #[test]
-    fn profile_parser_accepts_explicit_terminal_safe_choices() {
-        assert_eq!(
-            ThemeProfile::parse("dark-ansi"),
-            Some(ThemeProfile::DarkAnsi)
-        );
-        assert_eq!(
-            ThemeProfile::parse("ansi-light"),
-            Some(ThemeProfile::LightAnsi)
-        );
-        assert_eq!(ThemeProfile::parse("no-color"), Some(ThemeProfile::Plain));
-        assert_eq!(ThemeProfile::parse("not-a-theme"), None);
     }
 
     #[test]
@@ -823,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_profile_environment_reaches_surfaces_and_highlighting() {
+    fn terminal_config_reaches_surfaces_and_highlighting() {
         const CASE: &str = "ASTRA_TEST_TERMINAL_PROFILE";
         if let Ok(expected) = std::env::var(CASE) {
             let theme = current();
@@ -862,7 +819,7 @@ mod tests {
             return;
         }
         let test = format!(
-            "{}::terminal_profile_environment_reaches_surfaces_and_highlighting",
+            "{}::terminal_config_reaches_surfaces_and_highlighting",
             module_path!().split_once("::").unwrap().1
         );
         for (profile, bg, no_color, expected) in [
@@ -880,15 +837,14 @@ mod tests {
             child
                 .args(["--exact", &test, "--nocapture"])
                 .env(CASE, expected)
-                .env("ASTRA_TUI_THEME", profile)
                 .env("COLORTERM", "truecolor")
                 .env_remove("NO_COLOR")
-                .env_remove("COLORFGBG")
-                .env_remove("ASTRA_TERMINAL_BG")
-                .env_remove("ASTRA_TERMINAL_FG");
+                .env_remove("COLORFGBG");
+            let mut settings = format!("theme = {profile:?}");
             if let Some(bg) = bg {
-                child.env("ASTRA_TERMINAL_BG", bg);
+                settings.push_str(&format!("\nbackground = {bg:?}"));
             }
+            let _config = crate::tui::testing::configure_terminal(&mut child, &settings);
             if no_color {
                 child.env("NO_COLOR", "1");
             }
@@ -922,13 +878,13 @@ mod tests {
             "{}::stderr_theme_uses_its_own_terminal_capabilities",
             module_path!().split_once("::").unwrap().1
         );
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let _config =
+            crate::tui::testing::configure_terminal(&mut command, "background = \"#ffffff\"");
+        let output = command
             .args(["--exact", &test, "--nocapture"])
             .env(CASE, "1")
             .env("TERM", "xterm-256color")
-            .env("ASTRA_TUI_THEME", "auto")
-            .env("ASTRA_TERMINAL_BG", "#ffffff")
-            .env_remove("ASTRA_TERMINAL_FG")
             .env_remove("COLORFGBG")
             .env_remove("COLORTERM")
             .env_remove("TERM_PROGRAM")

@@ -115,8 +115,7 @@ impl LiveControlState {
 
     pub(crate) fn list_label(self) -> Option<&'static str> {
         match self {
-            Self::Available => None,
-            Self::StaleHandle => Some("stale snapshot"),
+            Self::Available | Self::StaleHandle => None,
             Self::UnsupportedInMode => Some("no control"),
         }
     }

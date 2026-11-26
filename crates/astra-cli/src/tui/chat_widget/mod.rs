@@ -56,7 +56,6 @@ use astra_turn_core::{
         agent_fanout_control_receipt_kind,
     },
 };
-use ratatui::text::Line;
 
 /// Events the ChatWidget knows how to route. Grouped by origin so
 /// `handle_event` can scale to more variants without bloating a
