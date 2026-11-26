@@ -2303,6 +2303,34 @@ pub enum SessionEndWriteError {
     Unconfirmed(std::io::Error),
 }
 
+/// A complete append-order read. Its observations can be reused only if the
+/// same file generation and version are still current under the write lock.
+/// When supported, an unlocked file handle pins that generation until drop.
+pub struct JournalSnapshot {
+    events: Vec<JournalEvent>,
+    generation: Option<JournalSnapshotGeneration>,
+}
+
+struct JournalSnapshotGeneration {
+    version: (JournalFileIdentity, JournalFileVersion),
+    // Keep the unlinked inode alive so its identity cannot be recycled while
+    // this snapshot is eligible for reuse. The shared lock is already released.
+    _file: std::fs::File,
+}
+
+impl JournalSnapshot {
+    pub fn events(&self) -> &[JournalEvent] {
+        &self.events
+    }
+}
+
+fn journal_snapshot_version(
+    file: &std::fs::File,
+) -> std::io::Result<Option<(JournalFileIdentity, JournalFileVersion)>> {
+    let metadata = file.metadata()?;
+    Ok(journal_file_identity(&metadata).zip(journal_file_version(&metadata)))
+}
+
 pub struct JournalWriter {
     path: PathBuf,
     owner_scope: OwnerScope,
@@ -2514,6 +2542,7 @@ impl JournalWriter {
         turn: u32,
         intended: &ConversationCommitV1,
         events: &[JournalEvent],
+        snapshot: Option<&JournalSnapshot>,
     ) -> CanonicalCommitCasOutcome {
         if lease.session_id != self.session_id
             || lease.lock_path != execution_lease_path(&self.path, &self.session_id)
@@ -2529,6 +2558,7 @@ impl JournalWriter {
             events,
             &lease.created_parent_dirs,
             None,
+            snapshot,
         )
     }
 
@@ -2542,6 +2572,7 @@ impl JournalWriter {
         turn: u32,
         intended: &ConversationCommitV1,
         event: &JournalEvent,
+        snapshot: Option<&JournalSnapshot>,
     ) -> CanonicalCommitCasOutcome {
         if lease.session_id != self.session_id
             || lease.lock_path != execution_lease_path(&self.path, &self.session_id)
@@ -2574,6 +2605,7 @@ impl JournalWriter {
             std::slice::from_ref(event),
             &lease.created_parent_dirs,
             Some(event),
+            snapshot,
         ) {
             CanonicalCommitCasOutcome::Committed {
                 persistence_warning,
@@ -2593,6 +2625,7 @@ impl JournalWriter {
         events: &[JournalEvent],
         lease_created_dirs: &[PathBuf],
         content_omitted: Option<&JournalEvent>,
+        snapshot: Option<&JournalSnapshot>,
     ) -> CanonicalCommitCasOutcome {
         use fs2::FileExt;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -2663,33 +2696,53 @@ impl JournalWriter {
             }
         }
 
-        if let Err(error) = file.seek(SeekFrom::Start(0)) {
-            return CanonicalCommitCasOutcome::Unknown(format!(
-                "failed to seek canonical journal CAS: {error}"
-            ));
-        }
-        let mut content = String::new();
-        if let Err(error) = file.read_to_string(&mut content) {
-            return CanonicalCommitCasOutcome::Unknown(format!(
-                "failed to read canonical journal CAS: {error}"
-            ));
-        }
-        let (current_events, _, malformed_lines) =
-            match parse_complete_journal_text_in_append_order(&content) {
-                Ok(parsed) => parsed,
+        let read_complete = |file: &mut std::fs::File| -> std::io::Result<_> {
+            file.seek(SeekFrom::Start(0))?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            let (events, _, malformed_lines) =
+                parse_complete_journal_text_in_append_order(&content)?;
+            record_journal_read(
+                astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
+                content.len(),
+                events.len(),
+            );
+            Ok((events, malformed_lines, content.len() as u64))
+        };
+        let owned;
+        // Journal writers append under the file lock; maintenance retires the
+        // inode. The snapshot pins that inode until this version check.
+        let (current_events, malformed_lines, append_offset) = match snapshot.and_then(|snapshot| {
+            snapshot
+                .generation
+                .as_ref()
+                .map(|generation| (snapshot, &generation.version))
+        }) {
+            Some((snapshot, version))
+                if journal_snapshot_version(&file)
+                    .is_ok_and(|current| current.as_ref() == Some(version)) =>
+            {
+                (snapshot.events(), 0, version.1.len)
+            }
+            _ => match read_complete(&mut file) {
+                Ok(parsed) => {
+                    owned = parsed.0;
+                    (owned.as_slice(), parsed.1, parsed.2)
+                }
                 Err(error) => {
                     return CanonicalCommitCasOutcome::Unknown(format!(
                         "canonical journal CAS readback is incomplete: {error}"
                     ));
                 }
-            };
+            },
+        };
         let classify = |events: &[JournalEvent], malformed_lines| match content_omitted {
             Some(event) => {
                 classify_content_omitted_turn_presence(events, malformed_lines, turn, event)
             }
             None => classify_canonical_commit_presence(events, malformed_lines, turn, intended),
         };
-        match classify(&current_events, malformed_lines) {
+        match classify(current_events, malformed_lines) {
             CanonicalCommitPresence::Exact => {
                 if let Err(error) = file.sync_data() {
                     return CanonicalCommitCasOutcome::Unknown(format!(
@@ -2773,27 +2826,42 @@ impl JournalWriter {
             }
         }
 
-        if let Err(error) = file.seek(SeekFrom::Start(0)) {
-            return CanonicalCommitCasOutcome::Unknown(format!(
-                "failed to seek canonical journal CAS verification: {error}"
-            ));
-        }
-        let mut verified_content = String::new();
-        if let Err(error) = file.read_to_string(&mut verified_content) {
-            return CanonicalCommitCasOutcome::Unknown(format!(
-                "failed to read canonical journal CAS verification: {error}"
-            ));
-        }
-        let (verified_events, _, verified_malformed_lines) =
-            match parse_complete_journal_text_in_append_order(&verified_content) {
-                Ok(parsed) => parsed,
+        // The locked prefix already proved the turn absent. Read only the
+        // appended batch on success; ambiguous writes use the full proof.
+        let verify_suffix = |file: &mut std::fs::File| -> std::io::Result<bool> {
+            let end = file.seek(SeekFrom::End(0))?;
+            if end.checked_sub(append_offset) != Some(serialized.len() as u64) {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::Start(append_offset))?;
+            let mut suffix = String::new();
+            file.take(serialized.len() as u64)
+                .read_to_string(&mut suffix)?;
+            if suffix.as_bytes() != serialized {
+                return Ok(false);
+            }
+            let (events, _, malformed_lines) =
+                parse_complete_journal_text_in_append_order(&suffix)?;
+            record_journal_read(
+                astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
+                suffix.len(),
+                events.len(),
+            );
+            Ok(classify(&events, malformed_lines) == CanonicalCommitPresence::Exact)
+        };
+        let presence = if write_error.is_none() && verify_suffix(&mut file).unwrap_or(false) {
+            CanonicalCommitPresence::Exact
+        } else {
+            match read_complete(&mut file) {
+                Ok((events, malformed_lines, _)) => classify(&events, malformed_lines),
                 Err(error) => {
                     return CanonicalCommitCasOutcome::Unknown(format!(
                         "canonical journal CAS verification is incomplete: {error}"
                     ));
                 }
-            };
-        match classify(&verified_events, verified_malformed_lines) {
+            }
+        };
+        match presence {
             CanonicalCommitPresence::Exact => {
                 match open_journal_file_is_current(&file, &self.path) {
                     Ok(true) => {}
@@ -2859,6 +2927,11 @@ impl JournalWriter {
     /// order. Canonical replay must use this order rather than timestamps,
     /// which are diagnostic and may move backwards across processes.
     pub fn complete_append_order_snapshot(&self) -> std::io::Result<Vec<JournalEvent>> {
+        self.validated_append_order_snapshot()
+            .map(|snapshot| snapshot.events)
+    }
+
+    pub fn validated_append_order_snapshot(&self) -> std::io::Result<JournalSnapshot> {
         use fs2::FileExt;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -2867,7 +2940,10 @@ impl JournalWriter {
             let mut file = match std::fs::OpenOptions::new().read(true).open(&self.path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Vec::new());
+                    return Ok(JournalSnapshot {
+                        events: Vec::new(),
+                        generation: None,
+                    });
                 }
                 Err(error) => return Err(error),
             };
@@ -2875,10 +2951,13 @@ impl JournalWriter {
             if !open_journal_file_is_current(&file, &self.path)? {
                 continue;
             }
+            let version = journal_snapshot_version(&file)?;
             file.seek(SeekFrom::Start(0))?;
             let mut content = String::new();
             file.read_to_string(&mut content)?;
-            if !open_journal_file_is_current(&file, &self.path)? {
+            if !open_journal_file_is_current(&file, &self.path)?
+                || journal_snapshot_version(&file)? != version
+            {
                 continue;
             }
             let (events, _, malformed_lines) =
@@ -2894,7 +2973,12 @@ impl JournalWriter {
                 content.len(),
                 events.len(),
             );
-            return Ok(events);
+            FileExt::unlock(&file)?;
+            let generation = version.map(|version| JournalSnapshotGeneration {
+                version,
+                _file: file,
+            });
+            return Ok(JournalSnapshot { events, generation });
         }
 
         Err(std::io::Error::new(
@@ -12156,7 +12240,7 @@ mod turn_event_buffer_tests {
             canonical_cas_test_event("sess-durable-readback-no-newline", "next", commit.clone());
         let lease = SessionExecutionLease::try_acquire("sess-durable-readback-no-newline").unwrap();
         assert!(matches!(
-            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event]),
+            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event], None),
             CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("incomplete")
         ));
     }
@@ -12204,6 +12288,185 @@ mod turn_event_buffer_tests {
         );
         event.conversation_commit = Some(commit);
         event
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn canonical_cas_reuses_a_validated_snapshot_at_scale() {
+        use astra_core::history_work::{HistoryWorkScenario, HistoryWorkSite};
+
+        // History-work scenarios include all threads in the process. Run the
+        // instrumented fixture alone even when the surrounding suite is parallel.
+        const CHILD_MARKER: &str = "ASTRA_TEST_CANONICAL_CAS_MEASUREMENT_CHILD";
+        const COMPLETION_MARKER: &str = "canonical CAS measurement completed";
+        let measure = cfg!(unix) && astra_core::history_work::instrumentation_enabled();
+        if measure && std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("session_journal::turn_event_buffer_tests::canonical_cas_reuses_a_validated_snapshot_at_scale")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("run isolated canonical CAS measurement");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETION_MARKER),
+                "isolated canonical CAS measurement failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                stdout,
+                stderr
+            );
+            eprint!("{stderr}");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let counts: &[usize] = if measure {
+            &[100, 10_000, 100_000]
+        } else {
+            &[100]
+        };
+        for &count in counts {
+            let sid = format!("canonical-cas-scale-{count}");
+            let lease = SessionExecutionLease::try_acquire(&sid).unwrap();
+            let writer = JournalWriter::new(&sid).unwrap();
+            let start = JournalEvent::session_start(Some(&sid), None);
+            let record = serialize_journal_events(&[start]).unwrap();
+            let prefix = record.repeat(count);
+            std::fs::write(writer.path(), &prefix).unwrap();
+            let commit = canonical_cas_test_commit(&sid, "exact");
+            let event = canonical_cas_test_event(&sid, "exact", commit.clone());
+
+            let scenario = measure
+                .then(|| HistoryWorkScenario::begin(format!("canonical-cas-{count}")).unwrap());
+            let snapshot = writer.validated_append_order_snapshot().unwrap();
+            assert_eq!(snapshot.events().len(), count);
+            assert!(matches!(
+                writer.append_canonical_commit_cas(
+                    &lease,
+                    None,
+                    1,
+                    &commit,
+                    &[event],
+                    Some(&snapshot)
+                ),
+                CanonicalCommitCasOutcome::Committed {
+                    persistence_warning: None
+                }
+            ));
+            if let Some(scenario) = scenario {
+                let report = scenario.finish().unwrap();
+                let reads = report
+                    .scoped
+                    .measurement(HistoryWorkSite::SessionJournalDigestRead);
+                let delta = report
+                    .scoped
+                    .measurement(HistoryWorkSite::SessionJournalAppendDeltaRead);
+                assert_eq!(reads.bytes, prefix.len() as u64);
+                assert_eq!(reads.events, 1);
+                assert_eq!(delta.events, 1);
+                assert_eq!(delta.rows, 1);
+                eprintln!(
+                    "{count} records: {} historical bytes plus {} new bytes in {:?}",
+                    reads.bytes, delta.bytes, report.elapsed
+                );
+            }
+            drop(snapshot);
+            let events = writer.complete_append_order_snapshot().unwrap();
+            assert_eq!(events.len(), count + 1);
+            assert_eq!(
+                events.last().unwrap().conversation_commit.as_ref(),
+                Some(&commit)
+            );
+        }
+        if measure {
+            eprintln!("{COMPLETION_MARKER}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn canonical_cas_revalidates_a_snapshot_after_another_append() {
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let sid = "canonical-cas-stale-snapshot";
+        let lease = SessionExecutionLease::try_acquire(sid).unwrap();
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(sid), None))
+            .unwrap();
+        let snapshot = writer.validated_append_order_snapshot().unwrap();
+        let existing = canonical_cas_test_commit(sid, "existing");
+        writer
+            .append(&canonical_cas_test_event(sid, "existing", existing))
+            .unwrap();
+        let candidate = canonical_cas_test_commit(sid, "candidate");
+        let event = canonical_cas_test_event(sid, "candidate", candidate.clone());
+        assert!(matches!(
+            writer.append_canonical_commit_cas(
+                &lease,
+                None,
+                1,
+                &candidate,
+                &[event],
+                Some(&snapshot)
+            ),
+            CanonicalCommitCasOutcome::Conflict(_)
+        ));
+        assert_eq!(writer.complete_append_order_snapshot().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn canonical_cas_revalidates_after_journal_deletion_and_recreation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let sid = "canonical-cas-recreated-journal";
+        let lease = SessionExecutionLease::try_acquire(sid).unwrap();
+        let writer = JournalWriter::new(sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(sid), None))
+            .unwrap();
+        let snapshot = writer.validated_append_order_snapshot().unwrap();
+        let original = writer.path().metadata().unwrap();
+
+        // Deletion must proceed while the snapshot is alive: it pins the
+        // inode, not its lock. A new journal cannot recycle that inode.
+        delete_session(sid).unwrap();
+        let existing = canonical_cas_test_commit(sid, "existing");
+        writer
+            .append(&canonical_cas_test_event(sid, "existing", existing.clone()))
+            .unwrap();
+        let recreated = writer.path().metadata().unwrap();
+        assert_ne!(
+            (original.dev(), original.ino()),
+            (recreated.dev(), recreated.ino())
+        );
+
+        let candidate = canonical_cas_test_commit(sid, "candidate");
+        let event = canonical_cas_test_event(sid, "candidate", candidate.clone());
+        assert!(matches!(
+            writer.append_canonical_commit_cas(
+                &lease,
+                None,
+                1,
+                &candidate,
+                &[event],
+                Some(&snapshot)
+            ),
+            CanonicalCommitCasOutcome::Conflict(_)
+        ));
+        let events = writer.complete_append_order_snapshot().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.last().unwrap().conversation_commit.as_ref(),
+            Some(&existing)
+        );
     }
 
     #[test]
@@ -12408,19 +12671,20 @@ mod turn_event_buffer_tests {
                 std::slice::from_ref(&event),
                 &[],
                 Some(&event),
+                None,
             ),
             CanonicalCommitCasOutcome::Conflict(_)
         ));
         assert!(writer.complete_append_order_snapshot().unwrap().is_empty());
         fail_next_journal_directory_sync();
         assert!(matches!(writer.append_canonical_commit_cas_locked(
-            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event),
+            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event), None,
         ), CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("creation metadata")));
         // Exact retry must repeat the creation fence after uncertainty, even
         // when reopening an existing file and retaining no created-dir list.
         fail_next_journal_directory_sync();
         assert!(matches!(writer.append_canonical_commit_cas_locked(
-            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event),
+            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event), None,
         ), CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("creation metadata")));
         // A successful fence establishes authority without duplicating the turn.
         assert!(matches!(
@@ -12431,6 +12695,7 @@ mod turn_event_buffer_tests {
                 std::slice::from_ref(&event),
                 &[],
                 Some(&event),
+                None,
             ),
             CanonicalCommitCasOutcome::Committed { .. }
         ));
@@ -12466,7 +12731,7 @@ mod turn_event_buffer_tests {
         fail_next_journal_directory_sync();
 
         assert!(matches!(
-            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event]),
+            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event], None),
             CanonicalCommitCasOutcome::Unknown(reason)
                 if reason.contains("creation metadata")
                     && reason.contains("injected journal directory sync failure")
@@ -12526,7 +12791,7 @@ mod turn_event_buffer_tests {
         let lease = SessionExecutionLease::try_acquire(session_id).unwrap();
 
         assert!(matches!(
-            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event]),
+            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event], None),
             CanonicalCommitCasOutcome::Conflict(reason) if reason.contains("already committed")
         ));
         let events = read_journal(session_id).unwrap();
@@ -12569,6 +12834,7 @@ mod turn_event_buffer_tests {
                 1,
                 &commit,
                 &[turn_error, candidate],
+                None,
             ),
             CanonicalCommitCasOutcome::NotCommitted(reason)
                 if reason.contains("exactly one intended turn commit")
@@ -12601,6 +12867,7 @@ mod turn_event_buffer_tests {
                     &[first_event],
                     &[],
                     None,
+                    None,
                 )
             });
             let second_barrier = barrier.clone();
@@ -12615,6 +12882,7 @@ mod turn_event_buffer_tests {
                     &second_commit,
                     &[second_event],
                     &[],
+                    None,
                     None,
                 )
             });
@@ -12683,7 +12951,7 @@ mod turn_event_buffer_tests {
             let _guard = JournalDirGuard::new(&thread_dir);
             JournalWriter::new(session_id)
                 .unwrap()
-                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[], None)
+                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[], None, None)
         });
 
         opened_rx.recv().unwrap();
