@@ -2582,8 +2582,11 @@ impl BottomPane {
         0
     }
 
-    fn has_composer_hints(&self, width: u16) -> bool {
-        width >= 34 && self.mention_menu.is_none() && self.skill_popup.is_none()
+    pub(super) fn has_composer_hints(&self, width: u16) -> bool {
+        width >= 34
+            && !self.has_active_view()
+            && self.mention_menu.is_none()
+            && self.skill_popup.is_none()
     }
 
     fn composer_hints(&self) -> &'static str {

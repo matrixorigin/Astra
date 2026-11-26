@@ -422,6 +422,15 @@ impl TranscriptItem {
         }
     }
 
+    fn explain_capture_ids(&self) -> Option<(&str, &str)> {
+        let TranscriptContent::Committed(cell) = &self.content else {
+            return None;
+        };
+        cell.as_any_ref()
+            .downcast_ref::<ExplainAnalyzeCell>()?
+            .capture_ids()
+    }
+
     fn is_expandable(&self, width: u16) -> bool {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
@@ -791,9 +800,21 @@ impl TranscriptView {
     }
 
     pub(crate) fn explain_report(item: TranscriptItem, terminal_height: u16, width: u16) -> Self {
+        let title = item.explain_capture_ids().map_or_else(
+            || "Explain".to_owned(),
+            |(run_id, _)| {
+                format!(
+                    "Explain · {}",
+                    crate::cli::effects::truncate_label(
+                        &crate::tui::render::line_utils::sanitize_terminal_text(run_id),
+                        32,
+                    )
+                )
+            },
+        );
         let mut view =
             Self::from_snapshot(TranscriptSnapshot::new(vec![item]), terminal_height, width)
-                .with_title("Explain");
+                .with_title(title);
         view.report = true;
         view.move_cursor_to(0);
         view
@@ -1704,19 +1725,12 @@ impl TranscriptView {
         let Some(id) = self.item_at_or_near(self.cursor) else {
             return;
         };
-        let Some(TranscriptContent::Committed(cell)) = self
+        if let Some((run_id, turn_id)) = self
             .snapshot
             .items
             .iter()
             .find(|item| item.id == id)
-            .map(|item| &item.content)
-        else {
-            return;
-        };
-        if let Some((run_id, turn_id)) = cell
-            .as_any_ref()
-            .downcast_ref::<ExplainAnalyzeCell>()
-            .and_then(ExplainAnalyzeCell::capture_ids)
+            .and_then(TranscriptItem::explain_capture_ids)
         {
             self.pending_action = Some(ViewActionRequest {
                 action: BottomPaneViewAction::DraftExplainQuestion {
@@ -1871,13 +1885,6 @@ impl BottomPaneView for TranscriptView {
                 Widget::render(prompt, row, buf);
             } else if let Some(status) = &self.status {
                 Widget::render(Line::styled(status.clone(), dim), row, buf);
-            } else if !self.report || self.selection_anchor.is_some() {
-                let keys = if self.selection_anchor.is_some() {
-                    "↑↓ extend · Y copy · V clear selection"
-                } else {
-                    "↑↓ move · / search · Enter details · F filter · V select · Y copy · n/N repeat"
-                };
-                super::render_hint_bar(keys, row, buf);
             }
         }
     }
@@ -2098,19 +2105,27 @@ impl BottomPaneView for TranscriptView {
     }
 
     fn reserve_status_footer(&self) -> bool {
-        self.report
+        true
     }
 
     fn hint_keys(&self) -> Option<String> {
-        if !self.report || self.search_input.is_some() {
+        if self.search_input.is_some() {
             return None;
+        }
+        if self.selection_anchor.is_some() {
+            return Some("↑↓ extend · Y copy · V clear selection".into());
+        }
+        if !self.report {
+            return Some("↑↓ select · Enter details · / search · Esc back · Y copy".into());
         }
         let evidence = if self.expanded.is_empty() {
             "Enter evidence"
         } else {
             "Enter hide evidence"
         };
-        Some(format!("{evidence} · A ask about this run · Esc back"))
+        Some(format!(
+            "{evidence} · A ask about this run · Ctrl+O transcript · Esc back"
+        ))
     }
 
     fn fit_conversation_workspace(&mut self, terminal_height: u16, width: u16) {

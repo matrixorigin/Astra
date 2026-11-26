@@ -886,13 +886,20 @@ impl BottomPaneView for InFlightAgentsView {
                     }
                 }
             };
-            buf.set_line(area.x, body_y + i as u16, &line, area.width);
+            let y = body_y + i as u16;
+            if let Some(background) = line.style.bg {
+                buf.set_style(
+                    Rect::new(area.x, y, area.width, 1),
+                    Style::default().bg(background),
+                );
+            }
+            buf.set_line(area.x, y, &line, area.width);
         }
         if detail_h > 0
             && let Some(row) = self.rows.get(self.selected)
         {
             let detail_y = body_y + body_h as u16;
-            let detail = selected_runtime_detail(row);
+            let detail = selected_runtime_detail(row, columns && !show_evidence);
             for (offset, text) in detail.into_iter().enumerate() {
                 let line = Line::from(Span::styled(
                     truncate_to_width(&text, usize::from(area.width)),
@@ -1097,7 +1104,7 @@ fn activity_labels(activity: AgentActivityCounts) -> Vec<String> {
     labels
 }
 
-fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
+fn selected_runtime_detail(row: &AgentRow, show_activity: bool) -> [String; 2] {
     let mut overview = Vec::with_capacity(6);
     match row.run_id.as_deref().filter(|id| !id.is_empty()) {
         Some(run_id) => overview.push(format!("run {}", truncate_label(run_id, 18))),
@@ -1150,10 +1157,6 @@ fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
     {
         details.push(format!("attention {summary}"));
     }
-    let activity = activity_labels(row.activity);
-    if !activity.is_empty() {
-        details.push(format!("Activity · {}", activity.join(" · ")));
-    }
     if let Some(facts) = row.runtime.permission.as_ref() {
         let health = if facts.has_issues {
             "permission issues"
@@ -1173,6 +1176,9 @@ fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
         .filter(|value| !value.is_empty())
     {
         details.push(format!("binding {binding}"));
+    }
+    if show_activity {
+        details.extend(activity_labels(row.activity));
     }
     let mut controls = Vec::with_capacity(3);
     if row

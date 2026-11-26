@@ -837,10 +837,12 @@ fn compact_view<'a>(
         )
         .saturating_add(u16::from(multi_agent.is_some()));
     let extra_picker_rows = bottom_pane.extra_picker_rows();
+    let optional_composer_rows =
+        extra_picker_rows + u16::from(bottom_pane.has_composer_hints(width));
     bottom_pane.set_composer_frame_allowed(true);
     let framed_bottom_h = bottom_pane
         .desired_height(width)
-        .saturating_sub(extra_picker_rows);
+        .saturating_sub(optional_composer_rows);
     // Keep a useful slice of the candidate list ahead of the optional frame.
     let minimum_picker_rows = extra_picker_rows.saturating_sub(1).min(2);
     bottom_pane.set_composer_frame_allowed(
@@ -853,7 +855,7 @@ fn compact_view<'a>(
     let desired = bottom_pane.desired_height(width);
     let bottom_h = height
         .saturating_sub(required_rows)
-        .clamp(desired.saturating_sub(extra_picker_rows), desired);
+        .clamp(desired.saturating_sub(optional_composer_rows), desired);
     let available = height.saturating_sub(bottom_h);
     let margin = super::style::conversation_margin(width);
     let status = status
@@ -1175,7 +1177,7 @@ mod compact_surface_tests {
 
     #[test]
     fn streaming_reply_and_turn_status_remain_visible_together() {
-        for height in [6, 8, 12] {
+        for height in [5, 6, 8, 12] {
             let area = Rect::new(0, 0, 40, height);
             let mut pane = BottomPane::new();
             let flex = compact_view(frame(area.width), &mut pane, area.width, area.height);

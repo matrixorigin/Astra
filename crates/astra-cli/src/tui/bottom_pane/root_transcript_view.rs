@@ -606,18 +606,15 @@ impl BottomPaneView for RootTranscriptView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        if self.transcript.is_search_active() {
-            return None;
-        }
-        let mut hints = vec!["R refresh"];
+        let mut hints = vec![self.transcript.hint_keys()?, "R refresh".into()];
         if self.has_more {
-            hints.push("O older");
+            hints.push("O older".into());
         }
-        hints.push("Ctrl+E toggle details");
-        hints.push("S export");
-        hints.push("Ctrl+G run navigator");
-        hints.push("Shift+←/→ switch");
-        hints.push("Esc back");
+        hints.extend([
+            "S export".into(),
+            "Ctrl+G agents".into(),
+            "Shift+←/→ switch".into(),
+        ]);
         Some(hints.join(" · "))
     }
 }

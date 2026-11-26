@@ -122,7 +122,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     const prompts = all.filter(line => line.includes(draft ? 'DRAFT_SENTINEL' : 'Message Astra'));
     const context = label + '\n' + all.join('\n');
     assert.equal(footers.length, 1, 'footer leaked into screen/scrollback: ' + context);
-    assert.equal(prompts.length, 1, 'composer leaked into screen/scrollback: ' + context);
+    assert.equal(prompts.length, 1, 'composer missing or duplicated: ' + context);
     assert(visible.some(line => line.includes(draft ? 'DRAFT_SENTINEL' : 'Message Astra')), 'live composer not visible: ' + context);
     assert.equal(all.filter(line => line.includes('RESIZE_HISTORY_SENTINEL')).length, 1,
       'pre-existing history was lost or duplicated: ' + context);

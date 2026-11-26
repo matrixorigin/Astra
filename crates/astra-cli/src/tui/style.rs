@@ -7,7 +7,7 @@ use ratatui::{
 
 /// Shared inset for conversation, composer and execution-report chrome.
 pub(crate) fn conversation_margin(width: u16) -> u16 {
-    if width >= 34 { 2 } else { 0 }
+    if width >= 60 { 2 } else { 0 }
 }
 
 /// Presentation-only status vocabulary. Owners map their typed runtime state

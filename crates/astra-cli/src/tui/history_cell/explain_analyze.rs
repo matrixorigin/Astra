@@ -818,6 +818,45 @@ mod tests {
     };
 
     #[test]
+    fn report_keys_expand_evidence_and_draft_for_the_same_capture() {
+        use crate::tui::bottom_pane::{
+            transcript_view::{TranscriptItem, TranscriptItemId, TranscriptView},
+            view::{BottomPaneView, BottomPaneViewAction, ViewActionDisposition},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{buffer::Buffer, layout::Rect};
+        use std::sync::Arc;
+
+        let cell = Arc::new(ExplainAnalyzeCell::new(example_graph(), false, false));
+        let mut view = TranscriptView::explain_report(
+            TranscriptItem::committed(TranscriptItemId::from_widget_id(1), cell, 0),
+            40,
+            80,
+        );
+        let render = |view: &TranscriptView| {
+            let area = Rect::new(0, 0, 80, 36);
+            let mut buffer = Buffer::empty(area);
+            view.render(area, &mut buffer);
+            crate::tui::testing::render::buffer_to_string(&buffer)
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!render(&view).contains("protocol reserve"));
+        view.handle_key(enter);
+        assert!(render(&view).contains("protocol reserve 8"));
+        view.handle_key(enter);
+        assert!(!render(&view).contains("protocol reserve"));
+
+        view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let request = view.take_action_request().expect("follow-up action");
+        assert_eq!(request.disposition, ViewActionDisposition::Close);
+        assert!(matches!(
+            request.action,
+            BottomPaneViewAction::DraftExplainQuestion { run_id, turn_id }
+                if run_id == "run-1" && turn_id == "turn-1"
+        ));
+    }
+
+    #[test]
     fn conflicting_auxiliary_usage_is_visible_in_settled_cell() {
         use astra_turn_types::{
             ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,

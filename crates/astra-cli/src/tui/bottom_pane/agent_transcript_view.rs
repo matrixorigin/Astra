@@ -2568,23 +2568,20 @@ impl BottomPaneView for AgentTranscriptView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        if self.transcript.is_search_active() {
-            return None;
-        }
-        let mut hints = Vec::new();
+        let mut hints = vec![self.transcript.hint_keys()?];
         if self.session_id.is_some() && self.transcript_target.is_some() {
-            hints.push("R refresh");
+            hints.push("R refresh".into());
         } else if self.transcript_target.is_none() {
-            hints.push("live only");
+            hints.push("live only".into());
         }
         if self.has_more {
-            hints.push("O older");
+            hints.push("O older".into());
         }
-        hints.push("Ctrl+E toggle details");
-        hints.push("S export");
-        hints.push("Ctrl+G run navigator");
-        hints.push("Shift+←/→ switch");
-        hints.push("Esc back");
+        hints.extend([
+            "S export".into(),
+            "Ctrl+G agents".into(),
+            "Shift+←/→ switch".into(),
+        ]);
         Some(hints.join(" · "))
     }
 
