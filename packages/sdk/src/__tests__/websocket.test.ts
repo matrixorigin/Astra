@@ -336,7 +336,8 @@ describe('AstraWebSocket', () => {
   });
 
   test('rejects a missing run and accepts a valid attach on the same connection', async () => {
-    const ws = new AstraWebSocket({ url: 'ws://localhost/ws', token: 'test-token' });
+    const onEvent = vi.fn();
+    const ws = new AstraWebSocket({ url: 'ws://localhost/ws', token: 'test-token', onEvent });
     await ws.connect();
     const raw = (ws as any).ws as MockWebSocket;
     const missing = ws.attachRun('missing', 3);
@@ -350,6 +351,11 @@ describe('AstraWebSocket', () => {
     });
     raw._receive({ type: 'session_info', session_id: 's1', run_id: 'owned' });
     await owned;
+    const childApproval = {
+      type: 'approval_required', run_id: 'child', request_id: 'approve-child', tool: 'review_plan',
+    };
+    raw._receive(childApproval);
+    expect(onEvent).toHaveBeenCalledWith(childApproval);
     expect(ws.runId).toBe('owned');
     ws.close();
   });

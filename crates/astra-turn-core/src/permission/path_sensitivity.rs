@@ -182,16 +182,26 @@ fn bash_protected_path_denial_in_context(
     describe_bash_path_denial(command, context, &hit)
 }
 
+const FIND_SELECTED_PATHS: &str = "find-selected paths";
+
+/// Append bounded, redacted command text without implying a resolved path.
+pub fn append_shell_match_text(reason: &mut String, token: &str) {
+    if token != FIND_SELECTED_PATHS
+        && let Ok((safe, _)) =
+            astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
+                token, 1024,
+            )
+    {
+        use std::fmt::Write;
+        let _ = write!(reason, " Matched command text: {safe:?}.");
+    }
+}
+
 fn describe_bash_path_denial(
     command: &str,
     context: &mut PathSensitivityContext,
     hit: &SensitivePathMatch,
 ) -> Option<String> {
-    let token = astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
-        &hit.token, 1024,
-    )
-    .map(|(safe, _)| safe)
-    .unwrap_or_else(|_| "<path expression omitted>".into());
     let rule = match hit.sensitivity {
         PathSensitivity::Sensitive => "a sensitive credential or system path",
         PathSensitivity::WriteSensitive => "write-sensitive app/runtime state",
@@ -208,11 +218,18 @@ fn describe_bash_path_denial(
         Some(PathAccess::List) => "the list operand",
         Some(PathAccess::Write) => "the write operand",
         None => {
-            return Some(format!(
-                "Sandbox: Protected-path preflight blocked path expression {token:?} under the rule for {rule}. This executor could not establish its effect or selected paths. The command was not run."
-            ));
+            let mut reason = format!(
+                "Sandbox: Protected-path preflight blocked the command under the rule for {rule}. This executor could not establish the access or selected paths. The command was not run."
+            );
+            append_shell_match_text(&mut reason, &hit.token);
+            return Some(reason);
         }
     };
+    let token = astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
+        &hit.token, 1024,
+    )
+    .map(|(safe, _)| safe)
+    .unwrap_or_else(|_| "<path expression omitted>".into());
     Some(format!(
         "Sandbox: Protected-path preflight blocked {operand} {token:?} under the rule for {rule}. The command was not run."
     ))
@@ -1885,7 +1902,7 @@ fn is_find_file_starting_point(root: &str, context: &PathSensitivityContext) -> 
 
 fn uncertain_find_path_match(access: PathAccess) -> SensitivePathMatch {
     SensitivePathMatch {
-        token: "find-selected paths".into(),
+        token: FIND_SELECTED_PATHS.into(),
         sensitivity: PathSensitivity::Sensitive,
         access,
         inferred: true,
@@ -2608,6 +2625,36 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         symlink(&ordinary, &alias).unwrap();
         assert_eq!(sensitive_path_match_for_shell_command(&write), None);
+    }
+
+    #[test]
+    fn bash_preflight_reports_only_proven_operands_as_paths() {
+        use astra_tools::shell_ops::BashPreflightRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let preflight = |command| {
+            bash_path_preflight(BashPreflightRequest::Command {
+                command,
+                directory: dir.path(),
+                workspace_root: dir.path(),
+                source_artifacts: None,
+                workspace_write_admitted: false,
+            })
+        };
+
+        let comparison = "python3 - <<'PY'\nname = 'plain'\nprint(name.endswith('/.git'))\nPY";
+        let unresolved = preflight(comparison).expect("opaque access remains gated");
+        assert!(unresolved.contains("could not establish"), "{unresolved}");
+        assert!(unresolved.contains("command was not run"), "{unresolved}");
+        assert!(unresolved.contains("Matched command text:"), "{unresolved}");
+        assert!(unresolved.contains("endswith"), "{unresolved}");
+
+        let known = preflight("readlink /proc/self/exe").expect("protected read remains gated");
+        assert!(
+            known.contains("read operand") && known.contains("/proc/self/exe"),
+            "{known}"
+        );
+        assert!(preflight("printf '%s\\n' /.git").is_none());
     }
 
     #[test]

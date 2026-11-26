@@ -82,6 +82,16 @@ Use `imagePullSecrets` when the registry requires authentication. Keep
 non-sensitive overrides in `api.env`; credentials belong in the existing
 Secret.
 
+## Upgrade and rollback
+
+For releases that change a persisted format, schedule a maintenance window and
+back up the database. Stop every Astra Server that shares that database before
+starting the new version, including replicas in other Deployments. Suspend
+autoscaling for those Deployments during the stop. Leave automatic rollback
+disabled. Images predating `llm_rounds` reject Run terminal receipts that contain
+it. After the new format is written, deploy a fix that reads the current database
+or run the previous image against a separate restore of the pre-upgrade backup.
+
 ## Verify
 
 ```bash

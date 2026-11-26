@@ -199,8 +199,13 @@ pub fn build_recovery_message_with_evidence(
                         "⚠ {tool_name} timed out. Captured output and side effects may be partial; inspect the current state before retrying."
                     );
                 }
+                if evidence.is_observed_command_exit() {
+                    return format!(
+                        "⚠ {tool_name} returned a nonzero command status. Use the exit code and output to distinguish a negative result from a failed command. If a prerequisite prevented the intended check, try another available way to run it. Before repeating a state-changing command, check what it already changed."
+                    );
+                }
                 return format!(
-                    "⚠ {tool_name} returned a nonzero command status. Inspect the exit code and captured output; the status may be an expected answer. Before retrying a command with side effects, check what it already changed."
+                    "⚠ The failure evidence for {tool_name} does not confirm a command exit status. Inspect the reported result and source error. Check for partial effects before repeating the command."
                 );
             }
             astra_core::ToolFailureCause::InputTooLarge => {
@@ -968,13 +973,35 @@ mod tests {
             Some(&evidence),
         );
         assert!(message.contains("nonzero command status"), "{message}");
-        assert!(message.contains("may be an expected answer"), "{message}");
+        assert!(
+            message.contains("distinguish a negative result"),
+            "{message}"
+        );
+        assert!(message.contains("another available way"), "{message}");
         assert!(
             message.contains("check what it already changed"),
             "{message}"
         );
         assert!(!message.contains("invalid arguments"), "{message}");
         assert!(!message.contains("correct the command"), "{message}");
+    }
+
+    #[test]
+    fn uncertain_command_status_does_not_claim_a_nonzero_exit() {
+        // A negative status can also be an observed platform-specific code.
+        // The recovery evidence alone cannot distinguish it from a sentinel.
+        for exit_code in [None, Some(-1)] {
+            let evidence = astra_tools::exit_semantics::command_exit_failure_evidence(exit_code);
+            let message = build_recovery_message_with_evidence(
+                "bash",
+                "failure details",
+                evidence.kind,
+                &[],
+                Some(&evidence),
+            );
+            assert!(message.contains("does not confirm a command exit status"));
+            assert!(!message.contains("returned a nonzero"));
+        }
     }
 
     #[test]

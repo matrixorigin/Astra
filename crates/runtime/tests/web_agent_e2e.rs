@@ -1837,13 +1837,13 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
         assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
         release.notify_one();
         let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader).await.unwrap().unwrap();
-        assert!(events.iter().all(|event| event.get("turn_evaluation").is_none()), "losing live candidate: {events:?}");
+        assert!(events.iter().all(|event| event.get("turn_diagnostics").is_none()), "losing live candidate: {events:?}");
         let durable = engine.load_run(USER_ID, run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, "paused");
-        assert!(durable.events.iter().all(|event| event.pointer("/data/turn_evaluation").is_none()), "losing durable candidate: {:?}", durable.events);
+        assert!(durable.events.iter().all(|event| event.pointer("/data/turn_diagnostics").is_none()), "losing durable candidate: {:?}", durable.events);
         let (status, replay) = get_run_stream(&app, run_id, 0).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(replay.iter().all(|event| event.get("turn_evaluation").is_none()), "losing process-local replay: {replay:?}");
+        assert!(replay.iter().all(|event| event.get("turn_diagnostics").is_none()), "losing process-local replay: {replay:?}");
         let replay_lifecycle = astra_runtime::AgenticRunLifecycleService::new(
             astra_runtime::MatrixOneSettings::mock(), test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
             Arc::new(tokio::sync::Mutex::new(HashMap::new())), engine);
@@ -1852,7 +1852,7 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
             .with_run_lifecycle_service(Arc::new(replay_lifecycle)));
         let (status, replay) = get_run_stream(&replay_app, run_id, 0).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(replay.iter().all(|event| event.get("turn_evaluation").is_none()), "losing durable replay: {replay:?}");
+        assert!(replay.iter().all(|event| event.get("turn_diagnostics").is_none()), "losing durable replay: {replay:?}");
         gateway.assert_complete();
         inference.assert_quiescent();
     }).catch_unwind().await;
@@ -2251,16 +2251,16 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let replay_serialized = serde_json::to_string(&replay_events).unwrap();
     let live_terminal = events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("root terminal");
     let replay_terminal = replay_events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("replayed root terminal");
-    assert_eq!(live_terminal["turn_evaluation"], replay_terminal["turn_evaluation"]);
+    assert_eq!(live_terminal["turn_diagnostics"], replay_terminal["turn_diagnostics"]);
     for (terminal, id, generation, status) in [
         (live_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
         (replay_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
     ] {
         assert_eq!(terminal["owner_generation"], generation);
         assert_eq!(terminal["status"], status);
-        if let Some(evaluation) = terminal.get("turn_evaluation") {
-            astra_turn_core::evaluation::turn_evaluation_from_terminal(evaluation, Some(&session), id, Some(generation), status)
-                .expect("optional evaluation must still have exact producer scope");
+        if let Some(evaluation) = terminal.get("turn_diagnostics") {
+            astra_turn_core::evaluation::turn_diagnostics_from_terminal(evaluation, Some(&session), id, Some(generation), status)
+                .expect("optional diagnostics must still have exact producer scope");
         }
     }
     assert_eq!(root_record.status, "completed");
@@ -2802,14 +2802,9 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
     assert_eq!(status, StatusCode::OK);
     let finished = find_event(&replay, "run_finished").expect("durable child terminal");
     assert_eq!(finished["status"], "completed");
-    assert_eq!(
-        finished["turn_evaluation"]["metadata"]["tool_execution_count"],
-        1
-    );
-    assert_eq!(
-        finished["turn_evaluation"]["metadata"]["tool_rejected_count"],
-        0
-    );
+    let diagnostics = &finished["turn_diagnostics"]["metadata"];
+    assert_eq!(diagnostics["blocked_tool_calls"], 0);
+    assert_eq!(diagnostics["unresolved_tool_outcomes"], json!({}));
     assert_eq!(
         find_event(&replay, "text_done").unwrap()["full_text"],
         MARKER
@@ -5896,11 +5891,9 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     assert_eq!(terminal["status"], "failed");
     assert_eq!(terminal["error_kind"], "budget_exhausted");
     assert_ne!(terminal.get("resumable"), Some(&json!(true)));
-    let evaluation = &terminal["turn_evaluation"]["metadata"];
+    let evaluation = &terminal["turn_diagnostics"]["metadata"];
     assert_eq!(evaluation["llm_rounds"], 2);
-    assert_eq!(evaluation["tool_call_count"], 2);
-    assert_eq!(evaluation["tool_execution_count"], 1);
-    assert_eq!(evaluation["tool_rejected_count"], 1);
+    assert_eq!(evaluation["blocked_tool_calls"], 1);
     assert_eq!(
         evaluation["execution_owner_generation"],
         terminal["owner_generation"]

@@ -25,7 +25,6 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         max_turn_input_tokens: state.max_turn_input_tokens,
         last_measured_prompt_tokens: state.last_measured_prompt_tokens,
         context_compression_triggered: state.context_compression_triggered,
-        first_budget_pressure: &mut state.telemetry.first_budget_pressure,
         pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
         observability_session: state.telemetry.observability_session.clone(),
     })
@@ -40,14 +39,13 @@ pub struct TurnTraceFinalizationInput<'a> {
     pub max_turn_input_tokens: u64,
     pub last_measured_prompt_tokens: Option<u64>,
     pub context_compression_triggered: bool,
-    pub first_budget_pressure: &'a mut f64,
     pub pending_context_assembly_trace: &'a mut Option<(u32, serde_json::Value)>,
     pub observability_session:
         Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
 }
 
 /// Settle measured context evidence without execution-loop state.
-pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) {
+pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) -> f64 {
     let collector = input.collector;
     if let Some(session_id) = input.session_id {
         collector.set_session_id(session_id);
@@ -59,7 +57,6 @@ pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) 
         input.max_turn_input_tokens,
         input.context_compression_triggered,
     );
-    *input.first_budget_pressure = input.first_budget_pressure.max(budget_pressure);
     let trace = collector.finalize();
     if let Some(ref session) = input.observability_session {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(session);
@@ -72,6 +69,7 @@ pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) 
         // the first one made long tool turns look artificially small.
         *input.pending_context_assembly_trace = Some((session_turn, trace.to_json_value()));
     }
+    budget_pressure
 }
 
 /// Publish derived context displays only after canonical terminal settlement.

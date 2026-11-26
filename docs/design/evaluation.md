@@ -110,24 +110,22 @@ retain their existing Memory evaluation owner. Learned-routing datasets,
 training, qualification and deployment are retired. Evaluation does not create
 a separate analytics API, persistence service or activation authority.
 
-Runtime tool-boundary feedback and terminal evaluation use thresholds resolved
-once from the admitted execution configuration. Cooperative handoff carries
-those thresholds with the original execution facts; later configuration edits
-do not reinterpret an in-flight run or replenish its recovery permissions.
-Tool batches perform no configuration file I/O.
+Runtime tool-boundary feedback uses thresholds resolved once from the admitted
+execution configuration. Cooperative handoff carries those thresholds with
+the original execution facts. Tool batches perform no configuration file I/O.
 
-The Server may evaluate the complete settled tool and child evidence once.
-`turn_evaluation` is optional diagnostic evidence; canonical Run completion and
-cold replay do not depend on persisting it. A live evaluation can therefore be
-absent from cold replay. When supplied, it carries the original journal event,
-session/run identity, execution generation, frozen thresholds and final status.
-Missing evaluation remains unknown; conflicting or incorrectly scoped evidence
-is a protocol error. CLI journals and feedback do not manufacture an evaluation
-from partial stream records or reload local thresholds to fill that gap.
+The Server's optional `turn_diagnostics` terminal event carries Run status,
+logical LLM rounds, and unresolved or blocked tool outcomes from the execution
+ledger. It includes session/run identity and execution generation. The Run
+terminal and raw tool results remain the authorities for lifecycle and tool
+outcomes. Cold replay can omit this diagnostic event. Conflicting or
+incorrectly scoped evidence is a protocol error. CLI journals persist the
+server-owned `turn_evaluation` event. CLI reflection shows the settled Run
+status alongside the journal's tool errors and recorded failed-call counts.
 
 The CLI sidecar journal adds only its existing projection ID/index for retry
-reconciliation. The Server timestamp, canonical turn, producer scope and
-evaluation metadata remain unchanged; projection retries never re-evaluate.
+reconciliation. Projection retries preserve the Server timestamp, canonical
+turn, producer scope and diagnostic metadata.
 
 Child-result adoption checks use the canonical Run tree for completion, model
 identity and parentage, terminal transcript content for the actual result, and

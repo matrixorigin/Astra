@@ -323,6 +323,8 @@ pub(crate) struct SessionState {
     /// Suggested next prompt shown after a completed turn when the next action is obvious.
     pub pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
+    /// Local edit versions fence delayed cloud reads, including ABA edits.
+    pub(crate) local_preference_revisions: std::collections::BTreeMap<&'static str, u64>,
     pub verbose_mode: bool,
     /// User preference: enable background memory-extraction agent.
     /// Synced via `pref_keys::AUTO_MEMORY_ENABLED`.
@@ -460,11 +462,6 @@ pub(crate) struct SessionState {
     pub session_memory_port:
         Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
 
-    /// P3/P4: evaluator-derived feedback from the previous turn. Passed to
-    /// the next turn's ToolExecutor so the prompt can correct tool behavior
-    /// such as sequential read churn, repeated calls, and stalls.
-    pub latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
-
     // ── Observability ──
     /// Global observability hub for profiles, traces, and feedback signals.
     /// Created at REPL startup, shared across sessions.
@@ -587,6 +584,7 @@ impl Default for SessionState {
             queued_message: None,
             pending_followup_suggestion: None,
             explain: ExplainMode::Off,
+            local_preference_revisions: Default::default(),
             verbose_mode: true,
             auto_memory_enabled: true,
             notifications_enabled: true,
@@ -648,7 +646,6 @@ impl Default for SessionState {
             drift_original_query: None,
             session_memory_port: None,
 
-            latest_turn_quality_feedback: None,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
@@ -720,6 +717,16 @@ impl SessionState {
         &self,
     ) -> crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle {
         self.native_delivery_refresh.clone()
+    }
+
+    /// Record local edits so an already pending cloud read cannot erase them.
+    pub(crate) fn set_explain_mode(&mut self, mode: ExplainMode) {
+        self.explain = mode;
+        let revision = self
+            .local_preference_revisions
+            .entry(astra_services::state_sync::pref_keys::EXPLAIN_MODE)
+            .or_default();
+        *revision = revision.wrapping_add(1);
     }
 
     /// Apply a format selected through `/explain` and remember its precedence
@@ -846,7 +853,6 @@ impl SessionState {
         self.clear_runtime_recovery_state();
         self.clear_resume_recovery_state();
         self.drift_original_query = None;
-        self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
         self.observability_config_pending = false;
@@ -900,7 +906,7 @@ pub(crate) fn apply_initial_explain_mode(
     initial_explain: Option<ExplainMode>,
 ) {
     if let Some(mode) = initial_explain {
-        state.explain = mode;
+        state.set_explain_mode(mode);
     }
 }
 
@@ -1076,11 +1082,6 @@ mod default_tests {
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
             drift_original_query: Some("orig".into()),
-            latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
-                turn: 1,
-                findings: vec!["finding".into()],
-                recommended_action: "act".into(),
-            }),
             last_turn_interrupted: true,
             plan_mode_sync_error: Some("err".into()),
             session_persistence_error: Some("journal append failed".into()),
@@ -1109,7 +1110,6 @@ mod default_tests {
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.drift_original_query.is_none());
-        assert!(state.latest_turn_quality_feedback.is_none());
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.session_persistence_error.is_none());

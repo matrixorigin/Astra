@@ -657,6 +657,7 @@ fn chat_response_serializes_with_explain() {
 #[test]
 fn run_status_response_serializes() {
     let resp = RunStatusResponse {
+        explain_requested: true,
         artifact_publication: None,
         run_id: "r1".into(),
         session_id: "s1".into(),
@@ -672,6 +673,7 @@ fn run_status_response_serializes() {
         accounting: None,
     };
     let v = serde_json::to_value(&resp).unwrap();
+    assert_eq!(v["explain_requested"], true);
     assert_eq!(v["waiting_for"], "tool_call");
     assert!(v["parent_run_id"].is_null());
     assert_eq!(v["root_run_id"], "r1");

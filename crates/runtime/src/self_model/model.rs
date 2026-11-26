@@ -71,20 +71,6 @@ pub struct SelfModel {
     /// the underlying historical evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_runtime_signals: Vec<String>,
-    /// Post-turn evaluator feedback from the immediately previous turn.
-    /// This is derived from
-    /// `TurnEvaluation` signals and is meant to correct next-turn tool
-    /// behavior (batching, repeat calls, stall recovery).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_quality_feedback: Option<TurnQualityFeedback>,
-}
-
-/// Actionable feedback derived from the previous turn's passive evaluator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TurnQualityFeedback {
-    pub turn: u32,
-    pub findings: Vec<String>,
-    pub recommended_action: String,
 }
 
 /// Gap 3: a single recent permission rejection, rendered into the
@@ -370,7 +356,6 @@ impl SelfModel {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             stale_runtime_signals: Vec::new(),
-            turn_quality_feedback: None,
         }
     }
 
@@ -401,12 +386,6 @@ impl SelfModel {
     /// can demote stale guidance without losing the historical context.
     pub fn with_stale_runtime_signals(mut self, advisories: Vec<String>) -> Self {
         self.stale_runtime_signals = advisories;
-        self
-    }
-
-    /// Attach feedback from the previous turn.
-    pub fn with_turn_quality_feedback(mut self, feedback: Option<TurnQualityFeedback>) -> Self {
-        self.turn_quality_feedback = feedback;
         self
     }
 }
@@ -617,22 +596,6 @@ impl SelfModel {
             }
         );
 
-        if let Some(ref feedback) = self.turn_quality_feedback {
-            let _ = writeln!(
-                s,
-                "⚠ Previous turn quality feedback (turn {}):",
-                feedback.turn
-            );
-            for finding in feedback.findings.iter().take(5) {
-                let _ = writeln!(s, "  - {}", sanitize_for_prompt(finding));
-            }
-            let _ = writeln!(
-                s,
-                "  → {}",
-                sanitize_for_prompt(&feedback.recommended_action)
-            );
-        }
-
         s
     }
 
@@ -675,9 +638,6 @@ impl SelfModel {
             return true;
         }
         if !self.stale_runtime_signals.is_empty() {
-            return true;
-        }
-        if self.turn_quality_feedback.is_some() {
             return true;
         }
         if let Some(ref b) = self.state.token_budget
@@ -1488,27 +1448,6 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_section_surfaces_turn_quality_feedback() {
-        let model = minimal_model().with_turn_quality_feedback(Some(TurnQualityFeedback {
-            turn: 7,
-            findings: vec![
-                "Detected 13 consecutive single-tool rounds; batch independent reads.".to_string(),
-                "Repeated bash with the same arguments; inspect prior output before retrying."
-                    .to_string(),
-            ],
-            recommended_action:
-                "Before calling tools, group independent reads/searches into one parallel batch."
-                    .to_string(),
-        }));
-
-        let rendered = model.to_system_prompt_section();
-        assert!(rendered.contains("Previous turn quality feedback (turn 7)"));
-        assert!(rendered.contains("13 consecutive single-tool rounds"));
-        assert!(rendered.contains("group independent reads/searches"));
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
     fn meaningful_when_token_pressure_high() {
         let mut model = minimal_model();
         model.state.token_budget = Some(TokenBudgetSnapshot {
@@ -1558,69 +1497,5 @@ mod tests {
         let mut model = minimal_model();
         model.capabilities.retry_cautioned_tools.push("grep".into());
         assert!(model.has_meaningful_self_awareness());
-    }
-}
-
-fn sanitize_for_prompt(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            if c.is_control() && *c != '\n' {
-                return false;
-            }
-            !is_invisible_unicode(*c)
-        })
-        .collect()
-}
-
-/// Comprehensive invisible/deceptive Unicode character filter.
-fn is_invisible_unicode(c: char) -> bool {
-    matches!(
-        c,
-        // Zero-width spaces and joiners
-        '\u{200B}'..='\u{200F}'
-        // Line/paragraph separators + bidi overrides/isolates
-        | '\u{2028}'..='\u{202F}'
-        // Word joiners and invisible operators
-        | '\u{2060}'..='\u{2064}'
-        // BOM
-        | '\u{FEFF}'
-        // Soft hyphen (renders as nothing unless line break)
-        | '\u{00AD}'
-        // Combining grapheme joiner
-        | '\u{034F}'
-        // Arabic letter mark
-        | '\u{061C}'
-        // Hangul fillers
-        | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
-        // Khmer vowel inherent
-        | '\u{17B4}' | '\u{17B5}'
-        // Mongolian vowel separator
-        | '\u{180E}'
-        // Tag characters (U+E0001–U+E007F)
-        | '\u{E0001}'..='\u{E007F}'
-    )
-}
-
-#[cfg(test)]
-mod feedback_sanitization_tests {
-    #[test]
-    fn preserves_text_and_newlines_without_hidden_controls() {
-        assert_eq!(
-            super::sanitize_for_prompt("run\u{200b} tests\u{202e}\nthen commit\u{0000}\u{feff}\t"),
-            "run tests\nthen commit"
-        );
-        for ch in [
-            '\u{00ad}',
-            '\u{034f}',
-            '\u{061c}',
-            '\u{115f}',
-            '\u{17b4}',
-            '\u{180e}',
-            '\u{2060}',
-            '\u{e0001}',
-        ] {
-            assert_eq!(super::sanitize_for_prompt(&format!("a{ch}b")), "ab");
-        }
-        assert_eq!(super::sanitize_for_prompt("运行测试 🦀"), "运行测试 🦀");
     }
 }

@@ -224,6 +224,17 @@ Bodies must remain replayable for the single automatic retry.
 
 Buffered `getRunEvents` uses the same authenticated request and structured
 `AstraApiError` decoding as REST, including error codes and action hints.
+It reads the durable event range captured by the server. Pass `{ follow: true }`
+to wait for the live attachment to close. Use `getRunEventReplay` for the
+server-confirmed next index, including positions without visible events. The
+reader times out after 60 seconds without bytes from the server.
+
+React's `useAstraRun` observes status and durable Run history. Its `error`
+preserves the SSE error frame or the underlying request error. Pause
+reconciliation ends when the server observes that the Explain Run resumed.
+For interactive observation, connect an `AstraWebSocket` and use `attachRun` with its event
+handlers. An approval owned by a child Run can appear on the live attachment
+without appearing in the parent Run's replay.
 
 Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
 The dashboard (`web/`) keeps tokens in **httpOnly cookies** and routes browser
@@ -348,7 +359,7 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `createRun` | `POST /chat` (non-streaming run) |
 | `listRuns` | `GET /runs?limit&after_updated_at&after_run_id` → `RunListResponse` (`runs` normalized to `RunStatus[]`, seek cursor preferred) |
 | `getRunStatus` / `cancelRun` / `pauseRun` / `resumeRun` | `GET`/`DELETE`/`POST` under `/chat/runs/{id}` |
-| `getRunEvents` | `GET /chat/runs/{id}/stream?last_index=` (buffered SSE parsed to `StreamEvent[]`) |
+| `getRunEvents` | `GET /chat/runs/{id}/stream` (buffered replay from an inclusive index) |
 | `delegateRun` / `listDelegations` / `pauseDelegations` / `resumeDelegations` | Multi-agent: `POST …/delegate`, `GET …/delegations`, `POST …/delegations/pause` · `resume` |
 | `streamChat` | `POST /chat/stream` (SSE) |
 | `getSessionEvents` / `listEvents` / `getCausalChain` | `GET /events/session/{id}`, `GET /events?…`, `GET /events/causal-chain/{id}` |
@@ -364,6 +375,7 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `connect()` / `close()` | Lifecycle |
 | `on` / `off` | Event subscription |
 | `sendMessage` | Chat message (`session_id` in payload when given) |
+| `attachRun(runId, lastIndex?)` | Observe an existing Run and its live interactions |
 | `approveToolCall` | Tool approval |
 
 ### Utilities

@@ -1609,7 +1609,7 @@ fn resolve_sensitive_path_guard(
     }
 
     let reason = if crate::tool::categories::registry().is_shell(tool_name) {
-        "A command path expression matches a protected-path rule; the actual access and execution scope are unknown. Manual approval is required"
+        "Protected-path checks flagged the command. The actual access and execution scope are unknown. Manual approval is required"
     } else {
         "Targets a sensitive file path and requires manual approval"
     }
@@ -2793,7 +2793,7 @@ mod tests {
         assert!(matches!(
             &shell.decision,
             HardDecision::NeedExternal { prompt }
-                if prompt.reason.contains("path expression")
+                if prompt.reason.contains("Protected-path checks flagged the command")
                     && prompt.reason.contains("execution scope are unknown")
         ));
         assert!(matches!(shell.source, DecisionSource::SensitivePath { .. }));

@@ -176,33 +176,38 @@ class GitHubApiTests(unittest.TestCase):
             api.list_runs("matrixorigin/Astra", OLD_SHA)
 
     def test_cancel_treats_a_completion_race_as_terminal(self) -> None:
-        api = GitHubApi("test-token")
-        api._request = Mock(  # type: ignore[method-assign]
-            side_effect=[
-                HTTPError("url", 409, "Conflict", {}, None),
-                (json.dumps({"status": "completed"}).encode(), {}),
-            ]
-        )
+        for code in (409, 500):
+            with self.subTest(code=code):
+                api = GitHubApi("test-token")
+                api._request = Mock(  # type: ignore[method-assign]
+                    side_effect=[
+                        HTTPError("url", code, "Cancellation failed", {}, None),
+                        (json.dumps({"status": "completed"}).encode(), {}),
+                    ]
+                )
 
-        self.assertFalse(api.cancel_run("matrixorigin/Astra", 42))
+                self.assertFalse(api.cancel_run("matrixorigin/Astra", 42))
 
-    def test_cancel_does_not_hide_a_conflict_for_an_active_run(self) -> None:
-        api = GitHubApi("test-token")
-        api._request = Mock(  # type: ignore[method-assign]
-            side_effect=[
-                HTTPError("url", 409, "Conflict", {}, None),
-                (json.dumps({"status": "in_progress"}).encode(), {}),
-                (json.dumps({"status": "in_progress"}).encode(), {}),
-                (json.dumps({"status": "in_progress"}).encode(), {}),
-            ]
-        )
+    def test_cancel_preserves_errors_for_an_active_run(self) -> None:
+        for code in (409, 500):
+            with self.subTest(code=code):
+                api = GitHubApi("test-token")
+                active = json.dumps({"status": "in_progress"}).encode(), {}
+                api._request = Mock(  # type: ignore[method-assign]
+                    side_effect=[
+                        HTTPError("url", code, "Cancellation failed", {}, None),
+                        active,
+                        active,
+                        active,
+                    ]
+                )
 
-        with (
-            patch("cancel_stale_pr_runs.time.sleep") as sleep,
-            self.assertRaisesRegex(RuntimeError, "refused to cancel active"),
-        ):
-            api.cancel_run("matrixorigin/Astra", 42)
-        self.assertEqual(sleep.call_count, 2)
+                with (
+                    patch("cancel_stale_pr_runs.time.sleep") as sleep,
+                    self.assertRaisesRegex(RuntimeError, "refused to cancel active"),
+                ):
+                    api.cancel_run("matrixorigin/Astra", 42)
+                self.assertEqual(sleep.call_count, 2)
 
     def test_cancel_waits_for_an_already_requested_cancellation(self) -> None:
         api = GitHubApi("test-token")

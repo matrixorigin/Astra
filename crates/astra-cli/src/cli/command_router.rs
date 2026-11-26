@@ -815,6 +815,8 @@ mod exact_model_resolution_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn one_shot_edge_registration_requires_server_admission_and_honors_deadline() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         assert!(crate::cli::edge_lifecycle::edge_cloud_registry_enabled());
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
@@ -7530,7 +7532,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -7559,7 +7561,6 @@ mod one_shot_persistence_tests {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
@@ -7666,7 +7667,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -7695,7 +7696,6 @@ mod one_shot_persistence_tests {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,

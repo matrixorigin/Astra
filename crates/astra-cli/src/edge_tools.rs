@@ -1475,9 +1475,6 @@ pub struct ToolExecutor {
     /// active model. Kept separate from effective input budget so introspection
     /// can answer both questions without guessing.
     current_context_window_tokens: std::sync::RwLock<Option<u64>>,
-    /// Evaluator feedback from the previous turn.
-    latest_turn_quality_feedback:
-        std::sync::Mutex<Option<astra_runtime::self_model::TurnQualityFeedback>>,
     /// Per-turn mutation accounting for adjust_config governor.
     /// (turn_number, mutations_applied_on_turn)
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
@@ -1696,7 +1693,6 @@ impl ToolExecutor {
             current_model: std::sync::RwLock::new(None),
             current_effective_input_budget_tokens: std::sync::RwLock::new(None),
             current_context_window_tokens: std::sync::RwLock::new(None),
-            latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
             default_executor: astra_tools::executor::DefaultToolExecutor::new(
                 astra_tools::ToolContext {
@@ -2761,9 +2757,6 @@ impl ToolExecutor {
             if let Ok(mut pending_boost) = self.pending_round_tool_boost.lock() {
                 *pending_boost = None;
             }
-            if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
-                *feedback = None;
-            }
             if let Ok(mut current_model) = self.current_model.write() {
                 *current_model = None;
             }
@@ -2835,15 +2828,6 @@ impl ToolExecutor {
             turn,
             self.memory_attribution_id.as_deref().unwrap_or("session"),
         )
-    }
-
-    pub fn set_latest_turn_quality_feedback(
-        &self,
-        feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
-    ) {
-        if let Ok(mut g) = self.latest_turn_quality_feedback.lock() {
-            *g = feedback;
-        }
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
@@ -4886,8 +4870,7 @@ impl ToolExecutor {
             astra_tools::schemas::validate_tool_arguments(name, args)
         };
         if let Err(error) = argument_validation {
-            let evidence = error.failure_evidence();
-            return EdgeToolRun::failure_evidence(error.output(), evidence);
+            return EdgeToolRun::from_tool_result(error.into_tool_result());
         }
         // Executor-only native capacity is admitted by the authenticated
         // delivery grant plus its local frozen approval, not model visibility.
@@ -6881,11 +6864,6 @@ impl ToolExecutor {
         if !stale_runtime_signals.is_empty() {
             snapshot = snapshot.with_stale_runtime_signals(stale_runtime_signals);
         }
-        if let Ok(feedback_guard) = self.latest_turn_quality_feedback.lock()
-            && let Some(ref feedback) = *feedback_guard
-        {
-            snapshot = snapshot.with_turn_quality_feedback(Some(feedback.clone()));
-        }
 
         Some(snapshot)
     }
@@ -8666,19 +8644,31 @@ pub(crate) mod tests {
             }
         });
         executor.set_cli_local_provider_schemas(vec![schema.clone()]);
-        executor.set_current_visible_tool_schemas(&[schema]);
+        executor.set_current_visible_tool_schemas(std::slice::from_ref(&schema));
 
         for args in [
             serde_json::json!({}),
             serde_json::json!({"city": 42}),
             serde_json::json!({"city": "Shanghai", "extra": true}),
         ] {
-            let output = executor.execute("custom_weather", &args).await;
-            assert!(
-                output.contains("Invalid arguments for tool `custom_weather`"),
-                "dynamic schema rejection must happen before handler dispatch: {output}"
-            );
-            assert!(!output.contains("not implemented by the CLI executor"));
+            let expected = astra_tools::schemas::validate_tool_arguments_against_schema(
+                "custom_weather",
+                &args,
+                &schema,
+            )
+            .unwrap_err()
+            .into_tool_result();
+            let outcome = executor
+                .execute_with_metadata("custom_weather", &args)
+                .await;
+            assert!(outcome.is_error);
+            assert_eq!(outcome.output, expected.output);
+            let fields = outcome
+                .tool_result_fields
+                .expect("schema rejection metadata");
+            assert_eq!(fields["execution_fact"], "not_executed");
+            assert_eq!(fields["side_effects_maybe"], false);
+            assert_eq!(fields["error_kind"], "tool_invalid_args");
         }
 
         let valid = executor

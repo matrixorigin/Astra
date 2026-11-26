@@ -95,7 +95,7 @@ test('REST and buffered SSE share one refresh of a single-use token', async () =
     if (authorization(init) === 'Bearer old-access') return unauthorized();
     expect(authorization(init)).toBe('Bearer new-access');
     return url.includes('/stream')
-      ? new Response('data: {"type":"run_finished"}\n\n')
+      ? new Response('data: {"type":"run_finished"}\n\ndata: [DONE]\n\n')
       : Response.json({ user_id: 'alice' });
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -384,7 +384,7 @@ test('already joined callers await an async notification that successfully reent
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (url.endsWith('/auth/refresh')) return Response.json(rotated);
     if (authorization(init) === 'Bearer old-access') return unauthorized();
-    return url.includes('/stream') ? new Response('data: {"type":"run_finished"}\n\n')
+    return url.includes('/stream') ? new Response('data: {"type":"run_finished"}\n\ndata: [DONE]\n\n')
       : Response.json({ user_id: 'alice' });
   }));
   const onTokenRefresh = vi.fn(async () => {

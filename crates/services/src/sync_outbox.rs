@@ -1180,9 +1180,12 @@ struct PreparedJournalDelta {
 }
 
 fn syncs_journal_event(event: &JournalEvent) -> bool {
-    // The journal owns CLI transcript replay. Cloud audit already has the
-    // turn and execution facts, and hosted replay uses its own transcript.
-    event.event_type != JournalEventType::TranscriptItem
+    // CLI transcript replay and process startup timing belong to the local
+    // journal. Hosted replay and audit use their own conversation and Run facts.
+    !matches!(
+        event.event_type,
+        JournalEventType::TranscriptItem | JournalEventType::Bootstrap
+    )
 }
 
 fn prepare_journal_delta(
@@ -2282,6 +2285,31 @@ mod tests {
         );
         assert_eq!(reopened.status().unwrap().ready, 2);
         assert!(std::fs::metadata(reopened.path()).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn startup_timing_stays_local_during_direct_and_cursor_sync() {
+        let (_temp, _guard, store) = test_store();
+        let startup = JournalEvent::bootstrap(Some("sess-1"), &[("setup", 23)], 23);
+        assert_eq!(
+            store.enqueue_journal_event(&startup).unwrap(),
+            SyncOutboxEnqueueOutcome::LocalOnly
+        );
+        let outcome = store
+            .append_journal_delta("sess-1", 0, 42, &[startup, event("model")])
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SyncOutboxJournalDeltaOutcome::Appended {
+                scanned_events: 2,
+                inserted: 1,
+                duplicates: 0,
+                poisoned: 0,
+                skipped: 0,
+            }
+        );
+        assert_eq!(store.status().unwrap().pending, 1);
+        assert_eq!(store.journal_source_offset("sess-1").unwrap(), 42);
     }
 
     #[test]

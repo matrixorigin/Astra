@@ -247,9 +247,8 @@ Observation timeouts do not buy inference while that dependency is paused.
 Parent guidance and messages still use ordinary input admission. Cancellation,
 lease loss, handoff and the original execution deadline remain authoritative.
 
-Turn-evaluation journals report settled `run_status` and separate
-`tool_evaluation_success` from overall `success`. Healthy tools do not promote
-a failed, cancelled, paused, or still-running execution to successful completion.
+Turn-diagnostic journals report the Run status and the execution ledger’s
+unresolved or blocked tool outcomes. The Run remains the lifecycle authority.
 Internal inference-ledger rejections are not provider HTTP-400 errors.
 
 Terminal states should distinguish:

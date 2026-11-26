@@ -64,11 +64,25 @@ pub fn circuit_breaker_config_from_tool_policy(
     }
 }
 
-/// Resolve once at execution admission; tool boundaries consume the frozen value.
+/// Thresholds for live behavioral feedback, frozen at execution admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyThresholds {
+    pub search_fanout: usize,
+    pub llm_round_churn: usize,
+    pub exploration_family_churn: usize,
+}
+
+impl Default for PolicyThresholds {
+    fn default() -> Self {
+        evaluation_thresholds_from_policy(&astra_config::runtime_config::ToolPolicyConfig::default())
+    }
+}
+
 pub fn evaluation_thresholds_from_policy(
     policy: &astra_config::runtime_config::ToolPolicyConfig,
-) -> astra_turn_core::evaluation::EvaluationThresholds {
-    astra_turn_core::evaluation::EvaluationThresholds {
+) -> PolicyThresholds {
+    PolicyThresholds {
         search_fanout: policy.effective_search_fanout_eval_threshold() as usize,
         llm_round_churn: astra_turn_core::evaluation::LLM_ROUND_CHURN_THRESHOLD,
         exploration_family_churn: astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
@@ -240,21 +254,17 @@ pub fn evaluate_tool_boundary(
         subject,
         records,
         completed_rounds,
-        astra_turn_core::evaluation::EvaluationThresholds::default(),
+        PolicyThresholds::default(),
         None,
     )
 }
 
-/// Production entry point. Runtime feedback and terminal evaluation share the
-/// same calibrated detector thresholds, so Desktop/Introspect cannot disagree
-/// with the eventual durable turn assessment merely because they used
-/// different configuration authorities.
 pub fn evaluate_tool_boundary_with_thresholds(
     state: &mut RuntimePolicyEvaluationState,
     subject: RuntimePolicySubject,
     records: &[ToolCallRecord],
     completed_rounds: u32,
-    thresholds: astra_turn_core::evaluation::EvaluationThresholds,
+    thresholds: PolicyThresholds,
     recovery: Option<RuntimeRecoveryEvidence>,
 ) -> Result<Option<RuntimePolicyFeedbackSet>, RuntimePolicyContinuationError> {
     state.preflight_history(records.len())?;
@@ -288,7 +298,7 @@ fn evaluate_policy_boundary(
     subject: RuntimePolicySubject,
     records: &[ToolCallRecord],
     completed_rounds: u32,
-    thresholds: astra_turn_core::evaluation::EvaluationThresholds,
+    thresholds: PolicyThresholds,
     recovery: Option<RuntimeRecoveryEvidence>,
 ) -> Result<Option<RuntimePolicyFeedbackSet>, RuntimePolicyContinuationError> {
     let subject_changed = state
@@ -1030,7 +1040,7 @@ mod tests {
                 RuntimePolicySubject::Run,
                 &[],
                 1,
-                astra_turn_core::evaluation::EvaluationThresholds::default(),
+                PolicyThresholds::default(),
                 recovery,
             )
             .unwrap()
@@ -1518,7 +1528,7 @@ mod tests {
             ));
         }
 
-        let mut thresholds = astra_turn_core::evaluation::EvaluationThresholds::default();
+        let mut thresholds = PolicyThresholds::default();
         // Keep this test focused on tool-shape detectors rather than the
         // independent long-trajectory synthesis nudge.
         thresholds.llm_round_churn = usize::MAX;
@@ -1729,7 +1739,7 @@ mod tests {
     #[test]
     fn search_volume_without_correlated_low_yield_evidence_is_observe_only() {
         let mut state = RuntimePolicyEvaluationState::default();
-        let records = (0..astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD)
+        let records = (0..PolicyThresholds::default().search_fanout)
             .map(|index| {
                 executed(
                     "grep",
@@ -2160,7 +2170,7 @@ mod tests {
     fn search_fanout_warns_early_but_never_gains_scheduler_authority() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
-        let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
+        let threshold = PolicyThresholds::default().search_fanout as u32;
         let mut records = (1..=threshold)
             .map(|round| {
                 executed(
@@ -2226,7 +2236,7 @@ mod tests {
     fn persistent_search_gets_one_precise_inspection_before_decision_guidance() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
-        let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
+        let threshold = PolicyThresholds::default().search_fanout as u32;
         let mut records = (1..=threshold + 1)
             .map(|round| {
                 executed(
@@ -2282,7 +2292,7 @@ mod tests {
     fn decisive_action_clears_search_inspection_watch_without_rearming_from_history() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
-        let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
+        let threshold = PolicyThresholds::default().search_fanout as u32;
         let mut records = (1..=threshold + 1)
             .map(|round| {
                 executed(
@@ -2340,7 +2350,7 @@ mod tests {
     fn introspect_does_not_masquerade_as_task_action_after_search_advisory() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
-        let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
+        let threshold = PolicyThresholds::default().search_fanout as u32;
         let mut records = (1..=threshold + 1)
             .map(|round| {
                 executed(
@@ -2385,7 +2395,7 @@ mod tests {
     fn batched_early_fanout_can_surface_persistent_search_before_round_churn_gate() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
-        let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
+        let threshold = PolicyThresholds::default().search_fanout as u32;
         let mut records = (0..threshold)
             .map(|index| {
                 executed(
@@ -2421,7 +2431,7 @@ mod tests {
     fn non_authoritative_lifecycle_record_preserves_active_watch_and_revision() {
         let mut state = RuntimePolicyEvaluationState::default();
         let subject = RuntimePolicySubject::Run;
-        let threshold = astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD as u32;
+        let threshold = PolicyThresholds::default().search_fanout as u32;
         let mut records = (1..=threshold + 1)
             .map(|round| {
                 executed(
@@ -2628,7 +2638,7 @@ mod tests {
 
     #[test]
     fn search_watch_tracks_emitted_feedback_across_projection_eviction() {
-        let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
+        let thresholds = PolicyThresholds {
             search_fanout: 1,
             llm_round_churn: usize::MAX,
             exploration_family_churn: 1,
@@ -2735,7 +2745,7 @@ mod tests {
 
     #[test]
     fn fresh_search_cycle_rearms_after_sliding_window_and_decisive_action() {
-        let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
+        let thresholds = PolicyThresholds {
             search_fanout: 2,
             llm_round_churn: usize::MAX,
             ..Default::default()

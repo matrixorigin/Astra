@@ -9541,22 +9541,22 @@ fn completed_subrun_lifecycle_is_not_inferred_from_tool_outcome_votes() {
             ..Default::default()
         },
     ]);
-    let evaluation = astra_turn_core::evaluation::evaluate_tool_call_records(
-        &state.message,
-        &state.recent_tools,
-        &state.stall.tool_call_records,
-        0,
-        false,
-        0.2,
+    let diagnostics = build_runtime_turn_diagnostics_event(
+        "session-1",
+        "server_subrun",
+        &state,
+        STATUS_COMPLETED,
     );
-
-    assert!(!evaluation.success, "the rejected route remains telemetry");
+    let metadata = diagnostics.metadata.unwrap();
+    assert_eq!(metadata["run_status"], STATUS_COMPLETED);
+    assert_eq!(metadata["blocked_tool_calls"], 1);
+    assert_eq!(metadata["unresolved_tool_outcomes"]["execution_error"], 1);
     assert!(state.interruption.is_none());
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_outcome_status(&outcome, &state),
         STATUS_COMPLETED,
-        "explicit loop lifecycle is independent from tool outcome quality"
+        "Run settlement is independent of individual tool outcomes"
     );
     assert_eq!(
         server_subrun_durable_status(&outcome, &state),
@@ -12633,7 +12633,12 @@ async fn root_live_terminal_precedes_blocked_remote_descendant_convergence() {
         .await
         .unwrap();
     let mut stream = ok(service
-        .stream_run_live(root_id.to_string(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            root_id.to_string(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut events = stream.event_rx.take().expect("root live receiver");
     assert_eq!(
@@ -13842,7 +13847,12 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         .await);
     assert_eq!(foreign_status.0, StatusCode::NOT_FOUND);
     let foreign_stream = err(service
-        .stream_run_live(blocked_run_id.clone(), owner_b.clone(), 0, false)
+        .stream_run_live(
+            blocked_run_id.clone(),
+            owner_b.clone(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     assert_eq!(foreign_stream.0, StatusCode::NOT_FOUND);
     let foreign_cancel = err(service
@@ -13930,7 +13940,12 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
 
     let attached = ok(tokio::time::timeout(
         Duration::from_secs(5),
-        service.stream_run_live(fast_a_run_id.clone(), owner_a.clone(), 0, false),
+        service.stream_run_live(
+            fast_a_run_id.clone(),
+            owner_a.clone(),
+            0,
+            RunAttachmentMode::UntilPause,
+        ),
     )
     .await
     .expect("durable reader reconnect should be bounded"));
@@ -19111,6 +19126,70 @@ fn native_edge_execution_request(executor_id: &str, root: &str) -> ChatRequestDa
 }
 
 #[tokio::test]
+async fn missing_edge_registration_preserves_code_and_pre_admission_proof_in_sse() {
+    let service = test_service().with_edge_connection_pool(
+        astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
+    );
+    let request = native_edge_execution_request("unregistered-edge", "/workspace/test");
+    let original = service
+        .authorize_native_edge_execution("owner", &request, &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        original.1.0.metadata.is_none(),
+        "a low-level error is not itself admission proof"
+    );
+    let (status, Json(error)) = execution_selection_admission_rejection(original);
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(
+        error.error_code.as_deref(),
+        Some("execution_binding_provider_required")
+    );
+    assert_eq!(
+        error.metadata.as_ref().unwrap()["attempt_admission_state"],
+        "rejected"
+    );
+    assert!(
+        error
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("admission_state")
+            .is_none(),
+        "older clients must not read an attempt rejection as logical-turn proof"
+    );
+    let response = crate::server::http_helpers::sse_error_response_from_error_with_context(
+        status,
+        error,
+        crate::server::http_helpers::SseErrorContext::default(),
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    let mut events = astra_thin_client::sse::parse_sse_body(text).unwrap();
+    assert_eq!(events.len(), 1);
+    let event = events.pop().unwrap();
+    let astra_thin_client::StreamEvent::Error { raw, .. } = event else {
+        panic!("expected rejection event")
+    };
+    assert_eq!(raw["error_code"], "execution_binding_provider_required");
+    assert_eq!(raw["metadata"]["attempt_admission_state"], "rejected");
+}
+
+#[test]
+fn unrelated_execution_selection_failure_is_not_reclassified_as_registration() {
+    let original = error_response_coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "execution_binding_unavailable",
+    );
+    let (status, Json(error)) = execution_selection_admission_rejection(original);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.metadata.is_none());
+}
+
+#[tokio::test]
 async fn native_edge_execution_reports_capability_schema_errors() {
     let binding = astra_runtime_env::RunBinding::edge_developer(
         "/workspace/schema-test",
@@ -21148,10 +21227,14 @@ async fn server_skills_are_discovered_only_for_explicit_selection() {
     );
 }
 
-#[test]
-fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
+#[cfg(unix)]
+#[tokio::test]
+async fn real_shell_negative_result_keeps_exit_fact_and_completed_run() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("fixture.txt"), "present\n").unwrap();
+
     let svc = test_service();
-    let request = test_request("git status");
+    let request = test_request("check for a missing value");
     let mut state = svc.build_initial_state(
         "test-user",
         &request,
@@ -21161,196 +21244,65 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
         None,
         None,
     );
-    state.recent_tools = vec!["git_status".into()];
-    state.telemetry.first_budget_pressure = 0.27;
-    state.stall.events.push(("repetition_stall".into(), 1));
-    state.stall.verdict_events.push(
-        astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
-            turn: 1,
-            severity: "warning".into(),
-            injections: vec!["stall detected".into()],
-            avoid_tools: vec!["git_status".into()],
-            health_avoidance_tools: vec![],
-            advisory_threshold_reached: false,
-            nudge_count: 1,
-            interaction_mode: "prompt".into(),
-            recent_error_pressure: 0,
-            recent_timeout_pressure: 0,
-            total_errors: 0,
-            health_avoidance_count: 0,
-            total_timeouts: 0,
-            timeout_dominant_tools: vec![],
-            total_cache_hits: 0,
-            flaky_count: 0,
-        },
-    );
-    state.stall.tool_call_records.push(ToolCallRecord {
-        name: "git_status".into(),
-        ok: true,
-        ms: 14,
-        error: None,
-        input_bytes: Some(8),
-        output_bytes: Some(180),
-        args_preview: None,
-        result_preview: Some("clean".into()),
-        file_path: None,
-        surgically_removed: None,
-        original_tool_name: None,
-        ..Default::default()
-    });
-    let mut round_prompts = vec![(0, 5_995)];
-    round_prompts.extend((1..33).map(|round| (round, 8_000)));
-    round_prompts.push((33, 15_922));
-    for (round, prompt_tokens) in round_prompts {
-        state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
-            qualified_usage: None,
-            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            turn: 2,
-            round,
-            provider: "test".into(),
-            model: "test-model".into(),
-            prompt_tokens,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            completion_tokens: 10,
-            tool_calls_returned: 1,
-            tool_call_names: vec!["git_status".into()],
-            start_offset_ms: u64::from(round) * 10,
-            duration_ms: 10,
-            finish_reason: Some("tool_calls".into()),
-        });
+    state.current_run_owner_generation = Some(0);
+    for (command, exit_code) in [
+        ("grep missing fixture.txt", 1),
+        ("grep missing absent.txt", 2),
+    ] {
+        let args = json!({"command": command});
+        let result = astra_tools::shell_ops::execute_bash(
+            &astra_tools::ToolContext::test(workspace.path()),
+            &args,
+            |_| None,
+        )
+        .await;
+        assert!(result.is_error, "{}", result.output);
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], exit_code);
+        let record = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
+            &astra_turn_core::sse_stream_host::EdgeToolExecResult {
+                work_attribution: None,
+                execution_completion: None,
+                request_id: format!("grep-{exit_code}"),
+                tool: "bash".into(),
+                args,
+                output: result.output,
+                tool_result_fields: result.metadata,
+                status: "failed".into(),
+                duration_ms: 0,
+            },
+        );
+        assert!(!record.ok);
+        state.stall.tool_call_records = vec![record];
+        let (_, status, _) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Completed),
+            Vec::new(),
+            &state,
+        );
+        assert_eq!(status, RunStatus::Completed);
+        let event = build_runtime_turn_diagnostics_event(
+            "session-1",
+            "server_runtime",
+            &state,
+            status.as_str(),
+        );
+        let wire = serde_json::to_value(event).unwrap();
+        let diagnostics = astra_turn_core::evaluation::turn_diagnostics_from_terminal(
+            &wire,
+            Some("session-1"),
+            "run-1",
+            Some(0),
+            STATUS_COMPLETED,
+        )
+        .unwrap()
+        .metadata
+        .unwrap();
+        assert_eq!(diagnostics["unresolved_tool_outcomes"], json!({}));
+        assert_eq!(diagnostics["blocked_tool_calls"], 0);
     }
-    state.llm_rounds_completed = 34;
-    state.total_prompt = 42_000;
-
-    assert_eq!(
-        state.recent_rounds.len(),
-        32,
-        "the diagnostics ring stays bounded"
-    );
-    assert_eq!(state.telemetry.first_round_prompt_tokens, Some(5_995));
-    assert_eq!(state.telemetry.max_round_prompt_tokens, Some(15_922));
-
-    let event = build_runtime_turn_evaluation_event(
-        "session-1",
-        "server_runtime",
-        &state,
-        STATUS_COMPLETED,
-    );
-
-    assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
-    assert_eq!(event.turn, Some(state.session_turn));
-    assert_eq!(
-        event
-            .producer_scope
-            .as_ref()
-            .map(|scope| scope.run_id.as_str()),
-        state.current_run_id.as_deref()
-    );
-    let metadata = event.metadata.expect("turn evaluation metadata");
-    assert_eq!(metadata["source"], "server_runtime");
-    assert_eq!(metadata["live_query"], false);
-    assert_eq!(metadata["stall_count"], 1);
-    assert_eq!(metadata["verdict_warning"], true);
-    assert_eq!(metadata["tool_call_count"], 1);
-    assert_eq!(
-        metadata["llm_rounds"], 34,
-        "completed logical rounds are not the bounded diagnostics ring length"
-    );
-    assert!(metadata["quality"].as_f64().unwrap() < 0.8);
-    assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
-    assert!(
-        metadata["signals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|signal| signal["kind"] == "prompt_growth_churn"),
-        "server evaluation must consume real per-round prompt telemetry"
-    );
-    assert!(
-        !metadata["signals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|signal| signal["kind"] == "all_tools_healthy"),
-        "cache/prompt churn must not be mislabeled as a fully healthy turn"
-    );
-}
-
-#[test]
-fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_tool_health() {
-    let svc = test_service();
-    let request = test_request("git status");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.recent_tools = vec!["git_status".into()];
-    state.stall.tool_call_records.push(ToolCallRecord {
-        name: "git_status".into(),
-        ok: true,
-        ms: 14,
-        output_bytes: Some(180),
-        result_preview: Some("working tree is clean".into()),
-        ..Default::default()
-    });
-
-    for source in ["server_runtime", "server_subrun"] {
-        for status in RunStatus::ALL {
-            let event =
-                build_runtime_turn_evaluation_event("session-1", source, &state, status.as_str());
-            let metadata = event.metadata.expect("turn evaluation metadata");
-            assert_eq!(metadata["run_status"], status.as_str());
-            assert_eq!(metadata["tool_evaluation_success"], true);
-            assert_eq!(
-                metadata["success"],
-                matches!(status, RunStatus::Completed | RunStatus::Delegated),
-                "healthy tools cannot override settled {status:?} for {source}"
-            );
-            assert!(
-                metadata["signals"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|signal| signal["kind"] == "all_tools_healthy"),
-                "a failed run must retain accurate evidence about its successful tools"
-            );
-        }
-    }
-
-    // A recovered provider deadline can remain in loop diagnostics. Evaluation
-    // must use the settled status, including a later unrelated terminal failure.
-    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-        InterruptionKind::ProviderDeadline,
-        ResumeAction::ContinueImmediately,
-        astra_turn_core::interruption::InterruptionStateSummary::default(),
-    ));
-    for (status, expected_success) in [(STATUS_COMPLETED, true), (STATUS_FAILED, false)] {
-        let event =
-            build_runtime_turn_evaluation_event("session-1", "server_runtime", &state, status);
-        assert_eq!(event.metadata.unwrap()["success"], expected_success);
-    }
-
-    state.stall.tool_call_records[0].ok = false;
-    state.stall.tool_call_records[0].error = Some("tool execution failed".into());
-    let event = build_runtime_turn_evaluation_event(
-        "session-1",
-        "server_runtime",
-        &state,
-        STATUS_COMPLETED,
-    );
-    let metadata = event.metadata.expect("turn evaluation metadata");
-    assert_eq!(metadata["tool_evaluation_success"], false);
-    assert_eq!(metadata["success"], false);
 }
 
 #[tokio::test]
-async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
+async fn completed_child_supersedes_nonterminal_receipts_in_turn_diagnostics() {
     use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
 
     for (tool, mixed_time, pending_status) in [
@@ -21452,7 +21404,7 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
         });
         }
         let evaluate = |state: &AgenticLoopState| {
-            build_runtime_turn_evaluation_event(
+            build_runtime_turn_diagnostics_event(
                 "session-1",
                 "server_runtime",
                 state,
@@ -21461,7 +21413,12 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
             .metadata
             .unwrap()
         };
-        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        assert!(
+            !evaluate(&state)["unresolved_tool_outcomes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         state.push_volatile_payload(
             crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
             serde_json::json!({
@@ -21471,7 +21428,12 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
                 "children": [{"agent_id":"child@run","run_id":"child-run","status":"completed"}]
             }),
         );
-        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        assert!(
+            !evaluate(&state)["unresolved_tool_outcomes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         state.volatile_pending.last_mut().unwrap().payload["children"][0]["result"] =
             serde_json::json!("check complete");
         state.volatile_pending.last_mut().unwrap().payload["children"][0]["result_bytes"] =
@@ -21558,12 +21520,17 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
         );
         let settled = evaluate(&state);
         assert_eq!(
-            settled["tool_evaluation_success"], true,
+            settled["unresolved_tool_outcomes"],
+            json!({}),
             "{tool} {pending_status:?} mixed={mixed_time}"
         );
-        assert_eq!(settled["success"], true);
         state.current_run_id = Some("other-run".into());
-        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        assert!(
+            !evaluate(&state)["unresolved_tool_outcomes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -24283,7 +24250,12 @@ async fn provider_task_ref_isolates_two_users_across_attach_and_cancel() {
             .await
             .expect("seed provider run");
         let attached = ok(svc
-            .stream_run_live(identity.run_id().to_string(), user_id.to_string(), 0, false)
+            .stream_run_live(
+                identity.run_id().to_string(),
+                user_id.to_string(),
+                0,
+                RunAttachmentMode::UntilPause,
+            )
             .await);
         assert_eq!(attached.run_id, identity.run_id());
         assert_eq!(attached.session_id, session_id);
@@ -24352,7 +24324,12 @@ async fn durable_live_attach_keeps_a_retained_pause_open_across_resume() {
                 );
             }
             let mut stream = ok(svc
-                .stream_run_live("remote-paused".into(), "user-1".into(), 0, false)
+                .stream_run_live(
+                    "remote-paused".into(),
+                    "user-1".into(),
+                    0,
+                    RunAttachmentMode::UntilPause,
+                )
                 .await);
             if owner == "released" && initially_paused {
                 assert!(
@@ -24487,7 +24464,12 @@ async fn durable_live_attach_local_wake_reads_committed_events_without_forwardin
     svc.runs.write().await.get_mut("live-run").unwrap().live_tx = Some(wake.clone());
 
     let mut events = ok(svc
-        .stream_run_live("live-run".into(), "user".into(), 0, false)
+        .stream_run_live(
+            "live-run".into(),
+            "user".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await)
     .event_rx
     .expect("live attachment");
@@ -24536,7 +24518,12 @@ async fn durable_live_attach_forwards_child_interactions_and_reports_lag() {
     let (wake, _) = broadcast::channel(4);
     svc.runs.write().await.get_mut("live-run").unwrap().live_tx = Some(wake.clone());
     let mut events = ok(svc
-        .stream_run_live("live-run".into(), "user".into(), 0, false)
+        .stream_run_live(
+            "live-run".into(),
+            "user".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await)
     .event_rx
     .expect("live attachment");
@@ -24588,7 +24575,9 @@ async fn websocket_pause_follows_resume_until_a_durable_finish() {
         .unwrap()
     );
 
-    let mut attached = ok(svc.stream_run_live(run.into(), user.into(), 0, true).await);
+    let mut attached = ok(svc
+        .stream_run_live(run.into(), user.into(), 0, RunAttachmentMode::Follow)
+        .await);
     let mut events = attached
         .event_rx
         .take()
@@ -24625,6 +24614,93 @@ async fn websocket_pause_follows_resume_until_a_durable_finish() {
     assert!(attached.attachment_completion.unwrap().await.is_ok());
 }
 
+#[tokio::test(start_paused = true)]
+async fn pause_reconciliation_closes_when_run_resumes() {
+    let svc = test_service_with_store(Arc::new(InMemoryRunStateStore::new()));
+    let (user, session, run) = ("user", "session", "resuming-run");
+    svc.run_engine.start_run(run, user, session).await.unwrap();
+    assert!(
+        svc.run_engine
+            .transition_status_with_event_if_current(
+                user,
+                session,
+                run,
+                &[STATUS_RUNNING],
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+                json!({"event_type":"run_paused", "data":{}}),
+            )
+            .await
+            .unwrap()
+    );
+    install_live_run_state(
+        &svc,
+        user,
+        run,
+        session,
+        RunStatus::Paused,
+        Some("user_resume"),
+    )
+    .await;
+
+    svc.runs.write().await.get_mut(run).unwrap().live_tx = None;
+    let mut attachment = ok(svc
+        .stream_run_live(
+            run.into(),
+            user.into(),
+            0,
+            RunAttachmentMode::ReconcilePause,
+        )
+        .await);
+    let mut events = attachment.event_rx.take().expect("pause still draining");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_started");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_paused");
+    assert!(
+        svc.run_engine
+            .transition_status_with_event_if_current(
+                user,
+                session,
+                run,
+                &[STATUS_PAUSED],
+                STATUS_RUNNING,
+                None,
+                None,
+                json!({"event_type":"run_resumed", "data":{}}),
+            )
+            .await
+            .unwrap()
+    );
+
+    let resumed = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed["event_type"], "run_resumed");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let through = attachment.attachment_completion.unwrap().await.unwrap();
+    assert_eq!(Some(through), resumed["index"].as_i64());
+
+    let settled = ok(svc
+        .stream_run_live(
+            run.into(),
+            user.into(),
+            0,
+            RunAttachmentMode::ReconcilePause,
+        )
+        .await);
+    assert!(settled.event_rx.is_none());
+    assert_eq!(
+        settled.attachment_completion.unwrap().await.unwrap(),
+        through
+    );
+}
+
 #[tokio::test]
 async fn durable_live_attach_follows_a_run_without_process_local_state() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
@@ -24645,7 +24721,7 @@ async fn durable_live_attach_follows_a_run_without_process_local_state() {
             "remote-provider-task".to_string(),
             "user-1".to_string(),
             0,
-            false,
+            RunAttachmentMode::UntilPause,
         )
         .await);
     let mut event_rx = stream
@@ -24726,7 +24802,12 @@ async fn ordinary_live_attach_delivers_events_added_before_the_admission_read() 
     store.reset_read_counters();
 
     let mut stream = ok(svc
-        .stream_run_live("ordinary-race".into(), "user-1".into(), 0, false)
+        .stream_run_live(
+            "ordinary-race".into(),
+            "user-1".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     if let Some(mut receiver) = stream.event_rx.take() {
         while let Some(event) = receiver.recv().await {
@@ -24767,7 +24848,12 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         .expect("seed remote Explain run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-explain".to_string(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            "remote-explain".to_string(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = stream.event_rx.take().expect("active Explain attachment");
     assert_eq!(
@@ -24873,7 +24959,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
             "remote-explain".to_string(),
             "user-1".to_string(),
             publication_index.saturating_add(1),
-            false,
+            RunAttachmentMode::UntilPause,
         )
         .await);
     assert!(
@@ -24940,7 +25026,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
             "remote-settled-explain".to_string(),
             "user-1".to_string(),
             0,
-            false,
+            RunAttachmentMode::UntilPause,
         )
         .await);
     let mut reconnect_rx = reconnect
@@ -25063,7 +25149,12 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     store.reset_read_counters();
 
     let stream = ok(svc
-        .stream_run_live("race-explain".into(), "user-1".into(), 0, false)
+        .stream_run_live(
+            "race-explain".into(),
+            "user-1".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     assert!(
         stream.event_rx.is_none(),
@@ -25131,7 +25222,12 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
         .expect("append replay burst");
 
     let mut stream = ok(svc
-        .stream_run_live("unread-terminal".into(), "user-1".into(), 0, false)
+        .stream_run_live(
+            "unread-terminal".into(),
+            "user-1".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = stream.event_rx.take().expect("terminal attach");
     tokio::time::sleep(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT + Duration::from_secs(1)).await;
@@ -25183,7 +25279,12 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
     let mut owner_event_rx = owner_stream.event_rx.take().expect("owner live stream");
     let owner_drain = tokio::spawn(async move { while owner_event_rx.recv().await.is_some() {} });
     let mut attached = ok(observer
-        .stream_run_live(owner_stream.run_id.clone(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            owner_stream.run_id.clone(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = attached
         .event_rx
@@ -26158,7 +26259,12 @@ async fn durable_live_attach_does_not_drop_a_backpressured_event_burst() {
         .expect("seed remote run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-burst".to_string(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            "remote-burst".to_string(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = stream.event_rx.take().expect("live attachment");
     assert_eq!(

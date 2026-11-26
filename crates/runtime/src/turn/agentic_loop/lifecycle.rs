@@ -1716,42 +1716,11 @@ pub(super) fn prepare_iteration_budget(
     Ok(())
 }
 
-/// Unified diagnosis of all stall conditions evaluated at interruption time.
-///
-/// Computes the signal string, human-readable summary, and restricted tool
-/// list in a single pass to avoid re-evaluating the same stall
-/// observations across three separate functions.
-struct StallDiagnosis {
-    signal: Option<String>,
-    summary: Option<String>,
-    restricted_tools: Vec<String>,
-}
-
-fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
-    // 1. Exploration family streak (read/search/diff dominance)
-    if let Some((family, streak)) =
-        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
-        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
-    {
-        let summary_text = match family {
-            "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
-            "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
-            "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
-            _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
-        };
-        let summary = Some(summary_text);
-        return StallDiagnosis {
-            signal: Some(format!("exploration_family={family};streak={streak}")),
-            summary,
-            restricted_tools: Vec::new(),
-        };
-    }
-
-    StallDiagnosis {
-        signal: None,
-        summary: None,
-        restricted_tools: Vec::new(),
-    }
+fn exploration_stall(state: &AgenticLoopState) -> Option<(&'static str, usize)> {
+    astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
+        .filter(|&(_, streak)| {
+            streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
+        })
 }
 
 /// Build an interruption state summary from the current loop state.
@@ -1759,20 +1728,22 @@ pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
     error_detail: Option<String>,
 ) -> InterruptionStateSummary {
-    let diag = compute_stall_diagnosis(state);
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
         tool_calls_completed: completed_tool_calls(state),
         turns_completed: current_agentic_step(state),
         remaining_turns: state.remaining_turns as u32,
         error_detail,
-        stall_signal: diag.signal,
-        resume_restricted_tools: diag.restricted_tools,
+        stall_signal: exploration_stall(state)
+            .map(|(family, streak)| format!("exploration_family={family};streak={streak}")),
+        resume_restricted_tools: Vec::new(),
     }
 }
 
 pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option<String> {
-    compute_stall_diagnosis(state).summary
+    exploration_stall(state).map(|(family, streak)| {
+        format!("{streak} consecutive {family}-dominant exploratory rounds")
+    })
 }
 
 pub(crate) fn mark_work_settlement_incomplete(state: &mut AgenticLoopState) {

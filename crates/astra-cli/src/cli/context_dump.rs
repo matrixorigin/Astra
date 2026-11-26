@@ -857,7 +857,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: None,
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
