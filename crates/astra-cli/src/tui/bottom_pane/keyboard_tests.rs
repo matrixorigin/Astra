@@ -1662,3 +1662,141 @@ fn active_turn_stop_key_is_consistent_even_with_queued_guidance() {
     let ctrl_c = pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(matches!(ctrl_c, BottomPaneAction::Interrupt));
 }
+
+#[test]
+fn history_search_accept_keeps_visible_edits_and_up_parked_paste() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("previous prompt");
+    pane.composer.clear_and_submit();
+    let original = "pasted draft\n".repeat(100);
+    pane.handle_paste(&original);
+    pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    pane.handle_paste(" with edits");
+    pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    pane.handle_paste("no match");
+    pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert!(pane.composer.is_history_search_active());
+    assert_eq!(pane.composer.text(), "previous prompt with edits");
+
+    pane.handle_paste("previous");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(pane.handle_key(enter), BottomPaneAction::Consumed));
+    assert_eq!(pane.composer.text(), "previous prompt");
+    pane.restore_into_composer("returned while editing");
+    assert_eq!(pane.composer.text(), "previous prompt");
+
+    assert!(matches!(
+        pane.handle_key(enter),
+        BottomPaneAction::SubmitInput(text) if text == "previous prompt"
+    ));
+    assert_eq!(
+        pane.composer.text(),
+        format!("previous prompt with edits\n\n{original}\n\nreturned while editing")
+    );
+}
+
+#[test]
+fn history_search_uses_replayed_messages_and_drops_matches_on_session_change() {
+    use crate::tui::chat_widget::ChatWidget;
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+
+    let mut widget = ChatWidget::new("restored");
+    widget.replay(
+        ["/stop", "  /exit", "!replayed-shell"]
+            .into_iter()
+            .map(|text| UserCell::new(text).to_persist().unwrap())
+            .collect(),
+    );
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_session_attachment(Some("restored"), 1);
+    let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    pane.handle_session_key_at(search, Instant::now(), widget.history());
+    for unavailable in ["/exit", "replayed-shell"] {
+        pane.handle_paste(unavailable);
+        assert!(matches!(pane.handle_key(enter), BottomPaneAction::Consumed));
+        assert!(pane.composer.is_history_search_active());
+        pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    }
+    pane.handle_paste("//stop");
+    pane.set_session_attachment(Some("restored"), 1);
+    assert!(matches!(pane.handle_key(enter), BottomPaneAction::Consumed));
+    assert_eq!(pane.composer.text(), "//stop");
+    assert!(
+        matches!(pane.handle_key(enter), BottomPaneAction::SubmitInput(text) if text == "//stop")
+    );
+
+    pane.composer.set_text(" //stop");
+    pane.composer.clear_and_submit();
+    pane.handle_session_key_at(search, Instant::now(), widget.history());
+    pane.handle_paste(" //stop");
+    pane.handle_key(enter);
+    assert_eq!(pane.composer.text(), " //stop");
+    pane.composer.clear_draft();
+
+    pane.composer.set_text("unsent");
+    pane.handle_session_key_at(search, Instant::now(), widget.history());
+    pane.handle_paste("stop");
+    pane.set_session_attachment(Some("other"), 2);
+    assert!(!pane.composer.is_history_search_active());
+    assert_eq!(pane.composer.text(), "unsent");
+}
+
+#[test]
+fn history_search_yank_cannot_release_a_pending_paste_guard() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("abcX");
+    pane.composer.clear_and_submit();
+    let start = Instant::now();
+    let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+    pane.handle_key_at(ctrl('r'), start);
+    pane.handle_paste("X");
+    pane.handle_key_at(ctrl('u'), start);
+    for (i, c) in "abc".chars().enumerate() {
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            start + std::time::Duration::from_millis(i as u64 + 1),
+        );
+    }
+    pane.handle_key_at(ctrl('y'), start + std::time::Duration::from_millis(4));
+    for ms in [5, 6] {
+        let action = pane.handle_key_at(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            start + std::time::Duration::from_millis(ms),
+        );
+        assert!(matches!(action, BottomPaneAction::Consumed));
+        assert!(pane.composer.is_history_search_active());
+    }
+}
+
+#[test]
+fn history_search_keeps_a_concurrent_return_queued_while_editing_a_match() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("previous");
+    pane.composer.clear_and_submit();
+    let start = Instant::now();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        start,
+    );
+    pane.handle_paste("previous");
+    pane.restore_into_composer("returned while searching");
+    pane.handle_key_at(key(KeyCode::Enter), start);
+    for (i, c) in "abc".chars().enumerate() {
+        pane.handle_key_at(
+            key(KeyCode::Char(c)),
+            start + std::time::Duration::from_millis(i as u64 + 1),
+        );
+    }
+    pane.pre_draw_tick(start + std::time::Duration::from_millis(80));
+    assert!(
+        matches!(pane.handle_key_at(key(KeyCode::Enter), start + std::time::Duration::from_millis(250)),
+        BottomPaneAction::SubmitInput(text) if text == "previousabc")
+    );
+    assert_eq!(pane.composer.text(), "returned while searching");
+}

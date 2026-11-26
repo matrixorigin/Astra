@@ -1201,7 +1201,10 @@ fn picker_navigation_transfers_suspended_history_drafts_and_pastes() {
             expected.push(original);
         }
         assert_eq!(
-            pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+            pane.restored_drafts
+                .iter()
+                .map(super::UnsentDraft::text)
+                .collect::<Vec<_>>(),
             expected
         );
         pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1232,7 +1235,10 @@ fn history_suspension_transfers_pending_paste_bytes_before_up() {
     pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     pane.start_composer_draft("/help");
     assert_eq!(
-        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        pane.restored_drafts
+            .iter()
+            .map(super::UnsentDraft::text)
+            .collect::<Vec<_>>(),
         vec!["original pending bytes"]
     );
 }
@@ -1335,7 +1341,10 @@ fn restoration_preserves_multiple_paste_blobs_and_suspended_history() {
     assert_eq!(pane.composer.pasted_blob_count(), 3);
     pane.start_composer_draft("/help");
     assert_eq!(
-        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        pane.restored_drafts
+            .iter()
+            .map(super::UnsentDraft::text)
+            .collect::<Vec<_>>(),
         vec![format!("{expected}\n\n/returned"), suspended.clone()]
     );
     pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1357,7 +1366,7 @@ fn recovery_waits_behind_intentional_whitespace_drafts() {
         pane.restore_into_composer("//returned");
         assert_eq!(pane.composer.text(), draft);
         assert_eq!(
-            pane.restored_drafts.front().map(String::as_str),
+            pane.restored_drafts.front().map(super::UnsentDraft::text),
             Some("//returned")
         );
         assert!(!pane.composer.is_empty());

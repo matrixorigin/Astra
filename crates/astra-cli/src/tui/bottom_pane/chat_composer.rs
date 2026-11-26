@@ -8,9 +8,12 @@ use ratatui::{
 };
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use crate::tui::history_cell::{HistoryCell, user::UserCell};
 
 use super::textarea::{TextArea, TextAreaAction};
 use crate::tui::file_writer::TuiFileWriter;
@@ -19,6 +22,7 @@ use crate::tui::file_writer::TuiFileWriter;
 /// unbounded. The oldest entries are dropped when the file is
 /// rewritten after an append crosses this threshold.
 const HISTORY_MAX_ENTRIES: usize = 500;
+const HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS: usize = 4096;
 
 /// Duration the `·` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
@@ -28,7 +32,14 @@ const SUBMIT_FLASH_DURATION: Duration = Duration::from_millis(180);
 #[derive(Debug)]
 struct HistorySearch {
     query: TextArea,
+    entries: Vec<HistorySearchEntry>,
     match_index: Option<usize>,
+}
+
+#[derive(Debug)]
+enum HistorySearchEntry {
+    Session(Arc<dyn HistoryCell>),
+    Local(usize),
 }
 
 #[derive(Debug)]
@@ -197,12 +208,12 @@ impl ChatComposer {
         let unchanged_recall = self
             .history_index
             .is_some_and(|i| self.history[i] == visible);
-        if !unchanged_recall && !visible.trim().is_empty() {
+        if !unchanged_recall && !visible.is_empty() {
             drafts.push(visible);
         }
         if let Some(raw) = self.draft.take() {
             let suspended = self.expand_pastes(&raw).into_owned();
-            if !suspended.trim().is_empty() && !drafts.contains(&suspended) {
+            if !suspended.is_empty() && !drafts.contains(&suspended) {
                 drafts.push(suspended);
             }
         }
@@ -521,59 +532,109 @@ impl ChatComposer {
                 .contains(crossterm::event::KeyModifiers::CONTROL)
     }
 
-    fn find_history_match(&self, query: &str, before: Option<usize>) -> Option<usize> {
+    fn session_message(cell: &dyn HistoryCell) -> Option<&str> {
+        cell.as_any_ref()
+            .downcast_ref::<UserCell>()
+            .map(UserCell::text)
+    }
+
+    fn history_search_entry<'a>(&'a self, entry: &'a HistorySearchEntry) -> Option<&'a str> {
+        match entry {
+            HistorySearchEntry::Session(cell) => Self::session_message(cell.as_ref()),
+            HistorySearchEntry::Local(index) => self.history.get(*index).map(String::as_str),
+        }
+    }
+
+    fn find_history_match(&self, after: usize) -> Option<usize> {
+        let search = self.history_search.as_ref()?;
+        let query = search.query.text();
         if query.is_empty() {
             return None;
         }
-        let end = before.unwrap_or(self.history.len()).min(self.history.len());
-        self.history[..end]
+        search
+            .entries
             .iter()
             .enumerate()
-            .rev()
-            .find(|(_, entry)| entry.contains(query))
-            .map(|(index, _)| index)
+            .skip(after)
+            .find_map(|(index, entry)| {
+                let text = self.history_search_entry(entry)?;
+                // A semantic leading slash gains one slash when recalled.
+                let escaped_match = matches!(entry, HistorySearchEntry::Session(_))
+                    && text.starts_with('/')
+                    && query
+                        .strip_prefix('/')
+                        .is_some_and(|suffix| text.starts_with(suffix));
+                (text.contains(query) || escaped_match).then_some(index)
+            })
     }
 
-    fn start_or_continue_history_search(&mut self, now: Instant) {
-        if let Some(search) = &self.history_search {
-            let next = self.find_history_match(search.query.text(), search.match_index);
-            if next.is_some()
-                && let Some(search) = &mut self.history_search
-            {
-                search.match_index = next;
-            }
-            return;
-        }
+    pub(super) fn start_history_search(&mut self, now: Instant, history: &[Arc<dyn HistoryCell>]) {
         self.textarea.flush_pending_paste_at(now);
         let mut query = TextArea::new();
         self.textarea.swap_paste_burst(&mut query);
+        let mut entries = Vec::new();
+        let mut session_text = std::collections::HashSet::new();
+        let recent_messages = history
+            .iter()
+            .rev()
+            .take(HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS)
+            .filter_map(|cell| Some((cell, Self::session_message(cell.as_ref())?)))
+            .take(HISTORY_MAX_ENTRIES);
+        for (cell, text) in recent_messages {
+            let trimmed = text.trim_start();
+            // The composer has no literal spelling for shell passthrough or
+            // a slash-prefixed message with significant leading whitespace.
+            if crate::cli::turn::turn_entry::shell_input_body(text).is_none()
+                && (!trimmed.starts_with('/') || trimmed == text)
+                && session_text.insert(text)
+            {
+                entries.push(HistorySearchEntry::Session(Arc::clone(cell)));
+            }
+        }
+        for (index, raw) in self
+            .history
+            .iter()
+            .enumerate()
+            .rev()
+            .take(HISTORY_MAX_ENTRIES)
+        {
+            let duplicate = if raw.starts_with('/') {
+                raw.strip_prefix('/')
+                    .is_some_and(|text| text.starts_with('/') && session_text.contains(text))
+            } else {
+                session_text.contains(raw.as_str())
+            };
+            if duplicate {
+                continue;
+            }
+            entries.push(HistorySearchEntry::Local(index));
+        }
         self.history_search = Some(HistorySearch {
             query,
+            entries,
             match_index: None,
         });
     }
 
     fn refresh_history_search(&mut self) {
-        let Some(search) = self.history_search.as_ref() else {
-            return;
-        };
-        let match_index = self.find_history_match(search.query.text(), None);
+        let match_index = self.find_history_match(0);
         if let Some(search) = &mut self.history_search {
             search.match_index = match_index;
         }
     }
 
-    fn accept_history_search(&mut self) {
-        let Some(mut search) = self.history_search.take() else {
-            return;
+    fn accept_history_search(&mut self) -> Option<String> {
+        let search = self.history_search.as_ref()?;
+        let entry = search.entries.get(search.match_index?)?;
+        let text = self.history_search_entry(entry)?;
+        let text = if matches!(entry, HistorySearchEntry::Session(_)) {
+            crate::tui::slash_dispatch::conversation_for_composer(text).into_owned()
+        } else {
+            text.to_owned()
         };
+        let mut search = self.history_search.take().expect("matched search");
         self.textarea.swap_paste_burst(&mut search.query);
-        if let Some(index) = search.match_index {
-            self.textarea.set_text(&self.history[index]);
-            self.pasted_blobs.clear();
-            self.history_index = None;
-            self.draft = None;
-        }
+        Some(text)
     }
 
     pub(super) fn cancel_history_search(&mut self) -> bool {
@@ -592,11 +653,17 @@ impl ChatComposer {
 
     pub(super) fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> ComposerAction {
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
-            if self.history_search.is_some() && self.active_input_mut().paste_input_pending_at(now)
-            {
-                return ComposerAction::Consumed;
+            if let Some(search) = &mut self.history_search {
+                if !search.query.paste_input_pending_at(now) {
+                    let after = search.match_index.map_or(0, |index| index + 1);
+                    if let Some(next) = self.find_history_match(after) {
+                        self.history_search
+                            .as_mut()
+                            .expect("active search")
+                            .match_index = Some(next);
+                    }
+                }
             }
-            self.start_or_continue_history_search(now);
             return ComposerAction::Consumed;
         }
         if self.history_search.is_some() {
@@ -608,49 +675,40 @@ impl ChatComposer {
                 {
                     self.active_input_mut().handle_key_at(key, now);
                     self.refresh_history_search();
-                    return ComposerAction::Consumed;
                 }
-                KeyCode::Enter => {
-                    if self.consume_guarded_enter_at(now) {
-                        return ComposerAction::Consumed;
-                    }
-                    if self
-                        .history_search
-                        .as_ref()
-                        .is_some_and(|search| search.match_index.is_some())
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    if !self.consume_guarded_enter_at(now)
+                        && let Some(text) = self.accept_history_search()
                     {
-                        self.accept_history_search();
+                        return ComposerAction::Recall(text);
                     }
-                    return ComposerAction::Consumed;
                 }
                 KeyCode::Esc => {
                     self.cancel_history_search_at(now);
-                    return ComposerAction::Consumed;
                 }
                 KeyCode::Tab if key.modifiers.is_empty() => {
-                    let before = self.active_input().text().len();
                     self.active_input_mut().insert_key_char_at('\t', now);
-                    if self.active_input().text().len() != before {
-                        self.refresh_history_search();
-                    }
-                    return ComposerAction::Consumed;
+                    self.refresh_history_search();
+                }
+                KeyCode::Char('y')
+                    if key.modifiers == KeyModifiers::CONTROL
+                        && self.active_input_mut().paste_input_pending_at(now) =>
+                {
+                    // Yank normally releases the paste guard. Keep that
+                    // guard with bytes still arriving in this input gesture.
                 }
                 code if code == KeyCode::Backspace
                     || matches!(code, KeyCode::Char(c) if !c.is_control()
-                        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)) =>
+                        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+                    || matches!(code, KeyCode::Char('u' | 'w' | 'k' | 'y'))
+                        && key.modifiers == KeyModifiers::CONTROL =>
                 {
-                    let before = self.active_input().text().len();
                     self.active_input_mut().handle_key_at(key, now);
-                    if self.active_input().text().len() != before {
-                        self.refresh_history_search();
-                    }
-                    return ComposerAction::Consumed;
+                    self.refresh_history_search();
                 }
-                _ if self.active_input_mut().paste_input_pending_at(now) => {
-                    return ComposerAction::Consumed;
-                }
-                _ => self.accept_history_search(),
+                _ => {}
             }
+            return ComposerAction::Consumed;
         }
         if Self::is_explicit_followup_key(key) {
             // Never clear a draft while part of a non-bracketed paste is
@@ -795,9 +853,11 @@ impl ChatComposer {
         let preview = search
             .match_index
             .filter(|_| include_preview)
-            .map(|index| {
+            .and_then(|index| search.entries.get(index))
+            .and_then(|entry| self.history_search_entry(entry))
+            .map(|entry| {
                 // Only the visible prefix is needed; a history entry can be large.
-                let prefix: String = self.history[index]
+                let prefix: String = entry
                     .graphemes(true)
                     .take(preview_width.saturating_add(1))
                     .collect();
@@ -931,8 +991,9 @@ impl ChatComposer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ComposerAction {
+    Recall(String),
     Submit,
     QueueFollowUp,
     OpenExternalEditor,

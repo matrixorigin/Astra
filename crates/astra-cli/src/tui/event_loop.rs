@@ -11366,7 +11366,7 @@ pub(crate) async fn run_tui_session(
                         let bottom_pane_action = if runtime_notification_submission {
                             BottomPaneAction::SubmitInput(String::new())
                         } else {
-                            bottom_pane.handle_key_at(key, input_at)
+                            bottom_pane.handle_session_key_at(key, input_at, chat_widget.history())
                         };
                                 (None, bottom_pane_action)
                             }
@@ -12647,7 +12647,7 @@ pub(crate) async fn run_tui_session(
                                                             // Enter queues a user intent against the active run.
                                                             // Ctrl+C interrupts.
                                                             bottom_pane.pre_draw_tick(std::time::Instant::now());
-                                                            let action = bottom_pane.handle_key(k);
+                                                            let action = bottom_pane.handle_session_key_at(k, std::time::Instant::now(), chat_widget.history());
                                                             if queue_explicit_active_followup(
                                                                 &action,
                                                                 &mut bottom_pane,
@@ -31468,7 +31468,11 @@ mod tests {
             // slash escapes and ordinary conversation semantics.
             for _ in 0..2 {
                 assert!(matches!(
-                    pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+                    pane.handle_session_key_at(
+                        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                        std::time::Instant::now(),
+                        widget.history()
+                    ),
                     BottomPaneAction::Consumed
                 ));
                 assert!(!pane.has_active_view());

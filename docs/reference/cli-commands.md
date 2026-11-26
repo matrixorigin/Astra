@@ -448,8 +448,10 @@ These editable drafts remain local to the running client.
 Ctrl+R starts inline readline-style history search in the existing composer,
 including when it already contains a draft; no popup replaces the input box.
 The `(reverse-i-search)` line shows the query and current match. Type to filter,
-repeat Ctrl+R to select older matches, and press Enter to insert the exact
-selected history entry. Esc closes search and restores the original draft.
+repeat Ctrl+R to select older matches, and press Enter to recall the selected
+entry for editing. Search checks the current conversation already loaded in the
+TUI before recent local inputs. The original draft stays in Unsent drafts after
+recall. Esc cancels search and leaves the original draft in place.
 Slash escapes are preserved, so resending `/exit` text keeps it a message; the
 transcript shows the original conversation text without the composer escape.
 Unknown or ambiguous single-slash actions still report a command error.

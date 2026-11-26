@@ -76,6 +76,25 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MAX_PENDING_INTENTS: usize = 64;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
+enum UnsentDraft {
+    Returned(String),
+    Parked(String),
+}
+
+impl UnsentDraft {
+    fn text(&self) -> &str {
+        match self {
+            Self::Returned(text) | Self::Parked(text) => text,
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Returned(text) | Self::Parked(text) => text,
+        }
+    }
+}
+
 enum ModelCatalogState {
     Ready(Vec<astra_services::ModelListItemResponse>),
 }
@@ -134,7 +153,7 @@ pub(crate) struct BottomPane {
     /// submissions, not guidance for the previous run.
     queued_next_turn_submissions: std::collections::VecDeque<NextTurnSubmission>,
     /// Recovery is editable input, not authority for automatic next-turn replay.
-    restored_drafts: std::collections::VecDeque<String>,
+    restored_drafts: std::collections::VecDeque<UnsentDraft>,
     applied_user_intent_ids: std::collections::HashSet<String>,
     /// Typed actions emitted while a retained projection refreshes. These are
     /// not user-input events: for example, a live agent transcript upgrades
@@ -521,6 +540,15 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
+        if self
+            .session_attachment
+            .as_ref()
+            .is_some_and(|(id, previous_epoch)| {
+                id.as_deref() != session_id || *previous_epoch != epoch
+            })
+        {
+            self.composer.cancel_history_search();
+        }
         let mut count = 0usize;
         let mut bytes = 0usize;
         let mut lost_edits = false;
@@ -1641,7 +1669,12 @@ impl BottomPane {
         for input in inputs {
             let text = input.as_ref();
             if !text.trim().is_empty() {
-                self.restored_drafts.push_back(text.to_owned());
+                let draft = if self.composer.is_history_search_active() {
+                    UnsentDraft::Parked(text.to_owned())
+                } else {
+                    UnsentDraft::Returned(text.to_owned())
+                };
+                self.restored_drafts.push_back(draft);
             }
         }
         self.restore_next_draft();
@@ -1654,13 +1687,21 @@ impl BottomPane {
                 && !parse_submission(text).is_command()
                 && crate::cli::turn::turn_entry::shell_input_body(text).is_none()
         };
-        if self.restored_drafts.is_empty() || self.composer.paste_burst_active() {
+        if self.restored_drafts.is_empty()
+            || self.composer.paste_burst_active()
+            || self.composer.is_history_search_active()
+        {
             return false;
         }
         let mut raw = self.composer.text();
+        let had_visible_draft = !raw.is_empty();
         let mut changed = false;
-        let compatible = if raw.is_empty() {
-            raw = self.restored_drafts.pop_front().expect("nonempty drafts");
+        let compatible = if !had_visible_draft {
+            raw = self
+                .restored_drafts
+                .pop_front()
+                .expect("nonempty drafts")
+                .into_text();
             changed = true;
             conversation(&raw)
         } else {
@@ -1670,14 +1711,13 @@ impl BottomPane {
             // Keep the first fragment's composer encoding and paste placeholders.
             // Only later fragments lose their leading literal escape; they no
             // longer occupy a command boundary in the combined conversation.
-            while self
-                .restored_drafts
-                .front()
-                .is_some_and(|text| conversation(text))
-            {
+            while self.restored_drafts.front().is_some_and(|draft| {
+                (!had_visible_draft || matches!(draft, UnsentDraft::Returned(_)))
+                    && conversation(draft.text())
+            }) {
                 let next = self.restored_drafts.pop_front().expect("checked front");
                 raw.push_str("\n\n");
-                raw.push_str(parse_submission(&next).text());
+                raw.push_str(parse_submission(next.text()).text());
                 changed = true;
             }
         }
@@ -2996,6 +3036,15 @@ impl BottomPane {
         key: KeyEvent,
         now: std::time::Instant,
     ) -> BottomPaneAction {
+        self.handle_session_key_at(key, now, &[])
+    }
+
+    pub(crate) fn handle_session_key_at(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> BottomPaneAction {
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
@@ -3040,14 +3089,19 @@ impl BottomPane {
         {
             self.sync_popups();
         }
-        let action = self.handle_key_inner(key, now);
+        let action = self.handle_key_inner(key, now, history);
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
         action
     }
 
-    fn handle_key_inner(&mut self, key: KeyEvent, now: std::time::Instant) -> BottomPaneAction {
+    fn handle_key_inner(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> BottomPaneAction {
         if let Some(a) = self.handle_ctrl_keys(key, now) {
             return a;
         }
@@ -3069,7 +3123,14 @@ impl BottomPane {
         if let Some(a) = self.handle_active_view_key(key, now) {
             return a;
         }
-        // Ctrl+R falls through to the composer for inline readline search.
+        if key.code == KeyCode::Char('r')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.composer.is_history_search_active()
+        {
+            self.composer.start_history_search(now, history);
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
+        }
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT {
             return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
                 after_cell_id: None,
@@ -3518,6 +3579,10 @@ impl BottomPane {
     fn route_to_composer(&mut self, key: KeyEvent, now: std::time::Instant) -> BottomPaneAction {
         let composer_action = self.composer.handle_key_at(key, now);
         let action = match composer_action {
+            ComposerAction::Recall(text) => {
+                self.start_composer_draft(&text);
+                return BottomPaneAction::Consumed;
+            }
             ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
                 self.slash_menu = None;
@@ -3577,7 +3642,7 @@ impl BottomPane {
     /// A command/view starts another draft without discarding ongoing editing.
     pub(crate) fn start_composer_draft(&mut self, text: &str) {
         for draft in self.composer.take_recoverable_drafts().into_iter().rev() {
-            self.restored_drafts.push_front(draft);
+            self.restored_drafts.push_front(UnsentDraft::Parked(draft));
         }
         self.replace_composer_text(text);
     }
@@ -3691,6 +3756,7 @@ impl BottomPane {
         }
         if let Some(next) = self.restored_drafts.front() {
             let preview: String = next
+                .text()
                 .chars()
                 .take(60)
                 .map(|ch| if ch.is_control() { ' ' } else { ch })
