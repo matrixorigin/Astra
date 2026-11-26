@@ -31,7 +31,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, StreamExt};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::schedule_journal_ingestion;
@@ -69,12 +69,11 @@ static SYNC_OUTBOX_RETRY_WAKE: Mutex<Option<SyncOutboxRetryWake>> = Mutex::new(N
 static SYNC_OUTBOX_CLOUD_ACCESS: LazyLock<
     watch::Sender<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>>,
 > = LazyLock::new(|| watch::channel(None).0);
-// Only current outbox health is published to the TUI. Retained failures are
-// read on demand by doctor.
+// The active owner has a bounded, process-local notice snapshot. Counters
+// survive a blocked TUI without queuing every health transition or rereading
+// historical records. Recovery re-arms at the producer, before coalescing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SyncOutboxHealth {
-    Readable { retry_clear: bool },
-    Settled { retry_clear: bool },
+pub(crate) enum SyncOutboxNotice {
     Retrying(u32),
     NewlyTerminal(u32),
     LoginSyncPending,
@@ -82,75 +81,204 @@ pub(crate) enum SyncOutboxHealth {
     Blocked(SyncOutboxDrainBlocker),
 }
 
-pub(crate) type OwnedSyncOutboxHealth = (astra_services::OwnerScope, SyncOutboxHealth);
-
-static SYNC_OUTBOX_HEALTH: LazyLock<broadcast::Sender<OwnedSyncOutboxHealth>> =
-    LazyLock::new(|| broadcast::channel(16).0);
-
-pub(crate) fn subscribe_sync_outbox_health() -> broadcast::Receiver<OwnedSyncOutboxHealth> {
-    SYNC_OUTBOX_HEALTH.subscribe()
+impl SyncOutboxNotice {
+    pub(crate) fn user_notice(self) -> Option<String> {
+        let mut report = SyncOutboxDrainReport::default();
+        match self {
+            Self::Retrying(count) => report.failed = count,
+            Self::NewlyTerminal(count) => report.terminal = count,
+            Self::LoginSyncPending => {
+                report.blocker = Some(SyncOutboxDrainBlocker::LocalSyncPending)
+            }
+            Self::JournalProjectionFailed => {
+                report.blocker = Some(SyncOutboxDrainBlocker::LocalJournalSync);
+            }
+            Self::Blocked(blocker) => report.blocker = Some(blocker),
+        }
+        report.user_notice()
+    }
 }
 
-// Permanent failures use a separate coalescing signal. A slow TUI can miss
-// transient health transitions without losing newly retained records.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct SyncNoticeState {
+    terminal: u64,
+    login_pending: u64,
+    projection_failures: u64,
+    retry_notices: u64,
+    last_retry_count: u32,
+    retrying: bool,
+    blocker_notices: u64,
+    last_blocker: Option<SyncOutboxDrainBlocker>,
+    blocker: Option<SyncOutboxDrainBlocker>,
+}
+
+impl SyncNoticeState {
+    fn blocked(&mut self, blocker: SyncOutboxDrainBlocker) {
+        if self.blocker.replace(blocker) != Some(blocker) {
+            self.blocker_notices += 1;
+            self.last_blocker = Some(blocker);
+        }
+    }
+
+    fn settled(&mut self, report: &SyncOutboxDrainReport) {
+        if report.failed > 0
+            && !self.retrying
+            && !matches!(
+                report.blocker,
+                Some(
+                    SyncOutboxDrainBlocker::CloudAccessRequired
+                        | SyncOutboxDrainBlocker::LocalSettlementWrite
+                )
+            )
+        {
+            self.retrying = true;
+            self.retry_notices += 1;
+            self.last_retry_count = report.failed;
+        }
+        match report.blocker {
+            Some(SyncOutboxDrainBlocker::CloudAccessRequired) => {}
+            Some(blocker) => self.blocked(blocker),
+            None => {
+                if report.retry_clear {
+                    self.retrying = false;
+                }
+                if report.acked > 0
+                    || report.failed > 0
+                    || report.terminal > 0
+                    || matches!(
+                        self.blocker,
+                        Some(
+                            SyncOutboxDrainBlocker::LocalOutboxRead
+                                | SyncOutboxDrainBlocker::LocalStatusRead
+                        )
+                    )
+                {
+                    self.blocker = None;
+                }
+            }
+        }
+    }
+
+    fn notices_since(&self, seen: &Self) -> Vec<SyncOutboxNotice> {
+        let mut notices = Vec::new();
+        if self.blocker_notices != seen.blocker_notices
+            && let Some(blocker) = self.last_blocker
+        {
+            notices.push(SyncOutboxNotice::Blocked(blocker));
+        }
+        if self.retry_notices != seen.retry_notices {
+            notices.push(SyncOutboxNotice::Retrying(self.last_retry_count));
+        }
+        let new_terminal = self.terminal.saturating_sub(seen.terminal);
+        if new_terminal > 0 {
+            notices.push(SyncOutboxNotice::NewlyTerminal(
+                u32::try_from(new_terminal).unwrap_or(u32::MAX),
+            ));
+        }
+        if self.login_pending != seen.login_pending {
+            notices.push(SyncOutboxNotice::LoginSyncPending);
+        }
+        if self.projection_failures != seen.projection_failures {
+            notices.push(SyncOutboxNotice::JournalProjectionFailed);
+        }
+        notices
+    }
+}
+
 #[derive(Clone)]
-struct TerminalSyncNotice {
+struct SyncNoticeSnapshot {
     owner: astra_services::OwnerScope,
     generation: u64,
-    total: u64,
+    state: SyncNoticeState,
 }
 
-static SYNC_TERMINAL_NOTICES: LazyLock<watch::Sender<Option<TerminalSyncNotice>>> =
-    LazyLock::new(|| watch::channel(None).0);
+struct SyncNoticeChannel(watch::Sender<Option<SyncNoticeSnapshot>>);
+
+static SYNC_OUTBOX_NOTICES: LazyLock<SyncNoticeChannel> = LazyLock::new(SyncNoticeChannel::new);
+
+impl SyncNoticeChannel {
+    fn new() -> Self {
+        Self(watch::channel(None).0)
+    }
+
+    fn update(
+        &self,
+        owner: &astra_services::OwnerScope,
+        update: impl FnOnce(&mut SyncNoticeState),
+    ) {
+        self.0.send_if_modified(|current| {
+            if *owner != astra_services::local_owner_scope() {
+                return false;
+            }
+            if current.as_ref().is_none_or(|notice| notice.owner != *owner) {
+                let generation = current
+                    .as_ref()
+                    .map_or(0, |notice| notice.generation.wrapping_add(1));
+                *current = Some(SyncNoticeSnapshot {
+                    owner: owner.clone(),
+                    generation,
+                    state: SyncNoticeState::default(),
+                });
+            }
+            let state = &mut current.as_mut().expect("notice state initialized").state;
+            let before = state.clone();
+            update(state);
+            *state != before
+        });
+    }
+
+    fn subscribe(&self) -> SyncOutboxNotices {
+        let mut receiver = self.0.subscribe();
+        self.0.send_if_modified(|current| {
+            // A replacement observer starts without the previous observer's
+            // deduplication state and at the current counts.
+            let Some(snapshot) = current.as_mut().filter(|_| self.0.receiver_count() == 1) else {
+                return false;
+            };
+            let state = &mut snapshot.state;
+            let had_active_warning = state.retrying || state.blocker.is_some();
+            state.retrying = false;
+            state.blocker = None;
+            had_active_warning
+        });
+        let seen = receiver.borrow_and_update().clone();
+        SyncOutboxNotices { receiver, seen }
+    }
+}
 
 pub(crate) fn report_new_sync_terminal(owner: &astra_services::OwnerScope, count: u32) {
-    SYNC_TERMINAL_NOTICES.send_if_modified(|current| {
-        if count == 0 || *owner != astra_services::local_owner_scope() {
-            return false;
+    if count > 0 {
+        SYNC_OUTBOX_NOTICES.update(owner, |state| {
+            state.terminal = state.terminal.saturating_add(u64::from(count));
+        });
+    }
+}
+
+pub(crate) struct SyncOutboxNotices {
+    receiver: watch::Receiver<Option<SyncNoticeSnapshot>>,
+    seen: Option<SyncNoticeSnapshot>,
+}
+
+pub(crate) fn subscribe_sync_outbox_notices() -> SyncOutboxNotices {
+    SYNC_OUTBOX_NOTICES.subscribe()
+}
+
+impl SyncOutboxNotices {
+    pub(crate) async fn recv(
+        &mut self,
+    ) -> Option<(astra_services::OwnerScope, Vec<SyncOutboxNotice>)> {
+        loop {
+            self.receiver.changed().await.ok()?;
+            let notice = self.receiver.borrow_and_update().clone()?;
+            let previous = self.seen.replace(notice.clone());
+            let seen = previous
+                .filter(|previous| previous.generation == notice.generation)
+                .map_or_else(SyncNoticeState::default, |previous| previous.state);
+            let fresh = notice.state.notices_since(&seen);
+            if !fresh.is_empty() {
+                return Some((notice.owner, fresh));
+            }
         }
-        if let Some(notice) = current.as_mut()
-            && notice.owner == *owner
-        {
-            notice.total = notice.total.saturating_add(u64::from(count));
-        } else {
-            let generation = current
-                .as_ref()
-                .map_or(0, |notice| notice.generation.wrapping_add(1));
-            *current = Some(TerminalSyncNotice {
-                owner: owner.clone(),
-                generation,
-                total: u64::from(count),
-            });
-        }
-        true
-    });
-}
-
-pub(crate) struct TerminalSyncNotices {
-    receiver: watch::Receiver<Option<TerminalSyncNotice>>,
-    seen: Option<TerminalSyncNotice>,
-}
-
-pub(crate) fn subscribe_sync_terminal_notices() -> TerminalSyncNotices {
-    let mut receiver = SYNC_TERMINAL_NOTICES.subscribe();
-    let seen = receiver.borrow_and_update().clone();
-    TerminalSyncNotices { receiver, seen }
-}
-
-impl TerminalSyncNotices {
-    pub(crate) async fn recv(&mut self) -> Option<OwnedSyncOutboxHealth> {
-        self.receiver.changed().await.ok()?;
-        let notice = self.receiver.borrow_and_update().clone()?;
-        let previous = self.seen.replace(notice.clone());
-        let fresh = previous
-            .filter(|previous| previous.generation == notice.generation)
-            .map_or(notice.total, |previous| {
-                notice.total.saturating_sub(previous.total)
-            });
-        Some((
-            notice.owner,
-            SyncOutboxHealth::NewlyTerminal(u32::try_from(fresh).unwrap_or(u32::MAX)),
-        ))
     }
 }
 
@@ -161,10 +289,9 @@ pub(crate) async fn check_startup_outbox_health(owner: &astra_services::OwnerSco
     };
     if let Err(error) = status {
         tracing::warn!(?error, "could not read local outbox at startup");
-        let _ = SYNC_OUTBOX_HEALTH.send((
-            owner.clone(),
-            SyncOutboxHealth::Blocked(SyncOutboxDrainBlocker::LocalOutboxRead),
-        ));
+        SYNC_OUTBOX_NOTICES.update(owner, |state| {
+            state.blocked(SyncOutboxDrainBlocker::LocalOutboxRead);
+        });
     }
 }
 
@@ -274,7 +401,7 @@ fn notify_login_projection_failure(owner: &astra_services::OwnerScope, session_i
     {
         return;
     }
-    let _ = SYNC_OUTBOX_HEALTH.send((owner.clone(), SyncOutboxHealth::JournalProjectionFailed));
+    SYNC_OUTBOX_NOTICES.update(owner, |state| state.projection_failures += 1);
 }
 
 fn defer_journal_ingest_hint(session_id: String) -> JournalIngestScheduleOutcome {
@@ -1311,40 +1438,16 @@ async fn try_drain_sync_outbox_for_snapshot(
     auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> SyncOutboxDrainReport {
     let report = drain_sync_outbox_for_snapshot(limit, auth_snapshot).await;
-    let publish = |health| {
-        let _ = SYNC_OUTBOX_HEALTH.send((auth_snapshot.owner_scope.clone(), health));
-    };
     // Permanent transitions belong to the outbox owner even if the same
     // account refreshed its login during settlement. The TUI checks that owner.
-    if report.terminal > 0 {
-        report_new_sync_terminal(&auth_snapshot.owner_scope, report.terminal);
-    }
-    if report.cloud_configured && auth_snapshot.is_current() {
-        // Rejected access has its own sign-in observer. A failed local write
-        // does not establish a retryable settlement on disk.
-        if report.failed > 0
-            && !matches!(
-                report.blocker,
-                Some(
-                    SyncOutboxDrainBlocker::CloudAccessRequired
-                        | SyncOutboxDrainBlocker::LocalSettlementWrite
-                )
-            )
-        {
-            publish(SyncOutboxHealth::Retrying(report.failed));
-        }
-        match report.blocker {
-            Some(SyncOutboxDrainBlocker::CloudAccessRequired) => {}
-            Some(blocker) => publish(SyncOutboxHealth::Blocked(blocker)),
-            None if report.acked > 0 || report.failed > 0 || report.terminal > 0 => {
-                publish(SyncOutboxHealth::Settled {
-                    retry_clear: report.retry_clear,
-                });
+    let current_login = report.cloud_configured && auth_snapshot.is_current();
+    if current_login || report.terminal > 0 {
+        SYNC_OUTBOX_NOTICES.update(&auth_snapshot.owner_scope, |state| {
+            state.terminal = state.terminal.saturating_add(u64::from(report.terminal));
+            if current_login {
+                state.settled(&report);
             }
-            None => publish(SyncOutboxHealth::Readable {
-                retry_clear: report.retry_clear,
-            }),
-        }
+        });
     }
     report
 }
@@ -2615,7 +2718,7 @@ async fn wait_for_post_auth_sync(
         && binding_matches
         && snapshot.is_current()
     {
-        let _ = SYNC_OUTBOX_HEALTH.send((snapshot.owner_scope, SyncOutboxHealth::LoginSyncPending));
+        SYNC_OUTBOX_NOTICES.update(&snapshot.owner_scope, |state| state.login_pending += 1);
     }
     report
 }
@@ -4799,6 +4902,144 @@ mod tests {
             next_sync_outbox_drain_delay(&status),
             Some(Duration::ZERO),
             "a healthy service must drain an existing backlog without a fixed cooldown"
+        );
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn unread_notices_survive_recovery_and_later_failure() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "notice-lag",
+            Some("notice-lag-owner"),
+        )
+        .unwrap();
+        let owner = astra_services::local_owner_scope();
+        let channel = SyncNoticeChannel::new();
+        channel.update(&owner, |state| state.terminal += 99);
+        let mut notices = channel.subscribe();
+        let settle = |report| channel.update(&owner, |state| state.settled(&report));
+        settle(SyncOutboxDrainReport {
+            failed: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), notices.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            [SyncOutboxNotice::Retrying(1)]
+        );
+
+        // A partial success leaves the old incident active.
+        settle(SyncOutboxDrainReport {
+            acked: 1,
+            ..Default::default()
+        });
+        settle(SyncOutboxDrainReport {
+            failed: 3,
+            ..Default::default()
+        });
+        let duplicate = tokio::time::timeout(Duration::from_millis(50), notices.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "partial settlement emitted {duplicate:?}"
+        );
+        channel.update(&owner, |state| state.login_pending += 1);
+        channel.update(&owner, |state| state.projection_failures += 1);
+        // The authoritative recovery and a distinct next failure both occur
+        // while the observer cannot consume anything.
+        settle(SyncOutboxDrainReport {
+            acked: 1,
+            retry_clear: true,
+            ..Default::default()
+        });
+        for _ in 0..20 {
+            settle(SyncOutboxDrainReport {
+                retry_clear: true,
+                ..Default::default()
+            });
+        }
+        settle(SyncOutboxDrainReport {
+            failed: 2,
+            ..Default::default()
+        });
+        channel.update(&owner, |state| state.terminal += 1);
+        channel.update(&owner, |state| state.terminal += 2);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), notices.recv())
+                .await
+                .unwrap(),
+            Some((
+                owner,
+                vec![
+                    SyncOutboxNotice::Retrying(2),
+                    SyncOutboxNotice::NewlyTerminal(3),
+                    SyncOutboxNotice::LoginSyncPending,
+                    SyncOutboxNotice::JournalProjectionFailed,
+                ]
+            ))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notices.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn only_owning_drain_recovery_rearms_local_warning() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "notice-local",
+            Some("notice-local-owner"),
+        )
+        .unwrap();
+        let owner = astra_services::local_owner_scope();
+        let channel = SyncNoticeChannel::new();
+        let mut notices = channel.subscribe();
+        let blocker = SyncOutboxDrainBlocker::LocalSettlementWrite;
+        let blocked = || channel.update(&owner, |state| state.blocked(blocker));
+        let expect = || Some((owner.clone(), vec![SyncOutboxNotice::Blocked(blocker)]));
+        blocked();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), notices.recv())
+                .await
+                .unwrap(),
+            expect()
+        );
+        let other = astra_services::OwnerScope::user("other-notice-owner").unwrap();
+        let settled = SyncOutboxDrainReport {
+            acked: 1,
+            retry_clear: true,
+            ..Default::default()
+        };
+        channel.update(&other, |state| state.settled(&settled));
+        channel.update(&owner, |state| {
+            state.settled(&SyncOutboxDrainReport::default())
+        });
+        blocked();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notices.recv())
+                .await
+                .is_err()
+        );
+
+        channel.update(&owner, |state| state.settled(&settled));
+        blocked();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), notices.recv())
+                .await
+                .unwrap(),
+            expect()
         );
     }
 }

@@ -492,9 +492,9 @@ async fn historical_rejections_are_quiet_at_startup_and_across_drains() {
         .unwrap();
 
     let owner = astra_services::local_owner_scope();
-    let mut health_events = cloud_sync::subscribe_sync_outbox_health();
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
     cloud_sync::check_startup_outbox_health(&owner).await;
-    assert!(health_events.try_recv().is_err());
+    assert_quiet(&mut warnings).await;
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
         .respond_with(|request: &wiremock::Request| {
@@ -526,14 +526,8 @@ async fn historical_rejections_are_quiet_at_startup_and_across_drains() {
         assert_eq!(report.acked, 1);
         assert_eq!(report.terminal, 0);
         assert_eq!(report.user_notice(), None);
-        assert_eq!(
-            health_events.try_recv().unwrap(),
-            (
-                owner.clone(),
-                cloud_sync::SyncOutboxHealth::Settled { retry_clear: true }
-            )
-        );
     }
+    assert_quiet(&mut warnings).await;
     let status = cloud_sync::read_sync_outbox_diagnostics()
         .await
         .unwrap()
@@ -864,7 +858,7 @@ async fn temporary_local_outbox_failure_warns_and_retries_automatically() {
         .open(store.path().parent().unwrap().join("outbox.lock"))
         .unwrap();
     lock.lock_exclusive().unwrap();
-    let mut notices = cloud_sync::subscribe_sync_outbox_health();
+    let mut notices = cloud_sync::subscribe_sync_outbox_notices();
     cloud_sync::schedule_sync_outbox_drain();
     let health = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv())
         .await
@@ -875,9 +869,9 @@ async fn temporary_local_outbox_failure_warns_and_retries_automatically() {
         health,
         (
             owner.clone(),
-            cloud_sync::SyncOutboxHealth::Blocked(
+            vec![cloud_sync::SyncOutboxNotice::Blocked(
                 cloud_sync::SyncOutboxDrainBlocker::LocalOutboxRead
-            )
+            )]
         )
     );
     lock.unlock().unwrap();
@@ -895,17 +889,6 @@ async fn temporary_local_outbox_failure_warns_and_retries_automatically() {
     })
     .await
     .expect("pending record should sync after the local lock is released");
-    let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv())
-        .await
-        .expect("retry should report recovery")
-        .unwrap();
-    assert_eq!(
-        recovered,
-        (
-            owner,
-            cloud_sync::SyncOutboxHealth::Settled { retry_clear: true }
-        )
-    );
     server.verify().await;
 }
 

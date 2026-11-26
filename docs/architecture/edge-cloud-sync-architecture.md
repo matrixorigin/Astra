@@ -127,8 +127,9 @@ record-level rejections are quarantined; request-level failures leave records
 pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
 oversized singleton pending for the deployment to be corrected. The active TUI
 reports newly persisted permanent rejections and skipped journal records to
-their owner. It coalesces unread counts independently of transient outbox
-health updates, so a busy TUI can still report all newly retained failures.
+their owner. Its bounded in-process notice snapshot coalesces unread warnings
+without dropping them when the TUI is busy. Retryable delivery and local I/O
+warnings re-arm from the existing drain outcome before the TUI consumes it.
 A new observer starts at the current count. Subsequent startup checks and
 drains leave those historical records in `astra doctor`. Retryable delivery
 failures warn once while pending, including after login. A successful delivery
