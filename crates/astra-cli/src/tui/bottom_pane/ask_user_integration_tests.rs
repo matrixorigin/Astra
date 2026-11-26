@@ -93,6 +93,29 @@ fn ask_user_closed_request_does_not_keep_a_modal_open() {
 }
 
 #[test]
+fn closed_questionnaire_does_not_swallow_an_active_turn_interrupt() {
+    use crate::tui::task_status::TaskStatus;
+    use std::time::Instant;
+
+    let mut bp = BottomPane::new();
+    bp.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    drop(enqueue(&mut bp, single_question(true)));
+    assert!(bp.has_active_view());
+    assert!(matches!(
+        bp.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Interrupt
+    ));
+    assert!(!bp.has_active_view());
+
+    drop(enqueue(&mut bp, single_question(true)));
+    bp.handle_paste("keep this draft");
+    assert_eq!(bp.composer.text(), "keep this draft");
+    assert!(!bp.has_active_view());
+}
+
+#[test]
 fn native_questionnaire_preserves_ids_with_identical_labels() {
     let mut bp = BottomPane::new();
     let prompt = astra_tools::ask_user::parse_ask_user_prompt(&serde_json::json!({

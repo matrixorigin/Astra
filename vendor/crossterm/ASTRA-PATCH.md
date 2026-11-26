@@ -161,3 +161,12 @@ an empty value, disables styling. The existing `force_color_output` override
 retains precedence. This covers Astra tool descriptions, status icons, durations,
 summaries and spinner frames without separate renderer state. Cursor commands
 and control bytes already present in content remain unchanged.
+
+## Queued input timestamps
+
+`EventStream::poll_next_timed` carries the native input batch timestamp through
+the existing reader and parser queues. Unix snapshots pending tty bytes and
+Windows uses the console's pending record count. Input already queued before
+dispatch keeps its timestamp across reads, so slow rendering cannot turn a
+paste's trailing Tab or Enter into an editor action. The regular event stream
+uses the same reader and continues to return the unchanged event type.

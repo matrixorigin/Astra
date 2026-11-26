@@ -6,13 +6,15 @@ use crate::event::source::unix::UnixInternalEventSource;
 use crate::event::source::windows::WindowsEventSource;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
-use crate::event::{filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent};
+use crate::event::{
+    filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent, TimedEvent,
+};
 
 /// Can be used to read `InternalEvent`s.
 pub(crate) struct InternalEventReader {
-    events: VecDeque<InternalEvent>,
+    events: VecDeque<TimedEvent>,
     source: Option<Box<dyn EventSource>>,
-    skipped_events: Vec<InternalEvent>,
+    skipped_events: Vec<TimedEvent>,
     #[cfg(unix)]
     pub(super) cursor_query_pending: bool,
 }
@@ -55,7 +57,7 @@ impl InternalEventReader {
         F: Filter,
     {
         for event in &self.events {
-            if filter.eval(event) {
+            if filter.eval(&event.event) {
                 return Ok(true);
             }
         }
@@ -79,10 +81,10 @@ impl InternalEventReader {
                 Ok(None) => None,
                 Ok(Some(event)) => {
                     #[cfg(unix)]
-                    if let InternalEvent::PrimaryDeviceAttributes(params) = &event {
+                    if let InternalEvent::PrimaryDeviceAttributes(params) = &event.event {
                         super::startup_query::record_device_attributes(params);
                     }
-                    if filter.eval(&event) {
+                    if filter.eval(&event.event) {
                         Some(event)
                     } else {
                         self.skipped_events.push(event);
@@ -118,8 +120,23 @@ impl InternalEventReader {
     where
         F: Filter,
     {
+        let TimedEvent {
+            event,
+            received_at: _received_at,
+        } = self.read_timed(filter)?;
+        Ok(event)
+    }
+
+    pub(crate) fn read_timed<F>(&mut self, filter: &F) -> io::Result<TimedEvent>
+    where
+        F: Filter,
+    {
         loop {
-            if let Some(index) = self.events.iter().position(|event| filter.eval(event)) {
+            if let Some(index) = self
+                .events
+                .iter()
+                .position(|event| filter.eval(&event.event))
+            {
                 return Ok(self.events.remove(index).expect("matching event exists"));
             }
             self.poll(None, filter)?;
@@ -134,7 +151,9 @@ mod tests {
 
     #[cfg(unix)]
     use super::super::filter::CursorPositionFilter;
-    use super::{super::Event, EventSource, Filter, InternalEvent, InternalEventReader};
+    use super::{
+        super::Event, EventSource, Filter, InternalEvent, InternalEventReader, TimedEvent,
+    };
 
     #[derive(Debug, Clone)]
     pub(crate) struct InternalEventFilter;
@@ -167,7 +186,7 @@ mod tests {
     #[test]
     fn test_poll_returns_true_for_matching_event_in_queue_at_front() {
         let mut reader = InternalEventReader {
-            events: vec![InternalEvent::Event(Event::Resize(10, 10))].into(),
+            events: [InternalEvent::Event(Event::Resize(10, 10)).into()].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
             #[cfg(unix)]
@@ -181,9 +200,9 @@ mod tests {
     #[cfg(unix)]
     fn test_poll_returns_true_for_matching_event_in_queue_at_back() {
         let mut reader = InternalEventReader {
-            events: vec![
-                InternalEvent::Event(Event::Resize(10, 10)),
-                InternalEvent::CursorPosition(10, 20),
+            events: [
+                InternalEvent::Event(Event::Resize(10, 10)).into(),
+                InternalEvent::CursorPosition(10, 20).into(),
             ]
             .into(),
             source: None,
@@ -200,7 +219,7 @@ mod tests {
         const EVENT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
 
         let mut reader = InternalEventReader {
-            events: vec![EVENT].into(),
+            events: [EVENT.into()].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
             #[cfg(unix)]
@@ -216,7 +235,11 @@ mod tests {
         const CURSOR_EVENT: InternalEvent = InternalEvent::CursorPosition(10, 20);
 
         let mut reader = InternalEventReader {
-            events: vec![InternalEvent::Event(Event::Resize(10, 10)), CURSOR_EVENT].into(),
+            events: [
+                InternalEvent::Event(Event::Resize(10, 10)).into(),
+                CURSOR_EVENT.into(),
+            ]
+            .into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
             #[cfg(unix)]
@@ -233,7 +256,7 @@ mod tests {
         const CURSOR_EVENT: InternalEvent = InternalEvent::CursorPosition(10, 20);
 
         let mut reader = InternalEventReader {
-            events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
+            events: [SKIPPED_EVENT.into(), CURSOR_EVENT.into()].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
             #[cfg(unix)]
@@ -249,11 +272,15 @@ mod tests {
     fn filtered_read_preserves_order_on_both_sides_of_a_response() {
         let first = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('a').into()));
         let second = InternalEvent::Event(Event::Paste("你好".into()));
+        let received_at = std::time::Instant::now();
         let mut reader = InternalEventReader {
-            events: vec![
-                first.clone(),
-                InternalEvent::CursorPosition(1, 2),
-                second.clone(),
+            events: [
+                TimedEvent {
+                    event: first.clone(),
+                    received_at,
+                },
+                InternalEvent::CursorPosition(1, 2).into(),
+                second.clone().into(),
             ]
             .into(),
             source: None,
@@ -262,7 +289,9 @@ mod tests {
             cursor_query_pending: false,
         };
         reader.read(&CursorPositionFilter).unwrap();
-        assert_eq!(reader.read(&InternalEventFilter).unwrap(), first);
+        let first_event = reader.read_timed(&InternalEventFilter).unwrap();
+        assert_eq!(first_event.event, first);
+        assert_eq!(first_event.received_at, received_at);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), second);
     }
 
@@ -509,7 +538,7 @@ mod tests {
     }
 
     impl EventSource for FakeSource {
-        fn try_read(&mut self, _timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        fn try_read(&mut self, _timeout: Option<Duration>) -> io::Result<Option<TimedEvent>> {
             // Return error if set in case there's just one remaining event
             if self.events.len() == 1 {
                 if let Some(error) = self.error.take() {
@@ -519,7 +548,7 @@ mod tests {
 
             // Return all events from the queue
             if let Some(event) = self.events.pop_front() {
-                return Ok(Some(event));
+                return Ok(Some(event.into()));
             }
 
             // Return error if there're no more events

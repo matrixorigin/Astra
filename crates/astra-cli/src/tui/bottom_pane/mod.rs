@@ -806,11 +806,12 @@ impl BottomPane {
         text: &str,
         history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
     ) {
+        let now = std::time::Instant::now();
+        self.dismiss_closed_views_at(now);
         if self.has_active_view() {
             // The explicit paste belongs to the focused view; a parked
             // composer's old unbracketed tail must not capture later keys.
-            self.composer
-                .release_paste_focus_at(std::time::Instant::now());
+            self.composer.release_paste_focus_at(now);
         }
         if self
             .active_view_mut()
@@ -3068,6 +3069,7 @@ impl BottomPane {
         now: std::time::Instant,
         history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
     ) -> BottomPaneAction {
+        self.dismiss_closed_views_at(now);
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
@@ -3657,6 +3659,18 @@ impl BottomPane {
         }
     }
 
+    fn dismiss_closed_views_at(&mut self, now: std::time::Instant) -> bool {
+        let mut changed = false;
+        while self
+            .active_view()
+            .is_some_and(|view| view.is_complete() && view.completion().is_none())
+        {
+            self.pop_active_view_at(now);
+            changed = true;
+        }
+        changed
+    }
+
     #[cfg(test)]
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
         self.pre_draw_session_tick(now, &[])
@@ -3673,13 +3687,7 @@ impl BottomPane {
             changed |= view.is_in_paste_burst();
             view.pre_draw_tick(now);
         }
-        let dismiss_completed_view = self
-            .active_view()
-            .is_some_and(|view| view.is_complete() && view.completion().is_none());
-        if dismiss_completed_view {
-            self.pop_active_view_at(now);
-            changed = true;
-        }
+        changed |= self.dismiss_closed_views_at(now);
         // Flush paste burst buffer when idle timeout expires.
         if self.composer.flush_paste_burst_at(now) {
             self.sync_popups();

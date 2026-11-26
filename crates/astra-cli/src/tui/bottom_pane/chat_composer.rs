@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use nucleo_matcher::{Matcher, Utf32Str};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -24,6 +25,7 @@ use crate::tui::file_writer::TuiFileWriter;
 const HISTORY_MAX_ENTRIES: usize = 500;
 const HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS: usize = 4096;
 const HISTORY_SUGGESTION_SCAN_BYTES: usize = 256 * 1024;
+const HISTORY_SUGGESTION_QUERY_BYTES: usize = 128;
 const HISTORY_SUGGESTION_ROWS: u16 = 4;
 
 /// Duration the `·` prefix glows after the user submits a message.
@@ -33,7 +35,7 @@ const SUBMIT_FLASH_DURATION: Duration = Duration::from_millis(180);
 
 #[derive(Debug)]
 struct HistorySearch {
-    // Prefix suggestions use the main editor as their query.
+    // Inline suggestions use the main editor as their query.
     query: Option<TextArea>,
     entries: Vec<HistoryEntry>,
     match_index: Option<usize>,
@@ -597,27 +599,35 @@ impl ChatComposer {
     fn history_entries(
         &self,
         history: &[Arc<dyn HistoryCell>],
-        prefix: Option<&str>,
+        query: Option<&str>,
     ) -> Vec<HistoryEntry> {
         const MAX_SUGGESTIONS: usize = 8;
-        let limit = if prefix.is_some() {
-            MAX_SUGGESTIONS
-        } else {
-            usize::MAX
-        };
-        let mut remaining_bytes = HISTORY_SUGGESTION_SCAN_BYTES;
-        let mut matches = |text: &str| {
-            let Some(prefix) = prefix else {
-                return true;
+        let mut fuzzy = query.map(|query| {
+            (
+                crate::tui::slash_menu::menu::fuzzy_atom(query),
+                Matcher::default(),
+                Vec::new(),
+            )
+        });
+        // Budget both the bytes inspected and the work of fuzzy scoring a long query.
+        let mut remaining_bytes =
+            HISTORY_SUGGESTION_SCAN_BYTES / query.map_or(1, |query| query.len().div_ceil(8).max(1));
+        let mut score = |text: &str| {
+            let Some((query, (atom, matcher, buffer))) = query.zip(fuzzy.as_mut()) else {
+                return Some((false, false, 0));
             };
-            if text.len() < prefix.len() || text.len() > remaining_bytes {
-                return false;
+            if text.len() > remaining_bytes {
+                return None;
             }
-            let matched = text.starts_with(prefix);
-            // Matching entries go through exact deduplication, even when all
-            // of them represent the same historical message.
-            remaining_bytes -= if matched { text.len() } else { prefix.len() };
-            matched
+            remaining_bytes -= text.len();
+            if text.trim_start().starts_with(['/', '!', '$']) {
+                return None;
+            }
+            let rank = atom.score(Utf32Str::new(text, buffer), matcher)?;
+            let prefix = text
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query));
+            Some((prefix && text.len() == query.len(), prefix, rank))
         };
         let mut entries = Vec::new();
         let mut seen_messages = std::collections::HashSet::new();
@@ -628,9 +638,9 @@ impl ChatComposer {
             .filter_map(|cell| Some((cell, Self::session_message(cell.as_ref())?)))
             .take(HISTORY_MAX_ENTRIES);
         for (cell, text) in recent_messages {
-            if !matches(text) {
+            let Some(rank) = score(text) else {
                 continue;
-            }
+            };
             let trimmed = text.trim_start();
             // The composer has no literal spelling for shell passthrough or
             // a slash-prefixed message with significant leading whitespace.
@@ -638,10 +648,7 @@ impl ChatComposer {
                 && (!trimmed.starts_with('/') || trimmed == text)
                 && seen_messages.insert(text)
             {
-                entries.push(HistoryEntry::Session(Arc::clone(cell)));
-                if entries.len() == limit {
-                    return entries;
-                }
+                entries.push((rank, HistoryEntry::Session(Arc::clone(cell))));
             }
         }
         for (index, raw) in self
@@ -651,9 +658,9 @@ impl ChatComposer {
             .rev()
             .take(HISTORY_MAX_ENTRIES)
         {
-            if !matches(raw) {
+            let Some(rank) = score(raw) else {
                 continue;
-            }
+            };
             let duplicate = if raw.starts_with('/') {
                 raw.strip_prefix('/')
                     .is_some_and(|text| text.starts_with('/') && seen_messages.contains(text))
@@ -661,13 +668,15 @@ impl ChatComposer {
                 !seen_messages.insert(raw.as_str())
             };
             if !duplicate {
-                entries.push(HistoryEntry::Local(index));
-                if entries.len() == limit {
-                    break;
-                }
+                entries.push((rank, HistoryEntry::Local(index)));
             }
         }
-        entries
+        if query.is_some() {
+            // Stable sort preserves the source order among equally ranked matches.
+            entries.sort_by_key(|&(rank, _)| std::cmp::Reverse(rank));
+            entries.truncate(MAX_SUGGESTIONS);
+        }
+        entries.into_iter().map(|(_, entry)| entry).collect()
     }
 
     pub(super) fn start_history_search(&mut self, now: Instant, history: &[Arc<dyn HistoryCell>]) {
@@ -686,19 +695,19 @@ impl ChatComposer {
             return;
         }
         let input = self.textarea.text();
-        if input.len() >= HISTORY_SUGGESTION_SCAN_BYTES {
+        if input.len() > HISTORY_SUGGESTION_QUERY_BYTES {
             self.history_search = None;
             return;
         }
-        let prefix = input.trim_start();
+        let query = input.trim();
         self.history_search = if self.draft.is_none()
             && self.pasted_blobs.is_empty()
             && self.textarea.cursor_byte() == input.len()
-            && !prefix.is_empty()
-            && !prefix.starts_with(['/', '!', '$'])
+            && !query.is_empty()
+            && !query.starts_with(['/', '!', '$'])
             && !input.contains(['\n', '\r', '\t'])
         {
-            let entries = self.history_entries(history, Some(input));
+            let entries = self.history_entries(history, Some(query));
             (!entries.is_empty()).then_some(HistorySearch {
                 query: None,
                 entries,
@@ -1169,17 +1178,19 @@ impl ChatComposer {
         let Some((entries, selected)) = self.history_suggestions() else {
             return;
         };
-        let Some(suffix) = self
-            .history_entry_text(&entries[selected])
-            .and_then(|entry| entry.strip_prefix(self.textarea.text()))
-        else {
+        let Some(text) = self.history_entry_text(&entries[selected]) else {
             return;
         };
         if let Some((x, y)) = self.cursor_position(area) {
             let right = composer_content_area(area, self.frame_allowed).right();
             let width = usize::from(right.saturating_sub(x));
+            let preview = match text.strip_prefix(self.textarea.text()) {
+                Some(suffix) => history_preview(suffix, width),
+                None if width > 3 => format!(" → {}", history_preview(text, width - 3)),
+                None => return,
+            };
             let dim = Style::default().fg(crate::tui::theme::current().dim);
-            buf.set_stringn(x, y, history_preview(suffix, width), width, dim);
+            buf.set_stringn(x, y, preview, width, dim);
         }
     }
 

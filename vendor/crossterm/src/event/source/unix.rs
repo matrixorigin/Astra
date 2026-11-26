@@ -1,3 +1,7 @@
+use super::InputBatch;
+use crate::terminal::sys::file_descriptor::FileDesc;
+use std::io;
+
 mod parser;
 #[cfg(feature = "use-dev-tty")]
 pub(crate) mod tty;
@@ -28,5 +32,36 @@ fn read_ready(
         Ok(_) => fd.read(buffer),
         Err(filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error)) => Err(error),
         Err(error) => Err(std::io::Error::new(std::io::ErrorKind::Other, error)),
+    }
+}
+
+/// Read from the current terminal batch, leaving newer bytes for the next
+/// timestamp. Only metadata is retained: the existing parser owns the data.
+fn read_input(
+    fd: &FileDesc<'_>,
+    buffer: &mut [u8],
+    batch: &mut InputBatch,
+    parser: &mut parser::Parser,
+) -> io::Result<()> {
+    let limit = batch
+        .0
+        .map_or(buffer.len(), |(_, count)| count.min(buffer.len()));
+    match read_ready(fd, &mut buffer[..limit]) {
+        Ok(0) => Err(io::ErrorKind::UnexpectedEof.into()),
+        Ok(count) => {
+            let received_at = batch.consume(count, || fd.queued_input());
+            parser.advance_at(
+                &buffer[..count],
+                count == buffer.len() || batch.0.is_some(),
+                received_at,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            if error.kind() != io::ErrorKind::Interrupted {
+                *batch = InputBatch::default();
+            }
+            Err(error)
+        }
     }
 }

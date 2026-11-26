@@ -1891,10 +1891,9 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
     let history: Vec<Arc<dyn HistoryCell>> = vec![
-        Arc::new(UserCell::new("shi")),
         Arc::new(UserCell::new("ship staging build")),
         Arc::new(UserCell::new("ship canary build")),
-        Arc::new(UserCell::new("shrink fixture")),
+        Arc::new(UserCell::new("shred branches")),
     ];
     let start = Instant::now();
     let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
@@ -1913,7 +1912,7 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
     }
     let text = render(&pane);
     assert!(
-        text.contains("> shrink fixture") && text.contains("ship staging build"),
+        text.contains("> shred branches") && text.contains("ship staging build"),
         "{text}"
     );
     pane.handle_session_key_at(
@@ -1926,14 +1925,14 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         text.contains("> ship canary build") && text.contains("ship staging build"),
         "{text}"
     );
-    assert!(!text.contains("shrink fixture"), "{text}");
-    assert!(text.lines().any(|line| line == "  shi"), "{text}");
+    assert!(!text.contains("shred branches"), "{text}");
+    assert_eq!(pane.composer.text(), "shi");
     pane.handle_session_key_at(
         key(KeyCode::Backspace),
         start + Duration::from_millis(55),
         &history,
     );
-    assert!(render(&pane).contains("> shrink fixture"));
+    assert!(render(&pane).contains("> shred branches"));
     pane.handle_session_key_at(
         key(KeyCode::Char('i')),
         start + Duration::from_millis(65),
@@ -1987,7 +1986,50 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
 }
 
 #[test]
-fn pasted_history_prefix_scrolls_to_older_matches() {
+fn fuzzy_history_suggestions_rank_matches_without_recalling_commands() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use crate::tui::testing::render::buffer_to_string;
+    use std::sync::Arc;
+
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let history: Vec<Arc<dyn HistoryCell>> = [
+        "pc probe ready",
+        "deploy production canary",
+        "dispatch package cache",
+        "/pc route",
+        "!pc launch",
+    ]
+    .into_iter()
+    .map(|text| Arc::new(UserCell::new(text)) as Arc<dyn HistoryCell>)
+    .collect();
+
+    let area = Rect::new(0, 0, 80, 8);
+    let mut buffer = Buffer::empty(area);
+    pane.handle_session_paste("PC", &history);
+    pane.render(area, &mut buffer);
+    let text = buffer_to_string(&buffer);
+    assert!(text.contains("> pc probe ready"), "{text}");
+    assert!(text.contains("deploy production canary"), "{text}");
+    assert!(text.contains("dispatch package cache"), "{text}");
+    assert!(
+        !text.contains("/pc route") && !text.contains("!pc launch"),
+        "{text}"
+    );
+    assert_eq!(pane.composer.text(), "PC");
+
+    assert!(matches!(
+        pane.handle_session_key_at(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Instant::now(),
+            &history,
+        ),
+        BottomPaneAction::SubmitInput(text) if text == "PC"
+    ));
+}
+
+#[test]
+fn pasted_fuzzy_history_query_scrolls_to_older_matches() {
     use crate::tui::history_cell::{HistoryCell, user::UserCell};
     use crate::tui::testing::render::buffer_to_string;
     use std::{sync::Arc, time::Duration};
@@ -2005,7 +2047,7 @@ fn pasted_history_prefix_scrolls_to_older_matches() {
         pane.render(area, &mut buffer);
         buffer_to_string(&buffer)
     };
-    pane.handle_session_paste("部署", &history);
+    pane.handle_session_paste("部署境", &history);
     let text = render(&pane).replace(' ', "");
     assert!(
         text.contains(">部署环境6") && text.contains("部署环境5"),
@@ -2020,7 +2062,7 @@ fn pasted_history_prefix_scrolls_to_older_matches() {
             &history,
         );
     }
-    assert_eq!(pane.composer.text(), "部署");
+    assert_eq!(pane.composer.text(), "部署境");
     let text = render(&pane).replace(' ', "");
     assert!(text.contains(">部署环境1"), "{text}");
     assert!(matches!(

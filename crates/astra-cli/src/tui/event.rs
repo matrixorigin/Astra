@@ -35,7 +35,6 @@ pub(crate) enum TuiEvent {
 
 pub(crate) struct TuiEventStream {
     pending: VecDeque<TuiEvent>,
-    ready_input: VecDeque<(Event, Instant)>,
     crossterm_stream: Option<EventStream>,
     resize_query: Option<tokio::task::JoinHandle<(EventStream, TuiEvent)>>,
     size_check: tokio::time::Interval,
@@ -49,7 +48,6 @@ impl TuiEventStream {
     pub(crate) fn new(draw_rx: mpsc::Receiver<()>, resize_pending: Arc<AtomicBool>) -> Self {
         Self {
             pending: VecDeque::new(),
-            ready_input: VecDeque::new(),
             crossterm_stream: Some(EventStream::new()),
             resize_query: None,
             size_check: tokio::time::interval(Duration::from_millis(100)),
@@ -62,42 +60,6 @@ impl TuiEventStream {
 
     pub(crate) fn push_front(&mut self, event: TuiEvent) {
         self.pending.push_front(event);
-    }
-
-    fn poll_terminal_input(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Event, Instant)>> {
-        const MAX_READY_INPUTS: usize = 32;
-        if let Some(input) = self.ready_input.pop_front() {
-            return Poll::Ready(Some(input));
-        }
-        let Some(stream) = self.crossterm_stream.as_mut() else {
-            return Poll::Ready(None);
-        };
-        let first = match Pin::new(&mut *stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(event))) => (event, Instant::now()),
-            Poll::Ready(_) => return Poll::Ready(None),
-            Poll::Pending => return Poll::Pending,
-        };
-        // Read already-ready text before the UI handles any of it. The
-        // editor measures input timing, which must exclude work on earlier keys.
-        if matches!(&first.0, Event::Key(key) if is_text_key(key)) {
-            for _ in 1..MAX_READY_INPUTS {
-                match Pin::new(&mut *stream).poll_next(cx) {
-                    Poll::Ready(Some(Ok(event))) => {
-                        let text = matches!(&event, Event::Key(key) if is_text_key(key));
-                        self.ready_input.push_back((event, first.1));
-                        if !text {
-                            break;
-                        }
-                    }
-                    Poll::Ready(_) => {
-                        self.crossterm_stream = None;
-                        break;
-                    }
-                    Poll::Pending => break,
-                }
-            }
-        }
-        Poll::Ready(Some(first))
     }
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
@@ -121,7 +83,7 @@ impl TuiEventStream {
             // the existing watchdog tick, not before every keyboard poll.
             // Poll through to Pending to register the next timer wake even
             // when this tick finds no resize and terminal input stays idle.
-            while self.ready_input.is_empty() && self.size_check.poll_tick(cx).is_ready() {
+            while self.size_check.poll_tick(cx).is_ready() {
                 let size = crossterm::terminal::size().ok();
                 if let Some(size) = size
                     && (pending || self.observed_size != Some(size))
@@ -129,7 +91,10 @@ impl TuiEventStream {
                     return self.start_resize_query(size);
                 }
             }
-            let event = self.poll_terminal_input(cx);
+            let Some(stream) = self.crossterm_stream.as_mut() else {
+                return Poll::Ready(None);
+            };
+            let event = stream.poll_next_timed(cx);
             #[cfg(unix)]
             if let Some(params) = crossterm::event::cached_primary_device_attributes() {
                 astra_tools::display_sixel::set_sixel_supported(
@@ -137,7 +102,7 @@ impl TuiEventStream {
                 );
             }
             match event {
-                Poll::Ready(Some((event, received_at))) => {
+                Poll::Ready(Some(Ok((event, received_at)))) => {
                     if let Event::Resize(width, height) = event {
                         let size = crossterm::terminal::size().unwrap_or((width, height));
                         return self.start_resize_query(size);
@@ -146,9 +111,7 @@ impl TuiEventStream {
                         return Poll::Ready(Some(mapped));
                     }
                 }
-                Poll::Ready(None) => {
-                    return Poll::Ready(None);
-                }
+                Poll::Ready(_) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
