@@ -1213,6 +1213,8 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn cancelled_resume_drops_the_admission_lease_before_stream_start() {
+        use axum::{Router, routing::post};
+        use std::sync::Arc;
         use std::time::Duration;
 
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
@@ -1228,55 +1230,50 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
-        let server = MockServer::start().await;
-        mock_existing_session(&server, &session_id).await;
-        Mock::given(method("POST"))
-            .and(path(format!("/sessions/{session_id}/resume")))
-            .and(header_exists("authorization"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(250))
-                    .set_body_json(astra_services::session_restore::RestoredSession {
-                        session_id: session_id.clone(),
-                        turn_count: 1,
-                        restored_from_cloud: true,
-                        resume_bundle: Some(typed_resume_bundle(
-                            &session_id,
-                            1,
-                            vec![serde_json::json!({"role": "user", "content": "previous"})],
-                            Vec::new(),
-                        )),
-                        ..Default::default()
-                    }),
-            )
-            .mount(&server)
-            .await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let received = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            &format!("/sessions/{session_id}/resume"),
+            post({
+                let received = received.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let received = received.clone();
+                    async move {
+                        assert!(headers.contains_key(axum::http::header::AUTHORIZATION));
+                        received.notify_one();
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let routing = select_one_shot_session_routing(Some(session_id.clone()), None, None);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(80),
-            super::admit_one_shot_session(routing, &api, Some("default")),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "the stalled restore should hit its deadline"
-        );
-        assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .any(|request| request.url.path() == format!("/sessions/{session_id}/resume")),
-            "the test must cancel an in-flight restore after lease acquisition"
-        );
+        {
+            let restore = super::admit_one_shot_session(routing, &api, Some("default"));
+            tokio::pin!(restore);
+            tokio::select! {
+                result = &mut restore => panic!("restore completed before cancellation: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(10), received.notified()) => {
+                    result.expect("restore request must reach the server");
+                }
+            }
+            assert!(matches!(
+                astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),
+                Err(astra_services::session_journal::SessionExecutionLeaseError::Conflict { .. })
+            ));
+        }
         assert!(
             astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
                 .is_ok(),
             "cancelling restore must release the lease before stream admission"
         );
+        server.abort();
     }
 
     #[test]
