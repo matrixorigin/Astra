@@ -687,8 +687,19 @@ impl ChatComposer {
                     self.cancel_history_search_at(now);
                 }
                 KeyCode::Tab if key.modifiers.is_empty() => {
-                    self.active_input_mut().insert_key_char_at('\t', now);
-                    self.refresh_history_search();
+                    if self.active_input_mut().insert_key_char_at('\t', now) {
+                        self.refresh_history_search();
+                    }
+                }
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if self.active_input_mut().insert_key_char_at(c, now) {
+                        self.refresh_history_search();
+                    }
                 }
                 KeyCode::Char('y')
                     if key.modifiers == KeyModifiers::CONTROL
@@ -698,8 +709,6 @@ impl ChatComposer {
                     // guard with bytes still arriving in this input gesture.
                 }
                 code if code == KeyCode::Backspace
-                    || matches!(code, KeyCode::Char(c) if !c.is_control()
-                        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
                     || matches!(code, KeyCode::Char('u' | 'w' | 'k' | 'y'))
                         && key.modifiers == KeyModifiers::CONTROL =>
                 {
@@ -1390,6 +1399,49 @@ mod paste_tests {
                 .content
                 .iter()
                 .any(|cell| matches!(cell.symbol(), "╭" | "╮" | "╰" | "╯"))
+        );
+    }
+
+    #[test]
+    fn buffered_search_keys_preserve_selection_until_paste_flush() {
+        let mut composer = ChatComposer::new_ephemeral();
+        for entry in ["ab older", "abcx\tnewer"] {
+            composer.set_text(entry);
+            composer.clear_and_submit();
+        }
+
+        let now = Instant::now();
+        composer.start_history_search(now, &[]);
+        composer.handle_paste("ab");
+        composer.handle_key_at(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            now,
+        );
+        assert_eq!(
+            composer.history_search.as_ref().unwrap().match_index,
+            Some(1)
+        );
+
+        composer
+            .active_input_mut()
+            .force_pending_paste_burst_for_test("c", now);
+        for code in [KeyCode::Char('x'), KeyCode::Tab] {
+            composer.handle_key_at(KeyEvent::new(code, KeyModifiers::NONE), now);
+            assert_eq!(composer.active_input().text(), "ab");
+            assert_eq!(
+                composer.history_search.as_ref().unwrap().match_index,
+                Some(1)
+            );
+        }
+
+        assert!(composer.flush_pending_paste_at(now));
+        assert_eq!(composer.active_input().text(), "abcx\t");
+        assert_eq!(
+            composer.handle_key_at(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                now + Duration::from_secs(1)
+            ),
+            ComposerAction::Recall("abcx\tnewer".into())
         );
     }
 }

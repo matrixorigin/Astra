@@ -212,9 +212,13 @@ impl TextArea {
         self.paste_burst.discard_tail(tail);
     }
 
-    pub(super) fn insert_key_char_at(&mut self, ch: char, now: Instant) {
+    /// Report whether the character changed the visible text immediately.
+    pub(super) fn insert_key_char_at(&mut self, ch: char, now: Instant) -> bool {
         if matches!(self.paste_burst.on_char(ch, now), BurstDecision::Normal) {
             self.insert_char(ch);
+            true
+        } else {
+            false
         }
     }
 
