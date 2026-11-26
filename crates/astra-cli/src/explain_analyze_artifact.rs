@@ -246,17 +246,12 @@ fn artifact_directory(session_id: &str) -> Result<PathBuf, String> {
 }
 
 fn capture_status(
-    events: &[ExplainAnalyzeEventV1],
+    graph: &astra_turn_types::ExplainAnalyzeGraphV1,
     delivery_degraded: bool,
 ) -> ExplainAnalyzeCaptureStatus {
     if delivery_degraded {
         return ExplainAnalyzeCaptureStatus::Partial;
     }
-    let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
-    for event in events {
-        graph.apply(event.clone());
-    }
-    graph.finish_ingest();
     if !graph.nodes().is_empty()
         && graph.nodes().iter().all(|node| node.terminal_observed)
         && graph.diagnostics().is_empty()
@@ -377,10 +372,11 @@ pub(crate) fn mark_unavailable(
     )
 }
 
-pub(crate) fn persist(
+fn persist(
     session_id: &str,
     events: &[ExplainAnalyzeEventV1],
     delivery_degraded: bool,
+    graph: &astra_turn_types::ExplainAnalyzeGraphV1,
 ) -> Result<Option<String>, String> {
     if session_id.trim().is_empty() {
         return Ok(None);
@@ -398,7 +394,7 @@ pub(crate) fn persist(
     let token = token_from_handle(&handle)
         .map(str::to_owned)
         .ok_or_else(|| "invalid Explain artifact handle".to_string())?;
-    let status = capture_status(events, delivery_degraded);
+    let status = capture_status(graph, delivery_degraded);
     latest_record(
         session_id,
         LatestRecordUpdate {
@@ -487,11 +483,12 @@ pub(crate) fn persist(
 pub(crate) fn persist_rendered_report(
     session_id: &str,
     events: &[ExplainAnalyzeEventV1],
+    graph: &astra_turn_types::ExplainAnalyzeGraphV1,
     delivery_degraded: bool,
     format: ExplainReportFormat,
     verbose: bool,
 ) -> Result<Option<PublishedArtifact>, String> {
-    let Some(handle) = persist(session_id, events, delivery_degraded)? else {
+    let Some(handle) = persist(session_id, events, delivery_degraded, graph)? else {
         return Ok(None);
     };
     let token = token_from_handle(&handle)
@@ -501,15 +498,16 @@ pub(crate) fn persist_rendered_report(
     let (extension, rendered) = match format {
         ExplainReportFormat::Html => (
             "html",
-            crate::explain_analyze_html::render(events, verbose, delivery_degraded),
+            crate::explain_analyze_html::render_graph(graph, verbose, delivery_degraded),
         ),
         ExplainReportFormat::Markdown => {
-            let report = crate::explain_analyze_report::render(events, verbose, delivery_degraded);
+            let report =
+                crate::explain_analyze_report::render_graph(graph, verbose, delivery_degraded);
             ("md", markdown_report(&report))
         }
         ExplainReportFormat::Text => (
             "txt",
-            crate::explain_analyze_report::render(events, verbose, delivery_degraded),
+            crate::explain_analyze_report::render_graph(graph, verbose, delivery_degraded),
         ),
     };
     let path = directory.join(format!("{token}.{extension}"));
@@ -811,7 +809,13 @@ pub(crate) fn persist_test_judgment_usage(session_id: &str) {
         }],
     }));
     events.push(events[1].clone());
-    persist(session_id, &events, false).unwrap();
+    persist(
+        session_id,
+        &events,
+        false,
+        &crate::explain_analyze_format::project(&events),
+    )
+    .unwrap();
 }
 
 fn read_local_judgment_usage(session_id: &str) -> Result<LocalCapturedJudgmentUsage, String> {
@@ -1028,7 +1032,13 @@ mod tests {
             let mut events = vec![artifact.events[0].clone()];
             events.extend(order.map(|index| records[index].clone()));
             assert!(events.iter().all(ExplainAnalyzeEventV1::is_valid));
-            persist(session, &events, false).unwrap();
+            persist(
+                session,
+                &events,
+                false,
+                &crate::explain_analyze_format::project(&events),
+            )
+            .unwrap();
             let captured = local_judgment_usage(session);
             assert!(matches!(
                 captured.scope,
@@ -1051,7 +1061,14 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session = "local-usage-test";
         assert!(!local_judgment_usage(session).facts.available);
-        persist(session, &complete_events(), false).unwrap();
+        let events = complete_events();
+        persist(
+            session,
+            &events,
+            false,
+            &crate::explain_analyze_format::project(&events),
+        )
+        .unwrap();
         assert!(
             !local_judgment_usage(session).facts.available,
             "no snapshot is not zero usage"
@@ -1250,6 +1267,7 @@ mod tests {
         let publication = persist_rendered_report(
             session_id,
             &events,
+            &crate::explain_analyze_format::project(&events),
             false,
             ExplainReportFormat::Markdown,
             false,
@@ -1280,9 +1298,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary sessions directory");
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f305";
+        let events = complete_events();
         let publication = persist_rendered_report(
             session_id,
-            &complete_events(),
+            &events,
+            &crate::explain_analyze_format::project(&events),
             false,
             ExplainReportFormat::Html,
             false,
@@ -1317,10 +1337,16 @@ mod tests {
         std::fs::create_dir_all(session_dir.join(ARTIFACT_DIR).join(format!("{token}.html")))
             .expect("block HTML temporary path");
 
-        let publication =
-            persist_rendered_report(session_id, &events, false, ExplainReportFormat::Html, false)
-                .expect("canonical publication should succeed")
-                .expect("non-empty capture should publish");
+        let publication = persist_rendered_report(
+            session_id,
+            &events,
+            &crate::explain_analyze_format::project(&events),
+            false,
+            ExplainReportFormat::Html,
+            false,
+        )
+        .expect("canonical publication should succeed")
+        .expect("non-empty capture should publish");
         assert!(publication.rendered_path.is_none());
         assert!(publication.render_error.is_some());
         let resolved = resolve_request(
@@ -1351,6 +1377,7 @@ mod tests {
             let publication = persist_rendered_report(
                 session_id,
                 &events,
+                &crate::explain_analyze_format::project(&events),
                 false,
                 ExplainReportFormat::Html,
                 false,

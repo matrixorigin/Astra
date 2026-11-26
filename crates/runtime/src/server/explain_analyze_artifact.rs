@@ -925,7 +925,13 @@ pub(crate) async fn resolve_selector(
         args.get("depth").and_then(Value::as_str),
         Some("diagnostic" | "forensic")
     ) {
-        return render_summary(&artifact, session_id, &run_id, generation, max_bytes);
+        return render_summary(
+            &artifact,
+            session_id,
+            Some(&run_id),
+            Some(generation),
+            max_bytes,
+        );
     }
     render_window(
         &artifact,
@@ -940,15 +946,34 @@ pub(crate) async fn resolve_selector(
 fn render_summary(
     artifact: &StoredSessionArtifact,
     session_id: &str,
-    run_id: &str,
-    generation: u64,
+    expected_run: Option<&str>,
+    expected_generation: Option<u64>,
     max_bytes: usize,
 ) -> Result<String, String> {
-    let (status, _, graph) =
-        validate_snapshot_payload_with_bytes(artifact, session_id, Some(run_id), Some(generation))?;
+    use astra_turn_types::{ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1};
+
+    let (status, _, graph) = validate_snapshot_payload_with_bytes(
+        artifact,
+        session_id,
+        expected_run,
+        expected_generation,
+    )?;
     if status == "unavailable" {
         return Err("the selected Explain Analyze capture is unavailable".into());
     }
+    let nodes = graph.nodes();
+    let run_id = artifact.content["run_id"]
+        .as_str()
+        .expect("validated run identity");
+    let mut turns = nodes
+        .iter()
+        .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::Turn);
+    let wall_time = turns
+        .next()
+        .filter(|turn| turns.next().is_none() && turn.terminal_observed && !turn.conflicted)
+        .and_then(|turn| turn.duration_ms);
+    let concurrency = graph.max_concurrency();
+    let usage = graph.observed_provider_usage();
     let auxiliary = graph.auxiliary_usage_snapshot();
     let auxiliary_attempts = graph.auxiliary_attempts();
     let scopes = graph.execution_scope_coverage();
@@ -960,6 +985,7 @@ fn render_summary(
     {
         let outcome = node
             .outcome
+            .filter(|_| node.terminal_observed && !node.conflicted)
             .map(|outcome| {
                 serde_json::to_value(outcome)
                     .unwrap()
@@ -974,30 +1000,10 @@ fn render_summary(
     for diagnostic in graph.diagnostics().iter() {
         *diagnostics.entry(diagnostic.code.as_str()).or_default() += 1;
     }
-    let mut nodes = graph
-        .nodes()
-        .iter()
-        .map(|node| {
-            json!({
-                "node_id": node.node_id, "parent_node_id": node.parent_node_id,
-                "clock_domain_id": node.clock_domain_id, "kind": node.kind,
-                "label": node.label, "start_elapsed_ms": node.start_elapsed_ms,
-                "duration_ms": node.duration_ms, "outcome": node.outcome,
-                "terminal_observed": node.terminal_observed, "conflicted": node.conflicted,
-                "round_index": node.round_index, "attempt_index": node.attempt_index,
-                "usage": node.usage,
-                "context": node.context.as_ref().map(|context| json!({
-                    "budget": context.budget,
-                    "assembly": context.assembly.as_ref().map(|assembly| json!({
-                        "basis": assembly.basis, "sources": assembly.sources,
-                    })),
-                })),
-            })
-        })
-        .collect::<Vec<_>>();
     let mut summary = json!({
         "observation": "explain_analyze_summary", "run_id": run_id,
-        "turn_id": artifact.content["turn_id"], "execution_owner_generation": generation,
+        "turn_id": artifact.content["turn_id"],
+        "execution_owner_generation": artifact.content["execution_owner_generation"],
         "artifact": artifact_handle(&artifact.artifact_id), "capture_status": status,
         "graph_integrity": match graph.integrity() {
             astra_turn_types::ExplainAnalyzeGraphIntegrityV1::Consistent => "consistent",
@@ -1008,6 +1014,22 @@ fn render_summary(
         "foreign_event_count": artifact.content["foreign_event_count"],
         "open_node_count": artifact.content["open_node_count"],
         "turn_outcome_counts": turn_outcomes,
+        "timing": {
+            "turn_wall_time_ms": wall_time,
+            "longest_measured_step": graph.longest_measured_step().map(|(_, step)| json!({
+                "node_id": step.node_id, "label": step.label, "duration_ms": step.duration_ms,
+            })),
+            "max_observed_concurrency": concurrency,
+            "concurrency_is_lower_bound": concurrency.is_some()
+                && (status != "complete" || !graph.coverage_gaps().is_empty()),
+        },
+        "provider_tokens": {
+            "observed_attempts": usage.attempts,
+            "fresh_input": reported_tokens(usage.fresh_input),
+            "cache_read": reported_tokens(usage.cache_read),
+            "cache_creation": reported_tokens(usage.cache_creation),
+            "output": reported_tokens(usage.output),
+        },
         "coverage_gaps": graph.coverage_gaps(), "diagnostics": diagnostics,
         "auxiliary": {
             "available": auxiliary.available,
@@ -1033,7 +1055,7 @@ fn render_summary(
         "omitted_native_observation_count": 0,
         "native_observation_coverage": artifact.content["native_observation_coverage"],
         "native_observation_scope": "Stage usage is cumulative within the native stage, not current context occupancy; last request is a separate snapshot. Internal call count and health are unknown. Native usage does not enter physical-attempt cache metrics.",
-        "note": "Bounded projected facts; null outcomes and measurements are unknown. Detail is available through the artifact handle at offset 0; this summary is not a pagination cursor. Child execution needs its own run evidence.",
+        "note": "Null values are unknown. Token totals cover the reported lanes of observed primary attempts. Compare time offsets only within a clock domain. Detail is available via the artifact handle. Child execution needs its own run evidence.",
     });
     // Reserve the mandatory envelope first, then select whole rows in one pass.
     // Keep factual identity/coverage even when the caller cannot afford any rows.
@@ -1072,49 +1094,46 @@ fn render_summary(
     summary["omitted_native_observation_count"] = json!(native_count - native_retained.len());
     summary["native_stage_observations"] = json!(native_retained);
     let mut priority = (0..nodes.len()).collect::<Vec<_>>();
-    priority.sort_by_key(|index| {
-        let node = &graph.nodes()[*index];
+    priority.sort_unstable_by_key(|index| {
+        let node = &nodes[*index];
         std::cmp::Reverse((
+            matches!(
+                node.kind,
+                ExplainAnalyzeNodeKindV1::Run | ExplainAnalyzeNodeKindV1::Turn
+            ),
             node.conflicted
                 || !node.terminal_observed
                 || matches!(
                     node.outcome,
                     Some(
-                        astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
-                            | astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
-                            | astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked
-                            | astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+                        ExplainAnalyzeOutcomeV1::Failed
+                            | ExplainAnalyzeOutcomeV1::Cancelled
+                            | ExplainAnalyzeOutcomeV1::Blocked
+                            | ExplainAnalyzeOutcomeV1::Rejected
+                            | ExplainAnalyzeOutcomeV1::Interrupted
                     )
                 ),
-            matches!(
-                node.kind,
-                astra_turn_types::ExplainAnalyzeNodeKindV1::Run
-                    | astra_turn_types::ExplainAnalyzeNodeKindV1::Turn
-            ),
-            matches!(
-                node.kind,
-                astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall
-                    | astra_turn_types::ExplainAnalyzeNodeKindV1::ChildRun
-                    | astra_turn_types::ExplainAnalyzeNodeKindV1::Wait
-            ),
+            node.duration_ms,
+            std::cmp::Reverse(*index),
         ))
     });
-    let mut retained = std::collections::HashSet::new();
+    let mut retained = Vec::new();
     for index in priority {
-        let size = serde_json::to_vec(&nodes[index])
+        if budget == 0 {
+            break;
+        }
+        let row = summary_node(&nodes[index]);
+        let size = serde_json::to_vec(&row)
             .map_err(|error| error.to_string())?
             .len()
             + 1;
         if size <= budget {
-            retained.insert(index);
+            retained.push((index, row));
             budget -= size;
         }
     }
-    nodes = nodes
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, node)| retained.contains(&index).then_some(node))
-        .collect();
+    retained.sort_unstable_by_key(|(index, _)| *index);
+    let shown_nodes: Vec<_> = retained.into_iter().map(|(_, row)| row).collect();
     let mut attempts = Vec::new();
     for attempt in &auxiliary_attempts {
         let row = serde_json::to_value(attempt).map_err(|error| error.to_string())?;
@@ -1127,9 +1146,9 @@ fn render_summary(
             budget -= size;
         }
     }
-    summary["shown_node_count"] = json!(nodes.len());
-    summary["omitted_node_count"] = json!(graph.nodes().len() - nodes.len());
-    summary["nodes"] = json!(nodes);
+    summary["shown_node_count"] = json!(shown_nodes.len());
+    summary["omitted_node_count"] = json!(nodes.len() - shown_nodes.len());
+    summary["nodes"] = json!(shown_nodes);
     summary["auxiliary"]["shown_attempt_count"] = json!(attempts.len());
     summary["auxiliary"]["omitted_attempt_count"] =
         json!(auxiliary_attempts.len() - attempts.len());
@@ -1138,6 +1157,42 @@ fn render_summary(
         .map_err(|error| format!("encode Explain summary: {error}"))?;
     debug_assert!(output.len() <= max_bytes);
     Ok(output)
+}
+
+fn reported_tokens(lane: astra_turn_types::ExplainAnalyzeObservedTokenLane) -> Value {
+    let tokens = if lane.reporting_attempts == 0 {
+        Value::Null
+    } else {
+        u64::try_from(lane.tokens)
+            .map_or_else(|_| json!(lane.tokens.to_string()), |value| json!(value))
+    };
+    json!({ "tokens": tokens, "reporting_attempts": lane.reporting_attempts })
+}
+
+fn summary_node(node: &astra_turn_types::ExplainAnalyzeProjectedNodeV1) -> Value {
+    let mut row = json!({
+        "node_id": node.node_id, "parent_node_id": node.parent_node_id,
+        "clock_domain_id": node.clock_domain_id, "kind": node.kind,
+        "label": node.label, "start_elapsed_ms": node.start_elapsed_ms,
+        "end_elapsed_ms": node.end_elapsed_ms, "duration_ms": node.duration_ms,
+        "outcome": node.outcome.filter(|_| node.terminal_observed && !node.conflicted),
+        "terminal_observed": node.terminal_observed, "conflicted": node.conflicted,
+        "round_index": node.round_index, "attempt_index": node.attempt_index,
+        "usage": node.usage,
+        "context": node.context.as_ref().map(|context| json!({
+            "budget": context.budget,
+            "assembly": context.assembly.as_ref().map(|assembly| json!({
+                "basis": assembly.basis, "sources": assembly.sources,
+            })),
+        })),
+    });
+    if !node.dependency_node_ids.is_empty() {
+        row["dependency_node_ids"] = json!(node.dependency_node_ids);
+    }
+    if let Some(detail) = &node.decision_detail {
+        row["decision_detail"] = json!(detail);
+    }
+    row
 }
 
 /// Select observations from the already-owned run events, never from another
@@ -1549,6 +1604,9 @@ pub(crate) async fn resolve_request(
                 .ok_or_else(|| {
                     "Explain Analyze artifact was not found for this session".to_string()
                 })?;
+            if offset == 0 && args.get("depth").and_then(Value::as_str) == Some("summary") {
+                return render_summary(&artifact, session_id, None, None, max_bytes);
+            }
             render_window(&artifact, session_id, None, None, offset, max_bytes)
         }
         .await,
@@ -1745,6 +1803,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn summary_answers_timing_and_usage_from_the_same_run_graph() {
+        let mut artifact = stored(explain_record(
+            "measured",
+            "user-a",
+            "session-a",
+            "complete",
+        ));
+        let mut turn = artifact.content["events"][0].clone();
+        turn["elapsed_ms"] = json!(4);
+        turn["duration_ms"] = json!(4);
+        let mut failed = turn.clone();
+        failed["event_id"] = json!("attempt-one-finished");
+        failed["node_id"] = json!("attempt-one");
+        failed["parent_node_id"] = json!("turn-1");
+        failed["kind"] = json!("provider_attempt");
+        failed["label"] = json!("First model attempt");
+        failed["round_index"] = json!(0);
+        failed["attempt_index"] = json!(0);
+        failed["start_elapsed_ms"] = json!(0);
+        failed["elapsed_ms"] = json!(1);
+        failed["duration_ms"] = json!(1);
+        failed["outcome"] = json!("failed");
+        failed["decision_detail"] = json!({"kind":"failure","error_kind":"rate_limit"});
+        let mut retry = failed.clone();
+        retry["event_id"] = json!("attempt-two-finished");
+        retry["node_id"] = json!("attempt-two");
+        retry["label"] = json!("Second model attempt");
+        retry["attempt_index"] = json!(1);
+        retry["start_elapsed_ms"] = json!(1);
+        retry["elapsed_ms"] = json!(4);
+        retry["duration_ms"] = json!(3);
+        retry["outcome"] = json!("completed");
+        retry.as_object_mut().unwrap().remove("decision_detail");
+        retry["dependency_node_ids"] = json!(["attempt-one"]);
+        retry["usage"] = json!({
+            "basis": "provider_partial",
+            "cache_read_tokens": 3844,
+            "output_tokens": 267
+        });
+        artifact.content["events"] = json!([turn, failed, retry]);
+        refresh_integrity_metadata(&mut artifact);
+
+        let rendered =
+            render_summary(&artifact, "session-a", Some("run-1"), Some(1), 16_384).unwrap();
+        let summary: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(summary["provider_tokens"]["observed_attempts"], 2);
+        assert_eq!(
+            summary["provider_tokens"]["fresh_input"]["tokens"],
+            Value::Null
+        );
+        assert_eq!(
+            summary["provider_tokens"]["cache_read"],
+            json!({"tokens":3844,"reporting_attempts":1})
+        );
+        assert_eq!(summary["provider_tokens"]["output"]["tokens"], 267);
+        assert_eq!(
+            summary["timing"]["longest_measured_step"]["node_id"],
+            "attempt-two"
+        );
+        assert_eq!(summary["timing"]["longest_measured_step"]["duration_ms"], 3);
+        assert_eq!(summary["timing"]["turn_wall_time_ms"], 4);
+        assert_eq!(summary["timing"]["max_observed_concurrency"], 1);
+        assert_eq!(
+            summary["nodes"][1]["decision_detail"]["error_kind"],
+            "rate_limit"
+        );
+        assert_eq!(
+            summary["nodes"][2]["dependency_node_ids"],
+            json!(["attempt-one"])
+        );
+        assert_eq!(
+            summary["nodes"][2]["clock_domain_id"],
+            summary["nodes"][1]["clock_domain_id"]
+        );
+    }
+
+    #[test]
     fn summary_preserves_unknown_capture_and_whole_evidence_with_tiny_budget() {
         let mut artifact = stored(explain_record(
             "summary-test",
@@ -1767,7 +1902,7 @@ pub(crate) mod tests {
         }
         refresh_integrity_metadata(&mut artifact);
         assert!(serde_json::to_vec(&artifact.content).unwrap().len() > 32768);
-        let output = render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap();
+        let output = render_summary(&artifact, "session-a", Some("run-1"), Some(1), 8192).unwrap();
         assert!(output.len() <= 8192);
         let summary: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(summary["total_node_count"], 301);
@@ -1784,7 +1919,7 @@ pub(crate) mod tests {
             summary["auxiliary"]["scope_coverage"]["snapshot_missing_count"],
             1
         );
-        let error = render_summary(&artifact, "session-a", "run-1", 1, 1).unwrap_err();
+        let error = render_summary(&artifact, "session-a", Some("run-1"), Some(1), 1).unwrap_err();
         let minimum: usize = error
             .split("minimum ")
             .nth(1)
@@ -1792,8 +1927,11 @@ pub(crate) mod tests {
             .trim_end_matches(')')
             .parse()
             .unwrap();
-        assert!(render_summary(&artifact, "session-a", "run-1", 1, minimum - 1).is_err());
-        let minimum_output = render_summary(&artifact, "session-a", "run-1", 1, minimum).unwrap();
+        assert!(
+            render_summary(&artifact, "session-a", Some("run-1"), Some(1), minimum - 1).is_err()
+        );
+        let minimum_output =
+            render_summary(&artifact, "session-a", Some("run-1"), Some(1), minimum).unwrap();
         assert_eq!(minimum_output.len(), minimum);
         let minimum_summary: Value = serde_json::from_str(&minimum_output).unwrap();
         assert_eq!(minimum_summary["shown_node_count"], 0);
@@ -1802,13 +1940,18 @@ pub(crate) mod tests {
             summary["turn_outcome_counts"]
         );
         assert_eq!(minimum_summary["auxiliary"], summary["auxiliary"]);
+        assert_eq!(minimum_summary["timing"], summary["timing"]);
+        assert_eq!(
+            minimum_summary["provider_tokens"],
+            summary["provider_tokens"]
+        );
         assert_eq!(minimum_summary["diagnostics"], summary["diagnostics"]);
         assert_eq!(minimum_summary["artifact"], artifact_handle("summary-test"));
         artifact.content["events"][0]["auxiliary_usage"] =
             json!({"available": true, "attempts": []});
         refresh_integrity_metadata(&mut artifact);
         let captured: Value = serde_json::from_str(
-            &render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap(),
+            &render_summary(&artifact, "session-a", Some("run-1"), Some(1), 8192).unwrap(),
         )
         .unwrap();
         assert_eq!(captured["auxiliary"]["available"], true);
@@ -1848,7 +1991,7 @@ pub(crate) mod tests {
         artifact.content["coverage_gaps"] = json!(projection.coverage_gaps);
         refresh_integrity_metadata(&mut artifact);
         let partial: Value = serde_json::from_str(
-            &render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap(),
+            &render_summary(&artifact, "session-a", Some("run-1"), Some(1), 8192).unwrap(),
         )
         .unwrap();
         assert_eq!(partial["capture_status"], "partial");
@@ -1869,7 +2012,7 @@ pub(crate) mod tests {
         );
         artifact.artifact_kind = "unrelated".into();
         assert!(
-            render_summary(&artifact, "session-a", "run-1", 1, 8192)
+            render_summary(&artifact, "session-a", Some("run-1"), Some(1), 8192)
                 .unwrap_err()
                 .contains("does not name")
         );
@@ -1921,7 +2064,7 @@ pub(crate) mod tests {
         artifact.content["graph_diagnostics"] = json!(projection.graph_diagnostics);
         artifact.content["coverage_gaps"] = json!(projection.coverage_gaps);
         refresh_integrity_metadata(&mut artifact);
-        let output = render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap();
+        let output = render_summary(&artifact, "session-a", Some("run-1"), Some(1), 8192).unwrap();
         assert!(output.len() <= 8192);
         let summary: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(
@@ -1946,7 +2089,7 @@ pub(crate) mod tests {
                     .unwrap(),
             1
         );
-        let error = render_summary(&artifact, "session-a", "run-1", 1, 1).unwrap_err();
+        let error = render_summary(&artifact, "session-a", Some("run-1"), Some(1), 1).unwrap_err();
         let minimum: usize = error
             .split("minimum ")
             .nth(1)
@@ -1955,7 +2098,7 @@ pub(crate) mod tests {
             .parse()
             .unwrap();
         let minimal: Value = serde_json::from_str(
-            &render_summary(&artifact, "session-a", "run-1", 1, minimum).unwrap(),
+            &render_summary(&artifact, "session-a", Some("run-1"), Some(1), minimum).unwrap(),
         )
         .unwrap();
         assert_eq!(minimal["nodes"], json!([]));
@@ -2106,6 +2249,50 @@ pub(crate) mod tests {
         assert!(!still_previous.is_error, "{still_previous:?}");
         let still_previous: Value = serde_json::from_str(&still_previous.output).unwrap();
         assert_eq!(still_previous["run_id"], "run-1");
+
+        // The fixed selector keeps the original report even as "previous" moves.
+        let later_executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            std::env::temp_dir(),
+            "user-a".into(),
+            "session-a".into(),
+            None,
+            None,
+        )
+        .with_explain_root(engine.clone(), "new-root".into())
+        .with_test_session_artifact_store(store.clone());
+        let followup = later_executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "run", "run_id": summary["run_id"]}}),
+            )
+            .await;
+        assert!(!followup.is_error, "{followup:?}");
+        let followup: Value = serde_json::from_str(&followup.output).unwrap();
+        assert_eq!(followup["run_id"], "run-1");
+        assert_eq!(followup["artifact"], summary["artifact"]);
+        assert_eq!(followup, summary);
+
+        // A known report handle only needs the existing session artifact reader.
+        let handle_only = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            std::env::temp_dir(),
+            "user-a".into(),
+            "session-a".into(),
+            None,
+            None,
+        )
+        .with_test_session_artifact_store(store.clone());
+        let handle_summary = handle_only
+            .execute_with_metadata(
+                "introspect",
+                &json!({"artifact": handle, "depth": "summary"}),
+            )
+            .await;
+        assert!(!handle_summary.is_error, "{handle_summary:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&handle_summary.output).unwrap(),
+            summary
+        );
+
         let page = executor
             .execute_with_metadata(
                 "introspect",

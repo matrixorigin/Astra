@@ -633,6 +633,10 @@ export type ExplainAnalyzeDecisionDetailV1 = {
   kind: "delegation_catalog_resolution";
   requirement_index: number;
   match_count: number;
+} | {
+  kind: "failure";
+  /** Stable runtime error kind, with no provider or tool message text. */
+  error_kind: string;
 };
 
 export type ExplainAnalyzeEventV1 = {

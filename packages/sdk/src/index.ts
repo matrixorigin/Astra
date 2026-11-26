@@ -356,7 +356,7 @@ export {
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
 } from "./explain-analyze";
-export { renderExplainAnalyzeText } from "./explain-analyze-text";
+export { explainAnalyzeDecisionDetailLine, renderExplainAnalyzeText } from "./explain-analyze-text";
 export type {
   ExplainAnalyzeGraphV1,
   ExplainAnalyzeDiagnosticV1,

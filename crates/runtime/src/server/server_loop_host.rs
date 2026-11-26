@@ -5372,17 +5372,28 @@ impl ToolRouteObserver for ExplainAnalyzeToolRouteObserver {
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        span.terminal_event = context.event(
+        let outcome = if result.is_error {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+        } else {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        };
+        let detail = result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("error_kind"))
+            .and_then(Value::as_str)
+            .and_then(|tag| {
+                astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(tag, outcome)
+            });
+        span.terminal_event = context.event_with_context(
             &span.node,
             astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
             finished_at,
             Some(duration_ms),
-            Some(if result.is_error {
-                astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
-            } else {
-                astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
-            }),
+            Some(outcome),
             None,
+            None,
+            detail,
         );
         // If the start was lost to bounded delivery, retain both facts for
         // host reconciliation so consumers never observe finish-before-start.
@@ -5493,13 +5504,18 @@ impl crate::turn::llm::client::ProviderAttemptObserver
                         .as_millis(),
                 )
                 .unwrap_or(u64::MAX);
-                span.terminal_event = context.event(
+                let detail = terminal.error_kind.as_deref().and_then(|tag| {
+                    astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(tag, outcome)
+                });
+                span.terminal_event = context.event_with_context(
                     &span.node,
                     astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
                     finished_at,
                     Some(duration_ms),
                     Some(outcome),
                     explain_analyze_token_usage(terminal, span.usage_presence),
+                    None,
+                    detail,
                 );
                 // If the start was lost to backpressure, the terminal event
                 // still reconstructs the interval. Publish the pair together
@@ -13090,6 +13106,12 @@ impl ServerAgenticLoopHost {
             },
         };
         let finished_at = Instant::now();
+        let failure = event
+            .get("error_kind")
+            .and_then(Value::as_str)
+            .and_then(|tag| {
+                astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(tag, outcome)
+            });
         let decision_detail = self
             .explain_analyze_admission_decision_details
             .remove(&call_id);
@@ -13101,11 +13123,16 @@ impl ServerAgenticLoopHost {
                 &node_id,
                 outcome,
                 finished_at,
-                decision_detail,
+                decision_detail.or_else(|| failure.clone()),
             );
         }
         if let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) {
-            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+            self.finish_explain_analyze_timed_node_with_decision_detail(
+                &node_id,
+                outcome,
+                finished_at,
+                failure,
+            );
         }
     }
 

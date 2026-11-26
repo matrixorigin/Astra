@@ -7,6 +7,7 @@ import {
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
   explainAnalyzeCoverageGapLabel,
+  explainAnalyzeDecisionDetailLine,
   explainAnalyzeContextSections,
   formatExplainAnalyzeContext,
   formatMs,
@@ -543,7 +544,11 @@ function TimelineDomain({
             <div><dt className="text-text-muted">Measured duration</dt><dd>{selected.durationMs === undefined ? "Not recorded" : formatMs(selected.durationMs)}</dd></div>
             <div><dt className="text-text-muted">Outcome</dt><dd>{!selected.terminalObserved && (!isLive || missingEndNodeIds.has(selected.nodeId)) ? "End not recorded" : nodeStatus(selected).label}</dd></div>
           </dl>
-          {selected.outcome === "failed" ? <p className="mt-3 text-xs text-danger">This stage failed. A failure reason was not included in these Explain facts.</p> : null}
+          {selected.decisionDetail ? (
+            <p className="mt-3 text-xs text-text">{explainAnalyzeDecisionDetailLine(selected.decisionDetail)}</p>
+          ) : selected.outcome === "failed" ? (
+            <p className="mt-3 text-xs text-danger">Failure reason was not recorded.</p>
+          ) : null}
           {nodes.some((node) => node.dependencyNodeIds.includes(selected.nodeId)) ? <div className="mt-3 text-xs text-text-muted">Dependent stages: {nodes.filter((node) => node.dependencyNodeIds.includes(selected.nodeId)).map((node) =>
             <button key={node.nodeId} type="button" className="ml-2 text-accent underline" onClick={() => inspect(node.nodeId)}>{node.label}</button>)}</div> : null}
           {selected.parentNodeId ? <p className="mt-3 text-xs text-text-muted">Parent: {nodeById.get(selected.parentNodeId)?.label ?? selected.parentNodeId}</p> : null}

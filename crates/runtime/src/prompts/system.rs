@@ -816,10 +816,11 @@ fn self_diagnosis_section(tool_names: &[&str]) -> String {
     }
     let mut s = String::from("\n## Self-Diagnosis\n");
     if has_introspect {
-        s.push_str("- Use ordinary `introspect` for current runtime state, and use its explicit Server Explain selector (`explain={target:run,run_id}` or `target=previous`) for identified historical execution evidence. Do not treat an ordinary live snapshot as history. For current-state claims, facet=overview (summary/current_turn defaults); snapshot totals exclude later calls. Select absent fields before use; depth=hint for quick checks, diagnostic depth only for a concrete gap or requested audit.\n");
+        s.push_str("- Use ordinary `introspect` for current runtime state, facet=overview (summary/current_turn defaults); totals exclude later calls. Select absent fields before use; depth=hint for quick checks, diagnostic depth only for a concrete gap or requested audit.\n");
+        s.push_str("- For a prior `/explain` report or one historical run, use the explicit Server Explain selector. Use `explain={target:previous}` for the immediately preceding run. Keep the returned run ID or artifact handle attached to that report for follow-ups, even after intervening runs. Reuse available evidence. For CLI/Edge-local reports, text `introspect` overview can surface the local handle.\n");
         s.push_str("- Conversation history is not runtime telemetry. Current live-state claims without Introspect are conversation-only.\n");
     } else if can_activate {
-        s.push_str("- Current state: select `introspect` with `tool_search(query=\"select:introspect\")` only if listed; otherwise claims are conversation-only.\n");
+        s.push_str("- For current state or a Server `/explain` question, select `introspect` with `tool_search(query=\"select:introspect\")` only if listed, then use its selected contract. Reuse the run ID or artifact handle for follow-ups about the same report.\n");
     }
     if has_reflect {
         s.push_str("- For session-level prior execution, use resident `reflect` with one concrete question: topic=overview facet=overview (summary/session) combines tools, errors, trace and coverage. Reuse it; follow up only for an unanswered fact or reported omission. A directly requested facet needs no overview first. Reflect is session-scoped, has no exact run/turn selector, and does not require live `introspect`. For one exact historical run, use Server Explain. Do not present session aggregates as facts about one run. Select depth=diagnostic|forensic only for a gap or requested audit; audit depth does not require facet fanout. Wait duration is not child runtime.\n");
@@ -1571,6 +1572,8 @@ mod tests {
         assert!(p_both.contains("forensic"));
         assert!(p_both.contains("Use ordinary `introspect` for current runtime state"));
         assert!(p_both.contains("explicit Server Explain selector"));
+        assert!(p_both.contains("prior `/explain` report"));
+        assert!(p_both.contains("attached to that report for follow-ups"));
         assert!(p_both.contains("one concrete question"));
         assert!(p_both.contains("topic=overview facet=overview"));
         assert!(p_both.contains("follow up only for an unanswered fact or reported omission"));

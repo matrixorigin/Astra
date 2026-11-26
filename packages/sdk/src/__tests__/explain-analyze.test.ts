@@ -94,6 +94,22 @@ describe("Explain Analyze graph reducer", () => {
     expect(conflict.conflictedNodeIds).toEqual(["admission-agent"]);
   });
 
+  it("retains classified errors without accepting raw provider messages", () => {
+    const terminal = finished("attempt", "provider_attempt", 30, 220, {
+      round_index: 0,
+      attempt_index: 0,
+      outcome: "failed",
+      decision_detail: { kind: "failure", error_kind: "rate_limit" },
+    });
+    expect(isExplainAnalyzeEventV1(terminal)).toBe(true);
+    expect(isExplainAnalyzeEventV1({ ...terminal, outcome: "succeeded" })).toBe(false);
+    expect(isExplainAnalyzeEventV1({
+      ...terminal,
+      decision_detail: { kind: "failure", error_kind: "provider text", message: "raw" },
+    })).toBe(false);
+    expect(renderExplainAnalyzeHtml([terminal])).toContain("Error · rate limit");
+  });
+
   it("accepts and renders a terminal judgment stage", () => {
     const judgment = finished("tool-result-judgment", "judgment", 10, 25, {
       round_index: 0,

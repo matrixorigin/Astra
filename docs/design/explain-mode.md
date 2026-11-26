@@ -276,8 +276,9 @@ Render the measured overlap as a lower bound and name the unmeasured boundaries.
   details, filters, and live updates from the run stream.
 - **SDK:** expose the typed event and a reducer-friendly stream; callers can
   render without reverse-engineering event prose.
-- **HTML:** export a standalone graph report from the same snapshot, with no
-  remote scripts, fonts, or data requests.
+- **HTML:** export a standalone waterfall aligned with the call tree from the
+  same snapshot. Link measured findings to their stages, with separate scales
+  for unaligned clocks and expandable evidence. Keep the file usable offline.
 
 ## Report artifacts and agent analysis
 
@@ -365,13 +366,10 @@ The model-facing value is an opaque, session-scoped handle. The server and
 local readers support UTF-8 JSON windows with `offset` and a bounded
 `max_bytes` (64 KiB maximum), and return a continuation offset. They never
 expose a physical path. A failed write publishes an `unavailable` status for
-that run and turn when the store is reachable. Server discovery is bound first
-to the latest durable root `run_started` record that explicitly requested Explain
-Analyze, excluding the current root execution, then to that run's deterministic
-artifact identity; a missing or
-invalid artifact is reported as unavailable and never falls back to an older
-run. The local index uses the same fail-closed status model for the host it
-owns.
+that run and turn when the store is reachable. Server discovery resolves the
+selected root or exact run, then reads its deterministic artifact identity if
+the run requested Explain. The local index uses the same fail-closed status
+model for the host it owns.
 
 Future storage backends fit the same reference contract. A trusted local-path
 backend may be used by a host adapter for files it owns; an S3-compatible
@@ -397,7 +395,10 @@ payloads on the same reference model without widening Explain Analyze into a
 raw trace or file browser.
 
 Server chat preparation performs no Explain discovery, artifact fetch, or
-recovery. The canonical tool schema and catalog advertise the explicit selector:
+recovery. The existing self-diagnosis guidance and `introspect` contract route
+questions about a prior `/explain` report to the matching run ID or detail handle.
+The current capture mode does not control reader availability. The canonical
+tool schema and catalog advertise these selectors:
 
 - `introspect(explain={target:"previous"}, offset=0, max_bytes=65536)` selects
   the latest root strictly before the trusted current root's `(created_at, run_id)`
@@ -425,13 +426,19 @@ recovery. The canonical tool schema and catalog advertise the explicit selector:
   the producer-bounded model presentation remains intact.
 - Explain artifact selection defaults to a bounded fact summary with run, turn,
   execution-owner generation, capture status, uncertainty and omission counts,
-  and a concrete opaque detail handle. Missing usage is not zero usage. Whole
+  and a concrete opaque detail handle. Node evidence includes recorded
+  dependencies and the runtime's classified error kind when available. Raw
+  provider error text and tool output are excluded. The summary includes
+  measured turn wall time, the longest measured step, observed overlap, and
+  provider token lanes with the number of attempts reporting each lane. Whole
   node and auxiliary-attempt rows retain their measurement basis; terminal and
   coverage facts remain present even when all optional rows are omitted.
   `depth="diagnostic"` or `depth="forensic"` selects the first raw byte window
   instead. Detail pages use `introspect(artifact="…", offset=…, max_bytes=…)`;
-  start at offset zero when moving from the summary to raw detail.
-  the moving `previous` selector is never a pagination cursor.
+  start at offset zero when moving from the summary to raw detail. Read a
+  known Explain handle with `depth="summary"` at offset zero to get the same
+  structured facts through one artifact lookup. The moving `previous` selector
+  is never a pagination cursor.
 - `explain` and `artifact` are mutually exclusive; discovery requires offset
   zero. `live_only` and `local_only` exclude server snapshot discovery.
   Unsupported execution contexts, including the local CLI/Edge selector, return

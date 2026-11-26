@@ -122,7 +122,8 @@ pub use explain_analyze::{
     ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
-    ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
+    ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeObservedProviderUsage,
+    ExplainAnalyzeObservedTokenLane, ExplainAnalyzeProjectedNodeV1,
     ExplainAnalyzeProjectionApplyResultV1, ExplainAnalyzeProjectionDiagnosticCodeV1,
     ExplainAnalyzeProjectionDiagnosticV1, ExplainAnalyzeProjectionDiagnosticsV1,
     ExplainAnalyzeScopeCoverageV1,

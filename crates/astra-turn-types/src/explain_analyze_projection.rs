@@ -48,6 +48,24 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub conflicted: bool,
 }
 
+/// Provider-reported tokens in one lane. Missing values never contribute a zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExplainAnalyzeObservedTokenLane {
+    pub tokens: u128,
+    pub reporting_attempts: usize,
+}
+
+/// Measurements across observed primary provider attempts. Auxiliary stage
+/// usage and runtime estimates are excluded. Coverage is per lane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExplainAnalyzeObservedProviderUsage {
+    pub attempts: usize,
+    pub fresh_input: ExplainAnalyzeObservedTokenLane,
+    pub cache_read: ExplainAnalyzeObservedTokenLane,
+    pub cache_creation: ExplainAnalyzeObservedTokenLane,
+    pub output: ExplainAnalyzeObservedTokenLane,
+}
+
 /// Capture coverage for one physical Explain Analyze execution scope.
 ///
 /// A logical turn can contain more than one scope when execution is retried,
@@ -429,6 +447,51 @@ impl ExplainAnalyzeGraphV1 {
 
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
+    }
+
+    /// Longest measured step, excluding enclosing run, turn, round and batch spans.
+    pub fn longest_measured_step(&self) -> Option<(usize, &ExplainAnalyzeProjectedNodeV1)> {
+        use ExplainAnalyzeNodeKindV1::*;
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.terminal_observed
+                    && !node.conflicted
+                    && node.duration_ms.is_some()
+                    && !matches!(node.kind, Run | Turn | ModelRound | ToolBatch)
+            })
+            .max_by_key(|(index, node)| (node.duration_ms, std::cmp::Reverse(*index)))
+    }
+
+    pub fn observed_provider_usage(&self) -> ExplainAnalyzeObservedProviderUsage {
+        let mut observed = ExplainAnalyzeObservedProviderUsage::default();
+        for node in self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::ProviderAttempt)
+        {
+            observed.attempts += 1;
+            let Some(usage) = node.usage.as_ref().filter(|usage| {
+                node.terminal_observed
+                    && !node.conflicted
+                    && usage.basis != crate::ExplainAnalyzeUsageBasisV1::RuntimeEstimated
+            }) else {
+                continue;
+            };
+            for (lane, value) in [
+                (&mut observed.fresh_input, usage.fresh_input_tokens),
+                (&mut observed.cache_read, usage.cache_read_tokens),
+                (&mut observed.cache_creation, usage.cache_creation_tokens),
+                (&mut observed.output, usage.output_tokens),
+            ] {
+                if let Some(value) = value {
+                    lane.tokens += u128::from(value);
+                    lane.reporting_attempts += 1;
+                }
+            }
+        }
+        observed
     }
 
     /// Exact primary input buckets across all observed execution scopes.
