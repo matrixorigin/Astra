@@ -1317,8 +1317,10 @@ mod compact_surface_tests {
             pane.handle_session_key_at(tab, Instant::now(), &history);
             assert_eq!(pane.composer.text(), query);
 
-            assert!(draw(&mut pane, 8).contains(candidate));
-            let short = draw(&mut pane, 6);
+            // The unframed composer leaves a row for suggestions at six
+            // rows. At five it preserves the input, live reply and status.
+            assert!(draw(&mut pane, 6).contains(candidate));
+            let short = draw(&mut pane, 5);
             assert!(
                 short.contains(query) && short.contains("Working"),
                 "{short}"
@@ -1330,7 +1332,7 @@ mod compact_surface_tests {
             pane.handle_session_key_at(tab, Instant::now(), &history);
             assert_eq!(pane.composer.text(), query);
 
-            assert!(draw(&mut pane, 8).contains(candidate));
+            assert!(draw(&mut pane, 6).contains(candidate));
             pane.handle_session_key_at(tab, Instant::now(), &history);
             assert_eq!(pane.composer.text(), candidate);
         }
