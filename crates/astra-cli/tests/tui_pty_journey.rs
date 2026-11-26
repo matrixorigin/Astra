@@ -2266,6 +2266,16 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
 
+    astra.paste_and_submit("/help");
+    astra.wait_for_screen("command browser actions", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Featured") && screen.contains("Enter insert · Esc close")
+    });
+    astra.write(b"/");
+    astra.wait_for("│› /", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Tab insert", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
     astra.write(b"\x1b[200~/session hstr\x1b[201~");
     astra.wait_for_screen(
         "fuzzy subcommand and keyboard actions",

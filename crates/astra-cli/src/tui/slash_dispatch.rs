@@ -3137,9 +3137,9 @@ fn context_dump_argument(args: &str) -> Option<&str> {
 // ── /model subcommand helpers ───────────────────────────────────
 
 pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
-    "Type to filter | Enter to choose | Some models then ask for thinking mode | Esc to go back";
+    "↑↓ select · Enter choose · Esc close · Type to filter · Supported models ask for thinking mode";
 pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
-    "Type to filter | Enter to finish model selection | Esc to go back";
+    "↑↓ select · Enter finish model selection · Esc back · Type to filter";
 
 /// `/model` with no args (or `list`) — fetch the catalog and push
 /// the picker. The typed result lets the outer loop check the model's

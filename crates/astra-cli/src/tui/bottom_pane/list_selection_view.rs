@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion, ViewResult};
 
@@ -18,7 +19,7 @@ pub(crate) struct SelectionItem {
 pub(crate) struct ListSelectionView {
     items: Vec<SelectionItem>,
     header: Option<String>,
-    footer_hint: Option<String>,
+    footer_hint: String,
     selected: usize,
     filter: String,
     completed: bool,
@@ -30,14 +31,14 @@ pub(crate) struct ListSelectionView {
 }
 
 impl ListSelectionView {
-    const DEFAULT_FOOTER_HINT: &str = "Type to filter | Enter to confirm | Esc to go back";
+    const DEFAULT_FOOTER_HINT: &str = "↑↓ select · Enter choose · Esc close · Type to filter";
 
     pub fn new(items: Vec<SelectionItem>, header: Option<String>) -> Self {
         let initial_sel = items.iter().position(|i| i.is_current).unwrap_or(0);
         Self {
             items,
             header,
-            footer_hint: Some(Self::DEFAULT_FOOTER_HINT.into()),
+            footer_hint: Self::DEFAULT_FOOTER_HINT.into(),
             selected: initial_sel,
             filter: String::new(),
             completed: false,
@@ -60,7 +61,7 @@ impl ListSelectionView {
     }
 
     pub fn with_footer_hint(mut self, hint: impl Into<String>) -> Self {
-        self.footer_hint = Some(hint.into());
+        self.footer_hint = hint.into();
         self
     }
 
@@ -103,111 +104,78 @@ impl BottomPaneView for ListSelectionView {
         let dim = Style::default().fg(theme.dim);
         let mut y = area.y;
 
-        // Header
-        if let Some(ref hdr) = self.header {
-            if y < area.bottom() {
-                let line = Line::from(Span::styled(format!("  {hdr}"), dim));
-                Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
-                y += 1;
+        if area.height > 1 && (self.header.is_some() || !self.filter.is_empty()) {
+            let mut heading = vec![Span::raw("  ")];
+            if let Some(title) = &self.header {
+                let title_style = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
+                heading.push(Span::styled(title.as_str(), title_style));
             }
+            if !self.filter.is_empty() {
+                let separator = if self.header.is_some() { " · " } else { "" };
+                heading.push(Span::styled(format!("{separator}Filter · {}", self.filter), dim));
+            }
+            buf.set_line(area.x, y, &Line::from(heading), area.width);
+            y += 1;
         }
 
-        // Items
         let filtered = self.filtered_items();
-        let visible_start = if self.selected >= MAX_VISIBLE {
-            self.selected - MAX_VISIBLE + 1
-        } else {
-            0
-        };
-        let visible_end = (visible_start + MAX_VISIBLE).min(filtered.len());
-
-        for (vi, &(_, item)) in filtered[visible_start..visible_end].iter().enumerate() {
-            if y >= area.bottom() {
-                break;
-            }
-            let idx = visible_start + vi;
-            let is_sel = idx == self.selected;
-
-            let marker = if is_sel { "› " } else { "  " };
-            let num = format!("{}. ", idx + 1);
-            let current_tag = if item.is_current { " (current)" } else { "" };
-
-            let sel_style = Style::default()
-                .fg(theme.selected_fg)
-                .bg(theme.selected_bg)
-                .add_modifier(Modifier::BOLD);
-
-            let mut spans = if is_sel {
-                vec![
-                    Span::styled("  ", sel_style),
-                    Span::styled(marker, sel_style),
-                    Span::styled(num, sel_style),
-                    Span::styled(format!("{}{}", item.name, current_tag), sel_style),
-                ]
-            } else {
-                vec![
-                    Span::raw("  "),
-                    Span::raw(marker),
-                    Span::raw(num),
-                    Span::raw(format!("{}{}", item.name, current_tag)),
-                ]
-            };
-
-            if let Some(ref desc) = item.description {
-                let budget =
-                    (area.width as usize).saturating_sub(8 + item.name.len() + current_tag.len());
-                if budget > 5 {
-                    let d: String = desc.chars().take(budget).collect();
-                    spans.push(Span::raw("  "));
-                    if is_sel {
-                        spans.push(Span::styled(d, sel_style));
-                    } else {
-                        spans.push(Span::styled(d, dim));
-                    }
-                }
-            }
-
-            Widget::render(Line::from(spans), Rect::new(area.x, y, area.width, 1), buf);
-            y += 1;
-        }
-
         if filtered.is_empty() && y < area.bottom() {
-            let line = Line::from(Span::styled("  no matches", dim));
-            Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
-            y += 1;
+            buf.set_line(area.x, y, &Line::styled("  No matches", dim), area.width);
+            return;
         }
 
-        // Blank line + footer hint
-        if y < area.bottom() {
-            y += 1;
-        }
-        if let Some(ref hint) = self.footer_hint {
-            if y < area.bottom() {
-                let line = Line::from(Span::styled(format!("  {hint}"), dim));
-                Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
+        let rows = usize::from(area.bottom().saturating_sub(y)).min(MAX_VISIBLE);
+        let start = self.selected.saturating_add(1).saturating_sub(rows);
+        let selected_style = Style::default()
+            .fg(theme.selected_fg)
+            .bg(theme.selected_bg)
+            .add_modifier(Modifier::BOLD);
+
+        for (row, &(_, item)) in filtered.iter().skip(start).take(rows).enumerate() {
+            let selected = row + start == self.selected;
+            let marker = if selected { "› " } else { "  " };
+            let current = if item.is_current { " (current)" } else { "" };
+            let label = format!("  {marker}{}{current}", item.name);
+            let label_style = if selected { selected_style } else { Style::default() };
+            let description_style = if selected { selected_style } else { dim };
+            let remaining = usize::from(area.width).saturating_sub(label.width() + 2);
+            let mut spans = vec![Span::styled(label, label_style)];
+            if let Some(description) = &item.description
+                && remaining > 5
+            {
+                let description =
+                    crate::tui::history_cell::truncate_by_width(description, remaining);
+                spans.push(Span::styled(format!("  {description}"), description_style));
             }
+            let row_area = Rect::new(area.x, y + row as u16, area.width, 1);
+            if selected {
+                buf.set_style(row_area, selected_style);
+            }
+            Widget::render(Line::from(spans), row_area, buf);
         }
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        let header_h = if self.header.is_some() { 1 } else { 0 };
-        let filtered_count = self.filtered_items().len().max(1); // at least 1 for "no matches"
-        let items_h = filtered_count.min(MAX_VISIBLE) as u16;
-        let footer_h = if self.footer_hint.is_some() { 2 } else { 0 }; // blank + hint
-        header_h + items_h + footer_h
+        let heading = u16::from(self.header.is_some() || !self.filter.is_empty());
+        let rows = self.filtered_items().len().clamp(1, MAX_VISIBLE) as u16;
+        heading + rows
+    }
+
+    fn hint_keys(&self) -> Option<String> {
+        Some(self.footer_hint.clone())
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         let filtered_len = self.filtered_items().len();
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
+            KeyCode::Up if filtered_len > 0 => {
                 self.selected = if self.selected == 0 {
                     filtered_len - 1
                 } else {
                     self.selected - 1
                 };
             }
-            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
+            KeyCode::Down if filtered_len > 0 => {
                 self.selected = (self.selected + 1) % filtered_len;
             }
             KeyCode::Enter => self.accept(),
@@ -269,13 +237,33 @@ mod tests {
     fn default_footer_explains_filtering() {
         let view = ListSelectionView::new(vec![], Some("Pick one".into()));
         assert_eq!(
-            view.footer_hint.as_deref(),
+            view.hint_keys().as_deref(),
             Some(ListSelectionView::DEFAULT_FOOTER_HINT)
         );
     }
 
     #[test]
-    fn character_input_filters_candidates_before_accepting() {
+    fn selected_row_stays_visible_in_a_short_picker() {
+        let items = ["First", "Second", "Last"]
+            .into_iter()
+            .map(|name| SelectionItem {
+                name: name.into(),
+                description: None,
+                is_current: false,
+            })
+            .collect();
+        let mut view = ListSelectionView::new(items, Some("Select model".into()));
+        view.handle_key(key(KeyCode::Up));
+
+        let area = ratatui::layout::Rect::new(0, 0, 28, 2);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        view.render(area, &mut buffer);
+        let screen = crate::tui::testing::render::buffer_to_string(&buffer);
+        assert!(screen.contains("› Last"), "{screen}");
+    }
+
+    #[test]
+    fn typing_k_filters_candidates_before_accepting() {
         let mut view = ListSelectionView::new(
             vec![
                 SelectionItem {
@@ -284,7 +272,7 @@ mod tests {
                     is_current: false,
                 },
                 SelectionItem {
-                    name: "Research (Anthropic)".into(),
+                    name: "Kimi (Anthropic)".into(),
                     description: None,
                     is_current: false,
                 },
@@ -300,7 +288,7 @@ mod tests {
             },
         ]);
 
-        for ch in "research".chars() {
+        for ch in "kimi".chars() {
             view.handle_key(key(KeyCode::Char(ch)));
         }
         view.handle_key(key(KeyCode::Enter));

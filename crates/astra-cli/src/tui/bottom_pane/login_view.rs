@@ -108,8 +108,8 @@ impl BottomPaneView for LoginView {
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
-    fn reserve_status_footer(&self) -> bool {
-        false
+    fn hint_keys(&self) -> Option<String> {
+        self.0.hint_keys()
     }
 }
 #[cfg(test)]
@@ -149,6 +149,10 @@ mod tests {
         assert_eq!(cell.fg, ratatui::style::Color::Reset);
         assert_eq!(cell.bg, ratatui::style::Color::Reset);
         assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+
+        let (x, y) = view.cursor_pos(Rect::new(0, 0, 100, 10)).unwrap();
+        assert_eq!(buf[(x - 1, y)].symbol(), "X");
+        assert!(view.cursor_pos(Rect::new(0, 0, 8, 10)).is_none());
     }
 
     #[test]
@@ -159,8 +163,9 @@ mod tests {
         assert!(s.contains("/login"));
         assert!(s.contains("Username"));
         assert!(s.contains("Password"));
-        assert!(s.contains("Enter submit"));
-        assert!(s.contains("Esc"));
+        let hints = v.hint_keys().unwrap();
+        assert!(hints.contains("Enter submit"));
+        assert!(hints.contains("Esc cancel"));
     }
 
     #[test]

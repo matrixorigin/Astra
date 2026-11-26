@@ -624,7 +624,7 @@ impl BottomPaneView for TaskInputView {
                 " Send input ",
                 task_id.as_str(),
                 " · running ",
-                "Input goes only to this process; Enter sends a line.",
+                "Input goes only to this process.",
             ),
         };
         let block = Block::default()

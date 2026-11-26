@@ -56,7 +56,7 @@ impl BottomPaneView for LocalOutputView {
             .border_type(BorderType::Rounded)
             .border_style(dim)
             .title(format!(" Shell output · {} · private ", self.task_id))
-            .title_style(Style::default().fg(theme.accent).bold());
+            .title_style(Style::default().fg(theme.fg).bold());
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.width == 0 || inner.height == 0 {

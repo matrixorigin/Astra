@@ -428,15 +428,15 @@ impl BottomPaneView for ConfigEditView {
 
     fn hint_keys(&self) -> Option<String> {
         if self.preview {
-            return Some("preview · any key returns".into());
+            return Some("Esc back".into());
         }
         if self.save_prompt.is_some() {
-            return Some("↑↓ move · Enter confirm · Esc back".into());
+            return Some("↑↓ select · Enter confirm · Esc back".into());
         }
         if let Some(ref inner) = self.inner {
             return Some(inner.hint_keys().to_string());
         }
-        Some("↑↓ navigate · Enter edit · type to search · Esc save/close".into())
+        Some("↑↓ select · Enter edit · Esc finish editing · Type to filter".into())
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -608,16 +608,11 @@ impl InnerEditor for BoolEditor {
             ]);
             lines.push(line);
         }
-        lines.push(Line::from(Span::styled(
-            "  (↑↓ move, space toggle, Enter save, Esc cancel)",
-            hint,
-        )));
         Widget::render(Paragraph::new(lines), area, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        // label + 2 options + hint = 4 rows
-        4
+        3
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> InnerOutcome {
@@ -639,7 +634,7 @@ impl InnerEditor for BoolEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        "↑↓ move · space toggle · Enter save · Esc cancel"
+        "↑↓ select · Space toggle · Enter apply · Esc back"
     }
     fn kind_label(&self) -> &'static str {
         "bool"
@@ -766,9 +761,9 @@ impl InnerEditor for ValueEditor {
                 Span::styled(
                     match self.number {
                         Some((min, max, _)) => {
-                            format!("    (range {min}..={max}, Enter saves, Esc cancels)")
+                            format!("    range {min}..={max}")
                         }
-                        None => "    #RRGGBB or auto · Enter apply · Esc cancel".to_string(),
+                        None => "    #RRGGBB or auto".to_string(),
                     },
                     hint,
                 ),
@@ -831,13 +826,7 @@ impl InnerEditor for ValueEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        match self.number {
-            Some((_, _, true)) => {
-                "digits/decimal to edit · Backspace erase · Enter save · Esc cancel"
-            }
-            Some(_) => "digits to edit · Backspace erase · Enter save · Esc cancel",
-            None => "type or paste · Backspace erase · Enter save · Esc cancel",
-        }
+        "Enter apply · Esc back · Backspace erase"
     }
     fn kind_label(&self) -> &'static str {
         if self.number.is_some() {
@@ -904,15 +893,11 @@ impl InnerEditor for EnumEditor {
             ]);
             lines.push(line);
         }
-        lines.push(Line::from(Span::styled(
-            "  (↑↓ move, Enter saves, Esc cancels)",
-            hint,
-        )));
         Widget::render(Paragraph::new(lines), area, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        (2 + self.options.len() as u16).min(8)
+        (1 + self.options.len() as u16).min(8)
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> InnerOutcome {
@@ -943,7 +928,7 @@ impl InnerEditor for EnumEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        "↑↓ move · Enter save · Esc cancel"
+        "↑↓ select · Enter apply · Esc back"
     }
     fn kind_label(&self) -> &'static str {
         "enum"
@@ -1050,12 +1035,12 @@ fn project_path_label() -> String {
 }
 
 fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
-    let head = Style::default()
-        .fg(crate::tui::theme::current().accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(crate::tui::theme::current().dim);
+    let theme = crate::tui::theme::current();
+    let head = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
     let sel = Style::default()
-        .fg(crate::tui::theme::current().accent)
+        .fg(theme.selected_fg)
+        .bg(theme.selected_bg)
         .add_modifier(Modifier::BOLD);
 
     let rows: [(&str, String); 4] = [
@@ -1083,11 +1068,6 @@ fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
             Span::styled(label.clone(), label_style),
         ]));
     }
-    lines.push(Line::from(Span::raw("")));
-    lines.push(Line::from(Span::styled(
-        "  ↑↓ move · Enter confirm · Esc back · [1][2][v][d] shortcuts",
-        dim,
-    )));
     Widget::render(Paragraph::new(lines), area, buf);
 }
 
