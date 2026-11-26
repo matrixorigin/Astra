@@ -1320,7 +1320,8 @@ mod tests {
         );
         let html = std::fs::read_to_string(path).expect("HTML report");
         assert!(html.starts_with("<!doctype html>"), "{html}");
-        assert!(html.contains("Execution workspace"), "{html}");
+        assert!(html.contains("id=\"execution-tree\""), "{html}");
+        assert!(html.contains(events[0].label.as_str()), "{html}");
     }
 
     #[test]
