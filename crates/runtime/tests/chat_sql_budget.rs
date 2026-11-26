@@ -400,6 +400,36 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
         &ctx.session_id,
     )
     .unwrap();
+    let sessions_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE user_id = ?")
+            .bind(&ctx.user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    let (status, error) = post_json(
+        &ctx.app,
+        "/chat",
+        Some(auth),
+        json!({
+            "message":"continue",
+            "model_selection":seeded_model_selection(ctx),
+            "attached_session_cursor":empty.cursor(),
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{error}");
+    assert_eq!(error["error_code"], "session_attachment_mismatch");
+    assert_eq!(error["metadata"]["admission_state"], "rejected");
+    let sessions_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE user_id = ?")
+            .bind(&ctx.user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sessions_after, sessions_before,
+        "an invalid attachment cannot create a Session"
+    );
     let missing = chat(Some(json!(empty.cursor()))).await;
     assert!(
         missing
@@ -450,8 +480,17 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
         .find(|e| e["type"] == "run_finished")
         .expect("the failed Run replays its terminal");
     assert_eq!(terminal["status"], "failed", "{repair:?}");
+    assert_eq!(
+        terminal["error_code"], "session_context_needs_repair",
+        "{repair:?}"
+    );
     assert_eq!(terminal["run_id"], opening["run_id"], "{repair:?}");
     assert!(terminal["owner_generation"].is_u64(), "{repair:?}");
+    assert!(
+        repair.iter().any(|event| event["type"] == "run_error"
+            && event["error_code"] == "session_context_needs_repair"),
+        "{repair:?}"
+    );
     assert_eq!(b.ctx.native_provider_requests().await.len(), 3);
     let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ?")
         .bind(&b.ctx.user_id)

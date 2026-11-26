@@ -68,10 +68,6 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
     });
     if let Some(server_turn) = input.admitted_server_turn
         && (!server_turn.attachment_owner.is_current()
-            || server_turn
-                .auth_owner
-                .as_ref()
-                .is_some_and(|owner| !owner.is_current())
             || state
                 .server_resume_attachment
                 .as_ref()
@@ -585,9 +581,11 @@ pub(crate) async fn refresh_attached_turn_for_test(
     token: &str,
 ) -> Result<String, String> {
     let session_id = state.session_id.clone().expect("restored Session");
-    let admission = super::turn_entry::acquire_interactive_turn_admission(state, api, None, token)
-        .await?
-        .expect("Session admission");
+    let auth_owner =
+        crate::cli::session::session_runtime::capture_admitted_auth_owner(api, None, token).await;
+    let admission =
+        super::turn_entry::acquire_interactive_turn_admission(state, api, auth_owner.as_ref())?
+            .expect("Session admission");
     let attached = admission.server_turn.as_ref().expect("Server attachment");
     super::turn_retry::refresh_stale_continuation(state, &session_id, token, attached).await
 }
@@ -601,9 +599,11 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
     fail_primary_append: bool,
 ) -> Result<(u32, Vec<serde_json::Value>, u32), String> {
     let session_id = state.session_id.clone().expect("restored session");
+    let auth_owner =
+        crate::cli::session::session_runtime::capture_admitted_auth_owner(api, None, input_token)
+            .await;
     let admission =
-        super::turn_entry::acquire_interactive_turn_admission(state, api, None, input_token)
-            .await?;
+        super::turn_entry::acquire_interactive_turn_admission(state, api, auth_owner.as_ref())?;
     assert!(
         matches!(
             astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),

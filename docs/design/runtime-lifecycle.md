@@ -344,8 +344,9 @@ model context, including changes made from other surfaces.
 
 A typed pre-admission rejection for a stale cursor or an inactive owned Session
 allows one bounded continuation refresh and one retry under the same local
-lease and owner binding. The refresh has a 30-second deadline and observes
-cancellation. A captured owner may refresh its own bearer after a 401. An
+lease and owner binding. Authentication is captured before acquiring the lease.
+Continuation and attached bearer recovery share a cancellable wait with a
+30-second deadline. A captured owner may refresh its own bearer after a 401. An
 explicit environment bearer has no profile refresh authority. An ambiguous
 send, failed authorization, missing or deleted Session, or invalid continuation
 does not authorize an execution retry. The CLI retains the draft on rejection.

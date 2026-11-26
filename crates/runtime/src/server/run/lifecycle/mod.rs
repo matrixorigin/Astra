@@ -15943,6 +15943,33 @@ impl AgenticRunLifecycleService {
         Ok(())
     }
 
+    fn validate_attached_session_cursor(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let Some(cursor) = request.attached_session_cursor.as_ref()
+            && (self.shared_pool.is_none()
+                || !request.session_id.as_deref().is_some_and(|session| {
+                    astra_turn_types::SessionKeyV1::owner_session(
+                        "server",
+                        user_id,
+                        session,
+                        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+                    )
+                    .validates_cursor(cursor)
+                }))
+        {
+            return Err(error_response_coded_with_metadata(
+                StatusCode::FORBIDDEN,
+                "The Server attachment no longer matches this account or Session",
+                "session_attachment_mismatch",
+                json!({"admission_state": "rejected"}),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
     async fn create_run_with_session_impl(
         &self,
@@ -15950,6 +15977,7 @@ impl AgenticRunLifecycleService {
         request: ChatRequestData,
         create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.validate_attached_session_cursor(&user_id, &request)?;
         let NewRunPreparation::Owned { execution, .. } = self
             .prepare_new_owned_execution(user_id, request, None, false, create_session)
             .await?
@@ -15978,25 +16006,7 @@ impl AgenticRunLifecycleService {
         self.require_invocation_composition()?;
         self.authorize_fork_session_request(&user_id, &request)
             .await?;
-        if let Some(cursor) = request.attached_session_cursor.as_ref() {
-            let valid = request.session_id.as_deref().is_some_and(|session| {
-                astra_turn_types::SessionKeyV1::owner_session(
-                    "server",
-                    &user_id,
-                    session,
-                    astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
-                )
-                .validates_cursor(cursor)
-            });
-            if !valid || self.shared_pool.is_none() {
-                return Err(error_response_coded_with_metadata(
-                    StatusCode::FORBIDDEN,
-                    "The Server attachment no longer matches this account or Session",
-                    "session_attachment_mismatch",
-                    json!({"admission_state": "rejected"}),
-                ));
-            }
-        }
+        self.validate_attached_session_cursor(&user_id, &request)?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
         // Replays consume frozen execution facts before mutable admission.
         if let Some(identity) = start_identity.as_ref()
@@ -16397,7 +16407,7 @@ impl AgenticRunLifecycleService {
                             error_response_coded(
                                 StatusCode::CONFLICT,
                                 format!("canonical Context requires repair: {error}"),
-                                "session_context_needs_repair",
+                                PreSpawnFailureCode::SessionContextNeedsRepair.as_str(),
                             )
                         })?;
                 if attached {
@@ -16405,7 +16415,8 @@ impl AgenticRunLifecycleService {
                         &materialized.messages,
                     )
                     .map_err(|(status, mut error)| {
-                        error.0.error_code = Some("session_context_needs_repair".into());
+                        error.0.error_code =
+                            Some(PreSpawnFailureCode::SessionContextNeedsRepair.as_str().into());
                         (status, error)
                     })?;
                 }
@@ -17084,6 +17095,9 @@ impl AgenticRunLifecycleService {
             }),
             Err(error) => {
                 let generation = execution_owner_generation;
+                let repair_code = PreSpawnFailureCode::SessionContextNeedsRepair;
+                let needs_context_repair =
+                    error.1.0.error_code.as_deref() == Some(repair_code.as_str());
                 // A heartbeat can lose ownership before preparation reaches
                 // final activation. That producer must not settle the run;
                 // leave its durable row and workspace to fenced recovery.
@@ -17093,7 +17107,11 @@ impl AgenticRunLifecycleService {
                     } else {
                         let mut events = pre_spawn_failure_terminal_events(
                             &error.1.0.detail,
-                            PreSpawnFailureCode::PreSpawnFailure,
+                            if needs_context_repair {
+                                repair_code
+                            } else {
+                                PreSpawnFailureCode::PreSpawnFailure
+                            },
                             empty_pre_admission_terminal(),
                         );
                         Self::stamp_run_finished_owner_generation(&mut events, generation);
@@ -17141,11 +17159,7 @@ impl AgenticRunLifecycleService {
                     )
                     .await;
                 }
-                if committed
-                    && streaming
-                    && attached
-                    && error.1.0.error_code.as_deref() == Some("session_context_needs_repair")
-                {
+                if committed && streaming && attached && needs_context_repair {
                     // This was an admitted Run. Replay its exact durable terminal
                     // instead of returning a pre-admission-shaped SSE error.
                     return Ok(NewRunPreparation::Existing { run_id });
