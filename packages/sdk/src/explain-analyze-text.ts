@@ -263,7 +263,7 @@ function renderNode(
 export function explainAnalyzeDecisionDetailLine(
   detail: ExplainAnalyzeDecisionDetailV1,
 ): string {
-  if (detail.kind === "failure") return "Error · " + detail.error_kind.replaceAll("_", " ");
+  if (detail.kind === "failure") return "Error · " + detail.error_kind.replace(/_/g, " ");
   const requirement = detail.requirement_index + 1;
   if (detail.match_count === 0) {
     return `Requested model requirement ${requirement}: no active authorized Chat-capable model exactly matched in the current catalog snapshot; no child was started.`;
