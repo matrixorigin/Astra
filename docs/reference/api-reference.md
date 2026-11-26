@@ -585,9 +585,11 @@ with its `session_id`. Both chat endpoints validate the attachment identity
 before allocating a Session. During Run admission the Server checks the cursor
 against the owned canonical head. A stale cursor on `POST /chat/stream` emits
 `session_continuation_stale` with `metadata.admission_state: rejected` and the
-current cursor. A committed Context advance exposes `canonical_context_cursor`
-on the Run's `run_finished` event, including replay. If an admitted Run cannot
-load its attached Context, its terminal replay retains
+current cursor. A cancelled, paused, ended, or closed attached Session emits
+`session_resume_required` with `metadata.admission_state: rejected`. The client can
+resume the Session and retry once. A committed Context advance exposes
+`canonical_context_cursor` on the Run's `run_finished` event, including replay.
+If an admitted Run cannot load its attached Context, its terminal replay retains
 `session_context_needs_repair` and the Run identity.
 For Provider `context.task_ref` retries, the expected cursor is part of the
 request identity. Changing it returns `provider_task_ref_request_mismatch`.

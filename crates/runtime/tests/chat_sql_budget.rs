@@ -461,7 +461,38 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
             .any(|e| e["error_code"] == "session_attachment_mismatch"),
         "{rejected:?}"
     );
-    let third = committed(chat(Some(second.clone())).await);
+    let (status, cancelled) = post_json(
+        &ctx.app,
+        &format!("/sessions/{}/cancel", ctx.session_id),
+        Some(auth),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["execution_settled"], true);
+
+    let inactive = chat(Some(second.clone())).await;
+    assert!(
+        inactive
+            .iter()
+            .any(|event| event["error_code"] == "session_resume_required"
+                && event["metadata"]["admission_state"] == "rejected"),
+        "{inactive:?}"
+    );
+    assert!(!inactive.iter().any(|event| event["type"] == "session_info"));
+
+    let (status, resumed) = post_json(
+        &ctx.app,
+        &format!("/sessions/{}/resume?continuation_only=true", ctx.session_id),
+        Some(auth),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{resumed}");
+    let resumed_cursor = resumed["resume_bundle"]["cursor"].clone();
+    assert_eq!(resumed_cursor, second);
+    let third = committed(chat(Some(resumed_cursor)).await);
     assert!(third["conversation_seq"].as_u64() > second["conversation_seq"].as_u64());
     // Break the stored content without changing the admitted head identity.
     sqlx::query("UPDATE conversation_manifest_nodes SET content_json = '[]' WHERE owner_user_id = ? AND session_id = ?")

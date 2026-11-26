@@ -1365,11 +1365,12 @@ where
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
     let status: String = row.try_get("status")?;
-    if matches!(status.as_str(), "ended" | "closed") {
-        return Ok(IndependentRunSessionAdmission::Inactive);
-    }
-    if status != "active" {
-        return Err(sqlx::Error::RowNotFound);
+    match status.as_str() {
+        "active" => {}
+        "ended" | "closed" | astra_core::STATUS_CANCELLED | astra_core::STATUS_PAUSED => {
+            return Ok(IndependentRunSessionAdmission::Inactive);
+        }
+        _ => return Err(sqlx::Error::RowNotFound),
     }
     if row.try_get::<i64, _>("execution_active")? != 0 {
         return Ok(IndependentRunSessionAdmission::Busy);
