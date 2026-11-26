@@ -4,6 +4,7 @@ use astra_turn_types::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
+    canonical_conversation_append_identity, canonical_conversation_identity,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -164,22 +165,31 @@ impl ActiveConversation {
     ) -> Result<Option<Self>, ActiveConversationError> {
         let mut cursor = Self::empty(owner_id, session_id)?.cursor;
         let mut messages = Vec::new();
+        let mut canonical_bytes = 2; // The empty canonical JSON array.
         let mut found = false;
         for commit in commits {
             validate_commit_identity(&cursor, &commit)?;
             if commit.base_root_hash != cursor.canonical_root_hash {
                 return Err(ActiveConversationError::BaseRootMismatch);
             }
-            match commit.delta {
-                ConversationDeltaV1::Append { messages: appended } => messages.extend(appended),
+            let (root, bytes) = match commit.delta {
+                ConversationDeltaV1::Append { messages: appended } => {
+                    let prefix_len = messages.len();
+                    messages.extend(appended);
+                    canonical_conversation_append_identity(&messages, prefix_len, canonical_bytes)
+                }
                 ConversationDeltaV1::Replace {
                     messages: replacement,
                     ..
-                } => messages = replacement,
-            }
-            if canonical_conversation_root(&messages) != commit.cursor.canonical_root_hash {
+                } => {
+                    messages = replacement;
+                    canonical_conversation_identity(&messages)
+                }
+            };
+            if root != commit.cursor.canonical_root_hash {
                 return Err(ActiveConversationError::RootMismatch);
             }
+            canonical_bytes = bytes;
             cursor = commit.cursor;
             found = true;
         }
@@ -477,6 +487,44 @@ mod tests {
         assert_eq!(
             canonical_conversation_root(&[json!({"role": "user", "content": "hi"})]),
             canonical_conversation_root(&[json!({"content": "hi", "role": "user"})])
+        );
+    }
+
+    #[test]
+    fn replay_checks_every_root_across_append_and_replacement() {
+        let initial = ActiveConversation::empty("owner", "session").unwrap();
+        let mut active = initial;
+        let mut commits = Vec::new();
+        let mut messages = Vec::new();
+        let mut snapshots = Vec::new();
+        for turn in 1..=7 {
+            match turn {
+                1 | 4 => messages.extend(tool_turn("工具\n")),
+                2 | 7 => messages.push(json!({"nested": {"b": [-1.25, null], "a": true}})),
+                3 | 6 => {} // Empty appends still advance the cursor.
+                5 => messages.clear(),
+                _ => unreachable!(),
+            }
+            let prepared = active.prepare_commit(turn, None, messages.clone()).unwrap();
+            commits.push(prepared.commit);
+            active = prepared.next;
+            snapshots.push(active.clone());
+        }
+        for (index, expected) in snapshots.iter().enumerate() {
+            let replayed =
+                ActiveConversation::replay("owner", "session", commits[..=index].iter().cloned())
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(replayed.messages(), expected.messages());
+            assert_eq!(replayed.cursor(), expected.cursor());
+        }
+        let ConversationDeltaV1::Append { messages } = &mut commits[1].delta else {
+            panic!("expected append");
+        };
+        messages[0] = json!({"nested": {"b": [-1.25, null], "a": null}});
+        assert_eq!(
+            ActiveConversation::replay("owner", "session", commits).unwrap_err(),
+            ActiveConversationError::RootMismatch
         );
     }
 
