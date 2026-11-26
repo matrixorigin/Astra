@@ -2389,6 +2389,62 @@ fn fire_server_loop_observer(
     });
 }
 
+/// Use only the adjacent public dialogue that gave a new user reply its
+/// referent. Do not skip over a tool or a rewritten history boundary.
+fn observer_preceding_question<'a>(
+    state: &'a AgenticLoopState,
+    session_id: &str,
+    current_input: &str,
+) -> Result<Option<(&'a str, &'a str)>, ()> {
+    use astra_turn_types::{is_human_user_message, is_runtime_owned_message, model_replay_origin};
+    let Some(index) = state.messages.iter().rposition(is_human_user_message) else {
+        return Ok(None);
+    };
+    if state.messages[index]["content"].as_str().map(str::trim) != Some(current_input.trim()) {
+        return Ok(None);
+    }
+    let Some((prior_assistant, earlier)) = state.messages[..index].split_last() else {
+        return Ok(None);
+    };
+    let Some(question) = prior_assistant["content"].as_str().map(str::trim) else {
+        return Ok(None);
+    };
+    if prior_assistant["role"] != "assistant" || !question.ends_with(['?', '？']) {
+        return Ok(None);
+    }
+
+    // A question is present. Losing its context would turn the reply into a
+    // standalone statement, so skip observation if the evidence is unsafe.
+    let prior_user = earlier.last().ok_or(())?;
+    if !is_human_user_message(prior_user)
+        || is_runtime_owned_message(prior_assistant)
+        || prior_assistant.get("tool_calls").is_some()
+        || prior_assistant.get("function_call").is_some()
+        || crate::turn::agentic_loop::finalization::terminal_context_omitted(prior_assistant)
+    {
+        return Err(());
+    }
+    for value in [prior_user, prior_assistant] {
+        if value
+            .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+            .is_some()
+        {
+            let origin = model_replay_origin(value).ok_or(())?;
+            if origin.runtime_generated || origin.session_id != session_id {
+                return Err(());
+            }
+        }
+    }
+    let opening = prior_user["content"].as_str().ok_or(())?.trim();
+    if opening.is_empty()
+        || opening.chars().nth(OBSERVER_MESSAGE_CHARS).is_some()
+        || question.chars().nth(OBSERVER_MESSAGE_CHARS).is_some()
+    {
+        return Err(());
+    }
+    Ok(Some((opening, question)))
+}
+
 fn build_server_loop_observer_request(
     user_id: &str,
     session_id: &str,
@@ -2462,7 +2518,23 @@ fn build_server_loop_observer_request(
     {
         answer = "";
     }
-    let mut messages = vec![message("user", content)];
+    let mut messages = Vec::with_capacity(4);
+    let mut exchange_bytes = "[user]: \n[assistant]: \n".len() + content.len() + answer.len();
+    if applied.is_empty()
+        && let Some((opening, question)) =
+            observer_preceding_question(state, session_id, user_message).ok()?
+    {
+        exchange_bytes += "[user]: \n[assistant]: \n".len() + opening.len() + question.len();
+        if exchange_bytes.saturating_sub(answer.len()) > OBSERVER_EXCHANGE_BYTES {
+            return None;
+        }
+        if exchange_bytes > OBSERVER_EXCHANGE_BYTES {
+            answer = "";
+        }
+        messages.push(message("user", opening.to_owned()));
+        messages.push(message("assistant", question.to_owned()));
+    }
+    messages.push(message("user", content));
     if !answer.is_empty() {
         messages.push(message("assistant", answer.to_owned()));
     }
@@ -3303,6 +3375,35 @@ mod tests {
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.turn_count, 3);
+    }
+
+    #[test]
+    fn server_loop_observer_retains_the_immediate_public_question_for_a_new_run() {
+        let mut state = observer_test_state();
+        state.messages = vec![
+            json!({"role":"user","content":"I prefer Rust."}),
+            json!({"role":"assistant","content":"Use Go instead?"}),
+            json!({"role":"user","content":"Yes."}),
+            json!({"role":"assistant","content":"Okay."}),
+        ];
+        state.final_text = "Okay.".into();
+        let build = |state: &AgenticLoopState| {
+            build_server_loop_observer_request("owner", "session", "Yes.", state)
+        };
+        let request = build(&state).unwrap();
+        let dialogue = request
+            .messages
+            .iter()
+            .map(|message| message["content"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dialogue,
+            ["I prefer Rust.", "Use Go instead?", "Yes.", "Okay."]
+        );
+        state
+            .messages
+            .insert(1, json!({"role":"tool","content":"private tool payload"}));
+        assert!(build(&state).is_none());
     }
 
     #[test]

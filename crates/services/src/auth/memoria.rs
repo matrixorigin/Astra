@@ -32,6 +32,24 @@ impl MemoryAccess {
             _ => None,
         }
     }
+    pub fn runtime_denial_message(
+        self,
+        write: bool,
+        owner_scoped_master: bool,
+    ) -> Option<&'static str> {
+        let message = self.denial_message(write)?;
+        // Built-in grants belong to the hosting product's workspace.
+        Some(match (owner_scoped_master, write) {
+            (true, true) => {
+                "Memory access is read-only. Ask your workspace memory administrator to grant memory.write before saving or modifying memories."
+            }
+            (true, false) => {
+                "Memory read access is not enabled. Ask your workspace memory administrator to grant memory.read."
+            }
+            _ => message,
+        })
+    }
+
     pub fn allows(self, write: bool) -> bool {
         self == Self::ReadWrite
             || (!write && self == Self::ReadOnly)
@@ -526,6 +544,54 @@ impl MemoriaCredentialResolver {
         user: &str,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
         self.resolve_runtime_for_session(user, None).await
+    }
+
+    /// Authenticate the workspace of a user-token memory proxy call. An
+    /// explicit Session must also have a retained proof for that workspace.
+    pub async fn resolve_runtime_for_proxy(
+        &self,
+        principal: &super::AuthPrincipal,
+        session_id: Option<&str>,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        let user = &principal.user.user_id;
+        let Some(subject) = moi_request_subject(user) else {
+            return self.resolve_runtime(user).await;
+        };
+        let super::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin
+        else {
+            return Ok(MemoriaCredentialResolution::Denied);
+        };
+        if context.provider_id != "moi"
+            || context.external_subject != subject
+            || context.provider_scope_id.is_empty()
+        {
+            return Ok(MemoriaCredentialResolution::Denied);
+        }
+        let workspace = &context.provider_scope_id;
+        if let Some(session) = session_id {
+            let bound = crate::session_fork_coordinator::retained_provider_session_owner(
+                self.pool.get(),
+                user,
+                session,
+                &self.encryptor,
+            )
+            .await
+            .map_err(|_| "MOI memory workspace binding cannot be verified")?;
+            if !bound.is_some_and(|scope| {
+                scope.provider_id == context.provider_id && scope.provider_scope_id == *workspace
+            }) {
+                return Ok(MemoriaCredentialResolution::Denied);
+            }
+        }
+        Self::resolve_moi_builtin(
+            &self.provider,
+            self.uc_provider.as_ref(),
+            &self.external_providers,
+            self.external_client.as_ref(),
+            subject,
+            workspace,
+        )
+        .await
     }
 
     pub async fn resolve_runtime_for_session(

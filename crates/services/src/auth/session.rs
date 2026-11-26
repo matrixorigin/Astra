@@ -19,7 +19,7 @@ use uuid::Uuid;
 pub const PROVIDER_SCOPE_PROOF_KEY: &str = "__astra_provider_scope_proof_v1";
 pub const PROVIDER_SCOPE_OWNER_KEY: &str = "__astra_provider_scope_owner_v1";
 pub const PROVIDER_MEMORY_SCOPE_PROOF_KEY: &str = "__astra_provider_memory_scope_proof_v1";
-const PROVIDER_SCOPE_METADATA_KEYS: [&str; 3] = [
+pub const PROVIDER_SCOPE_METADATA_KEYS: [&str; 3] = [
     PROVIDER_SCOPE_PROOF_KEY,
     PROVIDER_SCOPE_OWNER_KEY,
     PROVIDER_MEMORY_SCOPE_PROOF_KEY,

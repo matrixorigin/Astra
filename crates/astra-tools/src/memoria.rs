@@ -525,7 +525,7 @@ fn snapshot_transport_error(error: reqwest::Error) -> String {
 /// A mutation can return a deduplicated record or metadata inherited from an
 /// older record. Write authority permits its receipt, not that stored content.
 /// Project every ordinary write the same way, without an additional read grant.
-fn memory_write_receipt(
+pub fn memory_write_receipt(
     operation: &str,
     args: &Value,
     http_status: reqwest::StatusCode,

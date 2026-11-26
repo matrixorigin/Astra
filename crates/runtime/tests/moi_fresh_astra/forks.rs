@@ -1647,6 +1647,7 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     let fixture = ReviewFixture::new().await;
     let read_only = Arc::new(AtomicBool::new(true));
     let write_only = Arc::new(AtomicBool::new(false));
+    let revoked = Arc::new(AtomicBool::new(false));
     let identity_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let reflection_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1654,18 +1655,20 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     let callback_issuer = base.clone();
     let grant = read_only.clone();
     let write_grant = write_only.clone();
+    let revoked_grant = revoked.clone();
     let calls = identity_calls.clone();
     let reflect_calls = reflection_calls.clone();
     let bridge = Router::new()
         .route("/callback", route_post(move |headers: HeaderMap, Json(body): Json<Value>| {
             let issuer = callback_issuer.clone(); let grant = grant.clone(); let write_grant = write_grant.clone();
+            let revoked_grant = revoked_grant.clone();
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 assert_eq!(headers["authorization"], "Bearer lifecycle-callback-key");
                 assert_eq!(body["action"], "resolve_memory_identity");
                 Json(json!({"code":0,"data":{"external_subject":body["external_subject"],"provider_scope_id":body["provider_scope_id"],
                     "issuer":issuer,"uc_subject":"lifecycle-uc-owner",
-                    "memory_access":if write_grant.load(Ordering::SeqCst) {"write_only"} else if grant.load(Ordering::SeqCst) {"read_only"} else {"read_write"}}}))
+                    "memory_access":if revoked_grant.load(Ordering::SeqCst) {"none"} else if write_grant.load(Ordering::SeqCst) {"write_only"} else if grant.load(Ordering::SeqCst) {"read_only"} else {"read_write"}}}))
             }
         }))
         .route("/protocol/openid-connect/token", route_post(|| async {
@@ -1677,6 +1680,12 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
         .route("/v1/reflect", route_post(move || {
             reflect_calls.fetch_add(1, Ordering::SeqCst);
             async { Json(json!({"candidates":[{"memories":[{"content":"EXISTING-PRIVATE-MEMORY"}]}]})) }
+        }))
+        .route("/v1/memories/retrieve", route_post(|| async {
+            Json(json!({"memories":[{"content":"synthetic proxy result"}]}))
+        }))
+        .route("/v1/memories", route_post(|| async {
+            Json(json!({"memory_id":"synthetic-proxy-memory", "metadata":{"original":"private stored contents"}}))
         }))
         .route("/check", route_post(|| async {Json(json!({"code":0,"data":{"ok":true}}))}));
     let bridge = tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
@@ -1868,6 +1877,97 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    let edit_path = format!("/sessions/{edge_session_id}");
+    let update = json!({"metadata": edge_session["metadata"]}).to_string();
+    let (status, _) = response(
+        &app,
+        edge_request("PUT", &edit_path, &update, "moi-contract-workspace"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "public metadata must round-trip");
+    let (status, _) = response(
+        &app,
+        edge_request(
+            "PUT",
+            &edit_path,
+            r#"{"status":"closed"}"#,
+            "other-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "another workspace must not queue session finalization"
+    );
+
+    let memory_request = json!({
+        "session_id":edge_session_id, "query":"synthetic", "content":"synthetic", "memory_type":"semantic"
+    }).to_string();
+    let call =
+        |path: &str, body: &str, workspace: &str| edge_request("POST", path, body, workspace);
+    for (path, workspace, expected) in [
+        ("/memory/retrieve", "moi-contract-workspace", StatusCode::OK),
+        ("/memory/retrieve", "other-workspace", StatusCode::FORBIDDEN),
+        (
+            "/memory/store",
+            "moi-contract-workspace",
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (status, _) = response(&app, call(path, &memory_request, workspace)).await;
+        assert_eq!(status, expected, "{path}");
+    }
+    let (status, _) = response(
+        &app,
+        call("/memory/reflect", "{}", "moi-contract-workspace"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    write_only.store(true, Ordering::SeqCst);
+    let (status, receipt) = response(
+        &app,
+        call("/memory/store", &memory_request, "moi-contract-workspace"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(
+        receipt,
+        json!({"status":"completed","memory_id":"synthetic-proxy-memory"})
+    );
+    let (status, _) = response(
+        &app,
+        call("/memory/reflect", "{}", "moi-contract-workspace"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(reflection_calls.load(Ordering::SeqCst), 0);
+    write_only.store(false, Ordering::SeqCst);
+    read_only.store(false, Ordering::SeqCst);
+    let (status, _) = response(
+        &app,
+        call("/memory/reflect", "{}", "moi-contract-workspace"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "workspace-only reflection uses verified scope"
+    );
+    revoked.store(true, Ordering::SeqCst);
+    let (status, _) = response(
+        &app,
+        call(
+            "/memory/retrieve",
+            &memory_request,
+            "moi-contract-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    revoked.store(false, Ordering::SeqCst);
+    read_only.store(true, Ordering::SeqCst);
+
     let other_metadata: String = sqlx::query_scalar(
         "SELECT CAST(metadata AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
     )

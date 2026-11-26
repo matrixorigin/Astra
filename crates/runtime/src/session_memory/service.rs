@@ -203,6 +203,27 @@ pub struct MemoryExtractionService {
     extraction_work_timeout: Duration,
 }
 
+impl Drop for MemoryExtractionService {
+    fn drop(&mut self) {
+        let (Some(user_id), Some(session_id)) = (&self.user_id, &self.session_id) else {
+            return;
+        };
+        let key = (user_id.to_string(), session_id.to_string());
+        let mut scoped = self
+            .owner_scoped_services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Weak::upgrade can fail concurrently with a new admission. An old
+        // handle must only remove its own entry, never its replacement.
+        if scoped
+            .get(&key)
+            .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
+        {
+            scoped.remove(&key);
+        }
+    }
+}
+
 impl std::fmt::Debug for MemoryExtractionService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryExtractionService")
@@ -429,7 +450,6 @@ impl MemoryExtractionService {
             .owner_scoped_services
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        scoped.retain(|_, service| service.strong_count() > 0);
         if let Some(existing) = scoped
             .get(&(scope.user_id.clone(), scope.session_id.clone()))
             .and_then(std::sync::Weak::upgrade)
@@ -1987,6 +2007,31 @@ mod tests {
             SpawnDecision::Skipped,
             "process shutdown must permanently close new extraction admission"
         );
+    }
+
+    #[test]
+    fn owner_scoped_service_cache_keeps_many_live_sessions_and_releases_exact_keys() {
+        let port = Arc::new(OwnerBindingMemoria::default());
+        let (tx, _rx) = IngestionSender::for_tests(16);
+        let root = Arc::new(MemoryExtractionService::new_owner_scoped_template(
+            Arc::new(ConstMemoryInferenceResolver(None)),
+            port,
+            tx,
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+        let live: Vec<_> = (0..4096)
+            .map(|index| {
+                root.scoped_to_session("owner", &format!("session-{index}"))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(root.owner_scoped_services.lock().unwrap().len(), live.len());
+        assert!(Arc::ptr_eq(
+            &live[1024],
+            &root.scoped_to_session("owner", "session-1024").unwrap()
+        ));
+        drop(live);
+        assert!(root.owner_scoped_services.lock().unwrap().is_empty());
     }
 
     #[test]

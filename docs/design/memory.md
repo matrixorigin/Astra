@@ -340,7 +340,7 @@ Old Sessions without the new binding remain ineligible for workspace memory,
 and a new fork cannot turn their historical transcript into authorized memory.
 Existing conversation access is distinct from eligibility to extract memory.
 There is no implicit backfill, history copy or migration from account-level
-memory. Requests that need workspace memory must use a newly bound Session.
+memory. Requests that target a Session must use a newly bound Session.
 
 Memory owners use the `mws_` prefix and a base64url SHA-256 digest of the ordered
 JSON tuple `["astra.workspace-memory.v1", provider_id, workspace_id, issuer,
@@ -374,7 +374,12 @@ Close, memory-status and finalize retain request-bound HMAC verification of
 method/path/body and the Session's provider scope. Each lifecycle operation
 requires a fresh signature. Edge tokens retain their own owner namespace and
 cannot control an HMAC-created Session merely by sharing its IAM subject.
-The memory proxy retains its existing user-token authentication contract.
+The memory proxy retains its user-token authentication contract. Store and
+retrieve bind the supplied Session to the verified MOI token workspace.
+Workspace-wide proxy operations without a Session use the verified token's
+workspace and still check current IAM grants. Reflection needs both grants,
+and write-only responses expose bounded receipts. The legacy Session update
+route also verifies the workspace before closing a memory-bound Session.
 The MOI caller must invoke close/finalize for session-end maintenance.
 
 The identity callback has a two-second request deadline including response-body

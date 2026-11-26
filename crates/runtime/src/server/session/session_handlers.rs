@@ -1297,7 +1297,26 @@ pub(crate) async fn update_session_handler(
     headers: HeaderMap,
     Json(request): Json<SessionUpdateRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state.auth_service.current_principal(&headers).await?;
+    let user = principal.user;
+    if request.status.as_deref() == Some("closed")
+        && let astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
+            principal.origin
+        && context.provider_id == "moi"
+    {
+        // This existing update route uses legacy bearer authentication. Its
+        // close transition can schedule memory maintenance, just like /close.
+        authorize_session_lifecycle_scope(
+            &state,
+            &user.user_id,
+            &session_id,
+            &astra_services::runs::ProviderRunOwner {
+                provider_id: context.provider_id,
+                provider_scope_id: context.provider_scope_id,
+            },
+        )
+        .await?;
+    }
     let session = state
         .session_service
         .update_session(
@@ -1854,26 +1873,33 @@ async fn session_lifecycle_user(
         .get_session(session_id.to_owned(), user.user_id.clone())
         .await?;
     if let Some(owner) = fork_provider_scope(&auth, true)? {
-        let pool = state.shared_pool.as_ref().ok_or_else(|| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "provider session authority is unavailable",
-            )
-        })?;
-        astra_services::session_fork_coordinator::authorize_provider_fork_session(
-            pool.get(),
-            &user.user_id,
-            session_id,
-            Some(&owner),
-            Some(&state.fernet_encryptor),
-            // Lifecycle mutation requires retained scope evidence, including
-            // ordinary provider Sessions; never infer an old unbound scope.
-            astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ForkSource,
-        )
-        .await
-        .map_err(session_fork_http_error)?;
+        authorize_session_lifecycle_scope(state, &user.user_id, session_id, &owner).await?;
     }
     Ok(user)
+}
+
+async fn authorize_session_lifecycle_scope(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+    owner: &astra_services::runs::ProviderRunOwner,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let pool = state.shared_pool.as_ref().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider session authority is unavailable",
+        )
+    })?;
+    astra_services::session_fork_coordinator::authorize_provider_fork_session(
+        pool.get(),
+        user_id,
+        session_id,
+        Some(owner),
+        Some(&state.fernet_encryptor),
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ForkSource,
+    )
+    .await
+    .map_err(session_fork_http_error)
 }
 
 pub(crate) async fn close_session_handler(

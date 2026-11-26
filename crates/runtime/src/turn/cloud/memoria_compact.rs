@@ -605,16 +605,10 @@ impl UserScopedMemoriaPort {
         ) {
             MemoriaAuthoritySelection::Scoped(credential) => {
                 for &write in operations {
-                    if let Some(message) = credential.access.denial_message(write) {
-                        // Built-in grants belong to the hosting product, not to
-                        // the separate Memoria website's Connected apps page.
-                        let message = if credential.owner_scoped_master && write {
-                            "Memory access is read-only. Ask your workspace memory administrator to grant memory.write before saving or modifying memories."
-                        } else if credential.owner_scoped_master {
-                            "Memory read access is not enabled. Ask your workspace memory administrator to grant memory.read."
-                        } else {
-                            message
-                        };
+                    if let Some(message) = credential
+                        .access
+                        .runtime_denial_message(write, credential.owner_scoped_master)
+                    {
                         return Err(MemoriaOperationError::Disabled(message.into()));
                     }
                 }
