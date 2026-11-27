@@ -272,7 +272,7 @@ impl SessionMemoryLifecycleStore {
         )
     }
 
-    /// The same bounded index range supplies ready rows and the next retry time.
+    /// Return ready work and the next retry in one limited batch.
     pub async fn scan_recovery(
         &self,
         limit: u16,
@@ -282,10 +282,14 @@ impl SessionMemoryLifecycleStore {
             "SELECT w.user_id, w.session_id,
                     CAST(TIMESTAMPDIFF(MICROSECOND, NOW(6), w.next_attempt_at) AS SIGNED)
              FROM agent_session_memory_work w
-             JOIN agent_sessions s ON s.user_id = w.user_id AND s.session_id = w.session_id
-             WHERE s.delete_requested_at IS NULL AND w.complete = 0
+             WHERE w.complete = 0
                AND w.next_attempt_at <= TIMESTAMPADD(SECOND, ?, NOW(6))
                AND (w.lease_token IS NULL OR w.lease_expires_at <= NOW(6))
+               AND EXISTS (
+                 SELECT 1 FROM agent_sessions s
+                 WHERE s.user_id = w.user_id AND s.session_id = w.session_id
+                   AND s.delete_requested_at IS NULL
+               )
              ORDER BY w.next_attempt_at, w.user_id, w.session_id LIMIT ?",
         )
         .bind(lookahead_secs)
