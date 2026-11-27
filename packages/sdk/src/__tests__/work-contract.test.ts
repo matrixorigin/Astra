@@ -990,6 +990,7 @@ test("getWorkBranchActivity reads one owner-scoped, identity-checked status", as
     work_id: "work-1",
     branch_id: "branch-1",
     branch_revision: 3,
+    event_head: 7,
     activity: "working",
     observed_at: "2026-09-15T00:00:00Z",
   } as const;
@@ -1019,6 +1020,7 @@ test("Work branch activity decoder rejects drift and backing identities", () => 
       work_id: "work-1",
       branch_id: "branch-1",
       branch_revision: 1,
+      event_head: 1,
       activity: "running",
       observed_at: "2026-09-15T00:00:00Z",
     }),
@@ -1029,6 +1031,7 @@ test("Work branch activity decoder rejects drift and backing identities", () => 
       work_id: "work-1",
       branch_id: "branch-1",
       branch_revision: 1,
+      event_head: 1,
       activity: "idle",
       observed_at: "2026-09-15T00:00:00Z",
       session_id: "must-not-leak",

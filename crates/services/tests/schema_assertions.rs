@@ -798,6 +798,7 @@ async fn schema_rationalization_runtime_contract() {
         "semantic_read_observation_budgets",
         "observation_identity_collisions",
         "inference_routes",
+        "work_attention_receipts",
         "prompt_chunks",
         "harness_sources",
         "harness_decisions",

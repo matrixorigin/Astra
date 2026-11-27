@@ -1,9 +1,9 @@
 mod common;
 
 use astra_services::work::{
-    DatabaseWorkRepository, WorkAttentionCursorAdvance, WorkAttentionCursorKind,
-    WorkConflictResource, WorkEventCoverage, WorkEventPageLimit, WorkEventQuery, WorkEventSeq,
-    WorkGenesis, WorkId, WorkOwnerId, WorkRepository, WorkRepositoryError,
+    DatabaseWorkRepository, WorkAttentionCursorAdvance, WorkConflictResource, WorkEventCoverage,
+    WorkEventPageLimit, WorkEventQuery, WorkEventSeq, WorkGenesis, WorkId, WorkOwnerId,
+    WorkRepository, WorkRepositoryError,
 };
 use sqlx::Row;
 
@@ -313,7 +313,6 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
         "work_branches",
         "work_proposal_sequences",
         "work_event_sequences",
-        "work_attention_receipts",
         "work_events",
     ] {
         assert_eq!(
@@ -453,55 +452,35 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
         .await
         .expect("Work genesis");
 
-    let advance = |kind, through_event_seq| WorkAttentionCursorAdvance {
+    let advance = |through_event_seq| WorkAttentionCursorAdvance {
         owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
         work_id: WorkId::parse(&work_id).expect("work"),
-        kind,
         through_event_seq: WorkEventSeq::new(through_event_seq).expect("event sequence"),
     };
     let seen = repository
-        .advance_attention_cursor(advance(WorkAttentionCursorKind::Seen, 1))
+        .advance_attention_cursor(advance(1))
         .await
         .expect("mark genesis event seen");
     assert_eq!(seen.revision.get(), 2);
-    assert_eq!(seen.seen_through_event_seq.map(WorkEventSeq::get), Some(1));
-    assert_eq!(seen.delivered_through_event_seq, None);
-    assert!(seen.seen_receipt_hash.is_some());
+    assert_eq!(seen.through_event_seq.get(), 1);
     assert_eq!(
         repository
-            .advance_attention_cursor(advance(WorkAttentionCursorKind::Seen, 1))
+            .advance_attention_cursor(advance(1))
             .await
             .expect("idempotent seen replay"),
         seen,
         "an exact replay must not synthesize a new receipt revision or timestamp"
     );
 
-    let delivered = repository
-        .advance_attention_cursor(advance(WorkAttentionCursorKind::Delivered, 1))
-        .await
-        .expect("mark genesis event delivered");
-    assert_eq!(delivered.revision.get(), 3);
-    assert_eq!(
-        delivered.delivered_through_event_seq.map(WorkEventSeq::get),
-        Some(1)
-    );
-    assert_eq!(
-        delivered.seen_through_event_seq.map(WorkEventSeq::get),
-        Some(1),
-        "delivery and seen are independent durable facts"
-    );
-
     assert!(matches!(
-        repository
-            .advance_attention_cursor(advance(WorkAttentionCursorKind::Seen, 2))
-            .await,
+        repository.advance_attention_cursor(advance(2)).await,
         Err(WorkRepositoryError::EventCursorAhead {
             through_event_seq: 2,
             event_head: 1
         })
     ));
     let revision_after_rejection = sqlx::query(
-        "SELECT receipt_revision FROM work_attention_receipts
+        "SELECT receipt_revision FROM work_event_sequences
          WHERE owner_id = ? AND work_id = ?",
     )
     .bind(&owner_id)
@@ -511,7 +490,7 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
     .expect("receipt after future cursor rejection")
     .try_get::<i64, _>("receipt_revision")
     .expect("revision");
-    assert_eq!(revision_after_rejection, 3);
+    assert_eq!(revision_after_rejection, 2);
 
     let event_writer = repository.clone();
     let cursor_writer = repository.clone();
@@ -521,7 +500,7 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
         &branch_id,
         "Produce a second committed semantic event.",
     );
-    let seen_through_old_head = advance(WorkAttentionCursorKind::Seen, 1);
+    let seen_through_old_head = advance(1);
     let (event_result, old_cursor_result) = tokio::join!(
         event_writer.propose_plan(proposed_event),
         cursor_writer.advance_attention_cursor(seen_through_old_head)
@@ -529,12 +508,12 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
     event_result.expect("append proposal event");
     assert_eq!(
         old_cursor_result.expect("advance through the old head"),
-        delivered,
+        seen,
         "a concurrently arriving event must remain unseen when it is beyond through_event_seq"
     );
     let first = repository.clone();
     let second = repository.clone();
-    let first_advance = advance(WorkAttentionCursorKind::Seen, 2);
+    let first_advance = advance(2);
     let second_advance = first_advance.clone();
     let (left, right) = tokio::join!(
         first.advance_attention_cursor(first_advance),
@@ -543,11 +522,11 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
     let left = left.expect("first concurrent cursor");
     let right = right.expect("second concurrent cursor");
     assert_eq!(left, right);
-    assert_eq!(left.revision.get(), 4, "only one max advance may commit");
-    assert_eq!(left.seen_through_event_seq.map(WorkEventSeq::get), Some(2));
+    assert_eq!(left.revision.get(), 3, "only one max advance may commit");
+    assert_eq!(left.through_event_seq.get(), 2);
     assert_eq!(
         repository
-            .advance_attention_cursor(advance(WorkAttentionCursorKind::Seen, 1))
+            .advance_attention_cursor(advance(1))
             .await
             .expect("older cursor is a no-op"),
         left
@@ -556,7 +535,6 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
     let foreign = WorkAttentionCursorAdvance {
         owner_id: WorkOwnerId::parse(&other_owner_id).expect("other owner"),
         work_id: WorkId::parse(&work_id).expect("work"),
-        kind: WorkAttentionCursorKind::Seen,
         through_event_seq: WorkEventSeq::INITIAL,
     };
     assert!(matches!(
@@ -655,7 +633,6 @@ async fn event_pages_are_bounded_contiguous_owner_scoped_and_retention_explicit(
         .advance_attention_cursor(WorkAttentionCursorAdvance {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(&work_id).expect("work"),
-            kind: WorkAttentionCursorKind::Seen,
             through_event_seq: WorkEventSeq::INITIAL,
         })
         .await

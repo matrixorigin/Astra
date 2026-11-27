@@ -3,13 +3,6 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkAttentionCursorKind {
-    Delivered,
-    Seen,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct WorkAttentionReceiptRevision(i64);
 
@@ -35,19 +28,13 @@ impl WorkAttentionReceiptRevision {
 pub struct WorkAttentionCursorAdvance {
     pub owner_id: WorkOwnerId,
     pub work_id: WorkId,
-    pub kind: WorkAttentionCursorKind,
     pub through_event_seq: WorkEventSeq,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkAttentionReceipt {
-    pub owner_id: WorkOwnerId,
-    pub work_id: WorkId,
     pub revision: WorkAttentionReceiptRevision,
-    pub delivered_through_event_seq: Option<WorkEventSeq>,
-    pub seen_through_event_seq: Option<WorkEventSeq>,
-    pub delivered_receipt_hash: Option<WorkContentHash>,
-    pub seen_receipt_hash: Option<WorkContentHash>,
-    pub created_at: DateTime<Utc>,
+    pub through_event_seq: WorkEventSeq,
+    pub receipt_hash: WorkContentHash,
     pub updated_at: DateTime<Utc>,
 }

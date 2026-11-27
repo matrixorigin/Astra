@@ -104,6 +104,7 @@ export function decodeWorkBranchActivityResponseV1(
       "work_id",
       "branch_id",
       "branch_revision",
+      "event_head",
       "activity",
       "observed_at",
     ],
@@ -117,6 +118,7 @@ export function decodeWorkBranchActivityResponseV1(
     work_id: resourceIdentity(object.work_id, `${path}.work_id`),
     branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
     branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    event_head: positiveRevision(object.event_head, `${path}.event_head`),
     activity: oneOf(
       object.activity,
       ["working", "waiting", "paused", "idle"] as const,

@@ -193,7 +193,8 @@ pub enum WorkBranchActivityV1 {
 }
 
 /// Read-only, owner-scoped status used by Web observers to discover activity
-/// started by another client. It carries no Session or Run identity.
+/// started by another client and compare the current Work event head with the
+/// applied snapshot. It carries no Session or Run identity.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkBranchActivityResponseV1 {
@@ -201,6 +202,7 @@ pub struct WorkBranchActivityResponseV1 {
     pub work_id: String,
     pub branch_id: String,
     pub branch_revision: i64,
+    pub event_head: i64,
     pub activity: WorkBranchActivityV1,
     pub observed_at: String,
 }

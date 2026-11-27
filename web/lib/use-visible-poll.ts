@@ -19,6 +19,7 @@ export function useVisiblePoll({
   refresh,
 }: UseVisiblePollOptions) {
   const refreshRef = useRef(refresh);
+  const inFlight = useRef(false);
 
   useEffect(() => {
     refreshRef.current = refresh;
@@ -28,7 +29,6 @@ export function useVisiblePoll({
     if (!enabled) return;
 
     let cancelled = false;
-    let inFlight = false;
     let failures = 0;
     let timer: number | null = null;
 
@@ -52,21 +52,19 @@ export function useVisiblePoll({
     };
 
     async function run() {
-      if (
-        cancelled ||
-        inFlight ||
-        document.visibilityState !== "visible"
-      ) {
+      if (cancelled || document.visibilityState !== "visible") return;
+      if (inFlight.current) {
+        schedule(intervalMs);
         return;
       }
-      inFlight = true;
+      inFlight.current = true;
       let succeeded = false;
       try {
         succeeded = await refreshRef.current();
       } catch {
         succeeded = false;
       } finally {
-        inFlight = false;
+        inFlight.current = false;
       }
       if (cancelled) return;
       if (succeeded) {

@@ -349,6 +349,10 @@ canonical ownership also prevents deletion. The 2,048-record capacity and
 30-day age are soft limits for unresolved work: diagnostic reclamation must
 not destroy evidence still required for accounting or crash recovery.
 
+A terminal append checks the existing event count in the same SQL statement.
+When the scope is full, the request appends the fact and runs the bounded
+compaction batch. Smaller scopes save one SQL statement on each terminal fact.
+
 Eligible complete pairs are marked and deleted atomically under their physical
 attempt locks. Expiry walks old rows using the existing timestamp/event index,
 then checks the complete bounded owner/attempt groups. A fresh terminal protects

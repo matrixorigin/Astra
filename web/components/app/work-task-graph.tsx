@@ -43,12 +43,18 @@ type WorkTaskGraphProps = {
   id?: string;
   initial: WorkTaskGraphPageV2;
   live?: boolean;
+  pollWhileIdle?: boolean;
 };
 
 const LIVE_REFRESH_INTERVAL_MS = 2_000;
 const QUIET_REFRESH_INTERVAL_MS = 30_000;
 
-export function WorkTaskGraph({ id, initial, live = false }: WorkTaskGraphProps) {
+export function WorkTaskGraph({
+  id,
+  initial,
+  live = false,
+  pollWhileIdle = true,
+}: WorkTaskGraphProps) {
   const [head, setHead] = useState(initial);
   const [items, setItems] = useState(initial.items.entries);
   const [dependencies, setDependencies] = useState(initial.dependencies.entries);
@@ -200,7 +206,7 @@ export function WorkTaskGraph({ id, initial, live = false }: WorkTaskGraphProps)
   }, [revealTaskChanges]);
 
   useVisiblePoll({
-    enabled: true,
+    enabled: live || pollWhileIdle,
     intervalMs: live ? LIVE_REFRESH_INTERVAL_MS : QUIET_REFRESH_INTERVAL_MS,
     maximumIntervalMs: 120_000,
     immediate: live,

@@ -14,10 +14,8 @@ pub(super) async fn list_events(
 ) -> Result<WorkEventPage, WorkRepositoryError> {
     let metadata = query(
         "SELECT s.last_event_seq, s.retained_from_event_seq,
-                r.seen_through_event_seq
+                s.seen_through_event_seq
          FROM work_event_sequences s
-         LEFT JOIN work_attention_receipts r
-           ON r.owner_id = s.owner_id AND r.work_id = s.work_id
          WHERE s.owner_id = ? AND s.work_id = ? LIMIT 1",
     )
     .bind(query_value.owner_id.as_str())
@@ -35,16 +33,8 @@ pub(super) async fn list_events(
         .map_err(|source| WorkRepositoryError::corrupt("Work event page", source))?;
     let retained_from_event_seq = WorkEventSeq::new(integer("retained_from_event_seq")?)
         .map_err(|source| WorkRepositoryError::corrupt("Work event page", source))?;
-    let seen_value = metadata
-        .try_get::<Option<i64>, _>("seen_through_event_seq")
-        .map_err(|source| WorkRepositoryError::corrupt("Work attention receipt", source))?
-        .ok_or_else(|| {
-            WorkRepositoryError::corrupt(
-                "Work attention receipt",
-                std::io::Error::other("receipt is missing for an existing Work"),
-            )
-        })?;
-    let seen_through_event_seq = decode_optional_event_seq(seen_value, "seen cursor")?;
+    let seen_through_event_seq =
+        decode_optional_event_seq(integer("seen_through_event_seq")?, "seen cursor")?;
     if seen_through_event_seq.is_some_and(|cursor| cursor > event_head) {
         return Err(WorkRepositoryError::corrupt(
             "Work attention receipt",

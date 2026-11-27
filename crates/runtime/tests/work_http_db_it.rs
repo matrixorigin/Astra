@@ -367,7 +367,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("work_runtime_event_outbox", "owner_id"),
         ("work_runtime_event_outbox_slots", "owner_id"),
         ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
         ("work_event_sequences", "owner_id"),
         ("work_current_gap_acceptances", "owner_id"),
         ("work_acceptance_decisions", "owner_id"),
@@ -1845,6 +1844,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     assert_eq!(active["work_id"], newer_id);
     assert_eq!(active["branch_id"], newer_branch);
     assert_eq!(active["branch_revision"], 1);
+    assert_eq!(active["event_head"], 2);
     assert_eq!(active["activity"], "working");
     assert!(active["observed_at"].as_str().is_some());
     assert_field_absent(&active, "session_id");
@@ -1855,6 +1855,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     assert_eq!(idle_status, StatusCode::OK, "activity: {idle}");
     assert!(idle_bytes < 4 * 1024);
     assert_eq!(idle["activity"], "idle");
+    assert_eq!(idle["event_head"], 1);
     assert_eq!(idle["work_id"], older_id);
     assert_eq!(idle["branch_id"], older_branch);
 
@@ -5961,7 +5962,7 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
     assert_eq!(zero["code"], "invalid_work_event_cursor");
 
     let stored_revision = sqlx::query(
-        "SELECT receipt_revision FROM work_attention_receipts
+        "SELECT receipt_revision FROM work_event_sequences
          WHERE owner_id = ? AND work_id = ?",
     )
     .bind(&owner_id)

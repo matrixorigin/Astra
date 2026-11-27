@@ -2420,6 +2420,7 @@ export type WorkBranchActivityResponseV1 = {
   work_id: string;
   branch_id: string;
   branch_revision: number;
+  event_head: number;
   activity: WorkBranchActivityV1;
   observed_at: string;
 };

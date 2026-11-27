@@ -18,7 +18,7 @@ pub(super) async fn list_catalog(
                 b.branch_revision, b.current_graph_revision,
                 b.session_id AS branch_session_id,
                 gr.item_count AS graph_item_count,
-                es.last_event_seq, r.seen_through_event_seq,
+                es.last_event_seq, es.seen_through_event_seq,
                 active.run_id AS active_run_id, active.status AS active_run_status,
                 active.waiting_for AS active_run_waiting_for,
                 active.session_id AS active_run_session_id,
@@ -48,8 +48,6 @@ pub(super) async fn list_catalog(
           AND gr.revision = b.current_graph_revision
          LEFT JOIN work_event_sequences es
            ON es.owner_id = w.owner_id AND es.work_id = w.work_id
-         LEFT JOIN work_attention_receipts r
-           ON r.owner_id = w.owner_id AND r.work_id = w.work_id
          LEFT JOIN agent_runs active
            ON active.user_id = w.owner_id AND active.session_id = b.session_id
           AND active.parent_run_id IS NULL AND active.retry_of IS NULL

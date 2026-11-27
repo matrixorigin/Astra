@@ -38,7 +38,6 @@ pub enum WorkConflictResource {
     AcceptanceDecisionIdentity,
     WorkEventSequence,
     WorkEventIdentity,
-    WorkAttentionReceipt,
     WorkProposalIdentity,
     RecoveryPointIdentity,
     RecoveryPointRequest,
@@ -1133,12 +1132,6 @@ async fn insert_genesis_rows(
             graph_revision: Some(GraphRevision::INITIAL),
             source_ref: genesis_source,
         },
-    )
-    .await?;
-    super::attention_repository::insert_genesis_receipt(
-        transaction,
-        &genesis.owner_id,
-        &genesis.work_id,
     )
     .await?;
     super::runtime_event_outbox::insert_genesis_slot(

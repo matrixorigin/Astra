@@ -32,7 +32,6 @@ vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
   deleteWorkBranchAction: vi.fn(),
   observeWorkBranchDeletionAction: vi.fn(),
   refreshWorkBranchActivityAction: vi.fn(),
-  refreshWorkEventsAction: vi.fn(),
   refreshWorkTaskGraphAction: vi.fn(),
   loadWorkTaskGraphPageAction: vi.fn(),
   refreshWorkBranchInteractionsAction: vi.fn(),
@@ -49,7 +48,6 @@ import {
   observeWorkBranchCreationAction,
   observeWorkBranchDeletionAction,
   refreshWorkBranchActivityAction,
-  refreshWorkEventsAction,
   refreshWorkTaskGraphAction,
   refreshWorkBranchInteractionsAction,
   resolveCriteriaProposalAction,
@@ -143,7 +141,6 @@ const loadArchivedBranches = vi.mocked(loadArchivedWorkBranchesAction);
 const deleteBranch = vi.mocked(deleteWorkBranchAction);
 const observeDeletion = vi.mocked(observeWorkBranchDeletionAction);
 const refreshActivity = vi.mocked(refreshWorkBranchActivityAction);
-const refreshEvents = vi.mocked(refreshWorkEventsAction);
 const refreshTaskGraph = vi.mocked(refreshWorkTaskGraphAction);
 const refreshInteractions = vi.mocked(refreshWorkBranchInteractionsAction);
 
@@ -152,6 +149,7 @@ const idleActivity: WorkBranchActivityResponseV1 = {
   work_id: "work-1",
   branch_id: "branch-1",
   branch_revision: 1,
+  event_head: 3,
   activity: "idle",
   observed_at: "2026-08-01T00:00:00Z",
 };
@@ -565,10 +563,6 @@ function comparison(
 beforeEach(() => {
   vi.clearAllMocks();
   refreshActivity.mockResolvedValue({ ok: true, activity: idleActivity });
-  refreshEvents.mockResolvedValue({
-    ok: true,
-    page: { work_id: "work-1", event_head: 3, events: [] },
-  });
   refreshTaskGraph.mockResolvedValue({ ok: true, page: snapshot().taskGraph });
   Object.defineProperty(globalThis.crypto, "randomUUID", {
     configurable: true,
@@ -590,12 +584,39 @@ test("discovers activity started on another surface and refreshes this branch's 
     expect(screen.queryByText("Live", { exact: true })).not.toBeInTheDocument();
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_200);
+      await vi.advanceTimersByTimeAsync(9_999);
+    });
+    expect(refreshActivity).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
     });
 
     expect(refreshActivity).toHaveBeenCalledWith({ workId: "work-1", branchId: "branch-1" });
     expect(screen.getByRole("status")).toHaveTextContent("Astra is working · Live");
     expect(screen.getByText("Live", { exact: true })).toBeVisible();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(refreshActivity).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("uses only the combined Work observation while the detail page is idle", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    render(<TestWorkOverviewPage initial={snapshot()} initialActivity={idleActivity} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(refreshActivity).toHaveBeenCalledTimes(3);
+    expect(refreshTaskGraph).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
   } finally {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -623,33 +644,13 @@ test("describes a saved portable workspace package without promising conversatio
   expect(screen.queryByText(/Code files are not included yet/u)).not.toBeInTheDocument();
 });
 
-test("starts Work event polling from the applied snapshot cursor", async () => {
-  vi.useFakeTimers();
-  vi.spyOn(Math, "random").mockReturnValue(0.5);
-  try {
-    render(<TestWorkOverviewPage initial={snapshot()} initialActivity={idleActivity} />);
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(10_000);
-    });
-
-    expect(refreshEvents).toHaveBeenCalledWith({
-      workId: "work-1",
-      afterEventSeq: 3,
-    });
-  } finally {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-  }
-});
-
 test("keeps retrying the server projection while an observed event is unapplied", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0.5);
   try {
-    refreshEvents.mockResolvedValue({
+    refreshActivity.mockResolvedValue({
       ok: true,
-      page: { work_id: "work-1", event_head: 4, events: [] },
+      activity: { ...idleActivity, event_head: 4 },
     });
     render(<TestWorkOverviewPage initial={snapshot()} initialActivity={idleActivity} />);
 
@@ -661,7 +662,7 @@ test("keeps retrying the server projection while an observed event is unapplied"
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
-    expect(refreshEvents).toHaveBeenCalledTimes(2);
+    expect(refreshActivity).toHaveBeenCalledTimes(2);
     expect(refresh).toHaveBeenCalledTimes(2);
   } finally {
     vi.useRealTimers();
@@ -669,14 +670,14 @@ test("keeps retrying the server projection while an observed event is unapplied"
   }
 });
 
-test("ignores an old Work event response after navigating to another Work", async () => {
+test("ignores an old Work observation after navigating to another Work", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0.5);
   let finishOld!: (result: {
     ok: true;
-    page: { work_id: string; event_head: number; events: [] };
+    activity: WorkBranchActivityResponseV1;
   }) => void;
-  refreshEvents.mockImplementation(
+  refreshActivity.mockImplementation(
     () =>
       new Promise((resolve) => {
         finishOld = resolve;
@@ -702,7 +703,7 @@ test("ignores an old Work event response after navigating to another Work", asyn
     });
     expect(screen.getByRole("heading", { name: "A separate Work" })).toBeVisible();
 
-    finishOld?.({ ok: true, page: { work_id: "work-1", event_head: 4, events: [] } });
+    finishOld?.({ ok: true, activity: { ...idleActivity, activity: "working", event_head: 4 } });
     await act(async () => {
       await Promise.resolve();
     });

@@ -50,7 +50,6 @@ import {
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
   refreshWorkBranchActivityAction,
-  refreshWorkEventsAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -102,9 +101,8 @@ const ARCHIVE_DATE_FORMATTER = new Intl.DateTimeFormat("en", {
   dateStyle: "medium",
   timeZone: "UTC",
 });
-const ACTIVE_BRANCH_ACTIVITY_REFRESH_MS = 1_200;
-const ACTIVE_WORK_EVENTS_REFRESH_MS = 2_000;
-const IDLE_WORK_EVENTS_REFRESH_MS = 10_000;
+const ACTIVE_WORK_OBSERVATION_INTERVAL_MS = 2_000;
+const IDLE_WORK_OBSERVATION_INTERVAL_MS = 10_000;
 
 function deletionProgressLabel(
   phase: WorkBranchDeletionOperationV1["phase"],
@@ -212,7 +210,7 @@ export function WorkOverviewPage({
   const eventHeadRef = useRef(initial.report.overview.event_head);
   const initialEventHeadRef = useRef(initial.report.overview.event_head);
   const pendingProjectionHead = useRef<number | null>(null);
-  const eventRefreshGeneration = useRef(0);
+  const observationGeneration = useRef(0);
   const router = useRouter();
   const toast = useToast();
 
@@ -250,50 +248,14 @@ export function WorkOverviewPage({
     // A route change can reuse this client component. Never carry the prior
     // Work's cursor into the new identity; the next bounded read establishes
     // the new Work's current head.
-    // The API accepts a cursor only after the first committed event. Start
-    // from the server snapshot for this Work/branch so the first poll is a
-    // valid bounded read and can discover the next event across surfaces.
     eventHeadRef.current = initialEventHeadRef.current;
     pendingProjectionHead.current = null;
     setWorkEventsHealth("live");
-    eventRefreshGeneration.current += 1;
+    observationGeneration.current += 1;
     return () => {
-      eventRefreshGeneration.current += 1;
+      observationGeneration.current += 1;
     };
   }, [selectedBranchId, workId]);
-
-  const refreshBranchActivity = useCallback(async () => {
-    try {
-      const result = await refreshWorkBranchActivityAction({
-        workId,
-        branchId: selectedBranchId,
-      });
-      if (!result.ok) {
-        setBranchActivityHealth("delayed");
-        return false;
-      }
-      if (
-        result.activity.work_id !== workId ||
-        result.activity.branch_id !== selectedBranchId
-      ) {
-        setBranchActivityHealth("delayed");
-        return false;
-      }
-      setBranchActivity(result.activity);
-      setBranchActivityHealth("live");
-      return true;
-    } catch {
-      setBranchActivityHealth("delayed");
-      return false;
-    }
-  }, [selectedBranchId, workId]);
-
-  useVisiblePoll({
-    enabled: true,
-    intervalMs: ACTIVE_BRANCH_ACTIVITY_REFRESH_MS,
-    maximumIntervalMs: 30_000,
-    refresh: refreshBranchActivity,
-  });
 
   useEffect(() => {
     setSnapshot((current) => {
@@ -317,50 +279,53 @@ export function WorkOverviewPage({
       : null;
   const activityNeedsGraphRefresh =
     currentActivity === "working" || currentActivity === "waiting";
-  const refreshWorkEvents = useCallback(async () => {
-    const generation = eventRefreshGeneration.current;
-    const afterEventSeq = eventHeadRef.current;
+  const refreshWorkObservation = useCallback(async () => {
+    const generation = observationGeneration.current;
+    const markDelayed = () => {
+      setBranchActivityHealth("delayed");
+      setWorkEventsHealth("delayed");
+      return false;
+    };
     try {
-      const result = await refreshWorkEventsAction({ workId, afterEventSeq });
-      if (generation !== eventRefreshGeneration.current) return true;
-      if (!result.ok || result.page.work_id !== workId) {
-        setWorkEventsHealth("delayed");
-        return false;
+      const result = await refreshWorkBranchActivityAction({
+        workId,
+        branchId: selectedBranchId,
+      });
+      if (generation !== observationGeneration.current) return true;
+      if (
+        !result.ok ||
+        result.activity.work_id !== workId ||
+        result.activity.branch_id !== selectedBranchId
+      ) {
+        return markDelayed();
       }
-      if (result.page.event_head > eventHeadRef.current) {
-        eventHeadRef.current = result.page.event_head;
-        pendingProjectionHead.current = result.page.event_head;
-        setWorkEventsHealth("refreshing");
-        // The server-rendered bounded snapshot is the single projection
-        // authority. Refresh it once the shared Work clock advances instead
-        // of trying to merge partial JSON in the browser.
-        router.refresh();
-      } else if (pendingProjectionHead.current !== null) {
-        // `router.refresh()` has no completion signal. Keep retrying the
-        // bounded server projection while its applied event head is behind
-        // the observed Work clock, otherwise one transient RSC failure could
-        // leave the page stale forever.
+      setBranchActivity(result.activity);
+      setBranchActivityHealth("live");
+      const eventHead = result.activity.event_head;
+      if (eventHead > eventHeadRef.current) {
+        eventHeadRef.current = eventHead;
+        pendingProjectionHead.current = eventHead;
+      }
+      if (pendingProjectionHead.current !== null) {
+        // A newer head needs the canonical snapshot. Retry until it applies.
         setWorkEventsHealth("refreshing");
         router.refresh();
-      } else if (pendingProjectionHead.current === null) {
+      } else {
         setWorkEventsHealth("live");
       }
       return true;
     } catch {
-      if (generation === eventRefreshGeneration.current) {
-        setWorkEventsHealth("delayed");
-      }
-      return false;
+      return generation !== observationGeneration.current || markDelayed();
     }
-  }, [router, workId]);
+  }, [router, selectedBranchId, workId]);
 
   useVisiblePoll({
     enabled: true,
-    intervalMs: activityNeedsGraphRefresh
-      ? ACTIVE_WORK_EVENTS_REFRESH_MS
-      : IDLE_WORK_EVENTS_REFRESH_MS,
+    intervalMs: turnActive || activityNeedsGraphRefresh
+      ? ACTIVE_WORK_OBSERVATION_INTERVAL_MS
+      : IDLE_WORK_OBSERVATION_INTERVAL_MS,
     maximumIntervalMs: 30_000,
-    refresh: refreshWorkEvents,
+    refresh: refreshWorkObservation,
   });
   const branchLabel = workBranchLabel(branchCatalog, selectedBranch);
   const isDeliveryBranch = selectedBranch.is_delivery;
@@ -1055,6 +1020,7 @@ export function WorkOverviewPage({
               id="work-plan"
               initial={snapshot.taskGraph}
               live={turnActive || activityNeedsGraphRefresh}
+              pollWhileIdle={false}
             />
 
             <WorkActivityCard

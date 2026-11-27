@@ -223,6 +223,11 @@ delivery and usage records. Event identity collisions use the original
 event's hash and emit structured diagnostics. Fresh bootstrap declares
 106 tables.
 
+Fresh schema contract v130 puts the owner seen cursor on the existing Work
+event-sequence row. The cursor and event head share their owner and lifetime.
+Current seen receipts derive their hash from the cursor, and a duplicate
+advance uses one read. Fresh bootstrap declares 105 tables.
+
 ## Session-memory recovery journal
 
 Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed

@@ -274,17 +274,17 @@ primary navigation model.
 Initial reads remain bounded and revision-pinned: paginate the Work catalog,
 load only the first task-graph page for first paint, and fetch later pages on
 demand. Activity, transcript, branch control, provider health, and task graph
-may advance on separate durable cursors/revisions; the UI must label freshness
-per projection and recover retention gaps with a bounded snapshot. They must
-not scan all events or rebuild the entire Work view for every task update. The
-owner-scoped Server activity read discovers Runs started by other surfaces; a
-local Web composer flag is not evidence that a Run is active. Each visible Work
-detail page polls one exact branch about every 1.2 seconds and its Work event
-head about every 2 seconds while active (10 seconds while idle), so a quiet page
-can discover a Run started elsewhere and a Work started from TUI or another
-Edge can trigger a bounded server snapshot refresh. The latest `/now` page refreshes its first
-20-entry keyset page about every 10 seconds; older pages do not poll. Task graph
-refresh remains bounded to its first page while a Run can change it. Hidden tabs
+may advance on separate durable cursors/revisions. The UI labels freshness per
+projection and recovers retention gaps with a bounded snapshot. The Work
+detail page reads the selected branch's root Run activity and its Work's event
+head in one request. It checks about every two seconds while active and every
+ten seconds while idle. A Run started from another surface is visible through
+the same read, and a newer event head triggers a bounded snapshot refresh.
+The owner seen cursor lives beside the event head and advances only through
+the explicit read-cursor endpoint. The latest `/now` page refreshes its first
+20-entry keyset page about every 10 seconds; older pages do not poll. The Work
+detail page refreshes its task graph independently only while a Run can change
+it. Idle detail views use the event head to invalidate the snapshot. Hidden tabs
 pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
 obsolete branch results, and never overlaps polls within a page.
 

@@ -68,8 +68,7 @@ pub use attempt_settlement::{
     WorkAttemptOutcome, WorkAttemptSettlementError,
 };
 pub use attention::{
-    WorkAttentionCursorAdvance, WorkAttentionCursorKind, WorkAttentionReceipt,
-    WorkAttentionReceiptRevision,
+    WorkAttentionCursorAdvance, WorkAttentionReceipt, WorkAttentionReceiptRevision,
 };
 pub use basis::WorkBranchBasisChange;
 pub use branch_catalog::{
@@ -883,34 +882,18 @@ pub(crate) const WORK_EVENT_SEQUENCES_CREATE_SQL: &str =
     work_id VARCHAR(64) NOT NULL,
     last_event_seq BIGINT NOT NULL,
     retained_from_event_seq BIGINT NOT NULL,
+    seen_through_event_seq BIGINT NOT NULL DEFAULT 0,
+    receipt_revision BIGINT NOT NULL DEFAULT 1,
+    seen_updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (owner_id, work_id),
     CONSTRAINT chk_work_event_sequence CHECK (last_event_seq > 0),
+    CONSTRAINT chk_work_attention_revision CHECK (receipt_revision > 0),
+    CONSTRAINT chk_work_attention_seen_cursor CHECK (
+        seen_through_event_seq >= 0 AND seen_through_event_seq <= last_event_seq
+    ),
     CONSTRAINT chk_work_event_retention CHECK (
         retained_from_event_seq > 0 AND retained_from_event_seq <= last_event_seq
-    )
-)";
-
-pub(crate) const WORK_ATTENTION_RECEIPTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_attention_receipts (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    receipt_revision BIGINT NOT NULL,
-    delivered_through_event_seq BIGINT NOT NULL,
-    seen_through_event_seq BIGINT NOT NULL,
-    delivered_receipt_hash CHAR(71) NULL,
-    seen_receipt_hash CHAR(71) NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id),
-    CONSTRAINT chk_work_attention_revision CHECK (receipt_revision > 0),
-    CONSTRAINT chk_work_attention_delivered_cursor CHECK (delivered_through_event_seq >= 0),
-    CONSTRAINT chk_work_attention_seen_cursor CHECK (seen_through_event_seq >= 0),
-    CONSTRAINT chk_work_attention_delivered_hash CHECK (
-        (delivered_through_event_seq = 0) = (delivered_receipt_hash IS NULL)
-    ),
-    CONSTRAINT chk_work_attention_seen_hash CHECK (
-        (seen_through_event_seq = 0) = (seen_receipt_hash IS NULL)
     )
 )";
 
@@ -1170,10 +1153,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         WORK_CURRENT_GAP_ACCEPTANCES_CREATE_SQL,
     ),
     ("work_event_sequences", WORK_EVENT_SEQUENCES_CREATE_SQL),
-    (
-        "work_attention_receipts",
-        WORK_ATTENTION_RECEIPTS_CREATE_SQL,
-    ),
     ("work_item_attempts", WORK_ITEM_ATTEMPTS_CREATE_SQL),
     ("work_terminal_cuts", WORK_TERMINAL_CUTS_CREATE_SQL),
     ("work_events", WORK_EVENTS_CREATE_SQL),
@@ -1862,7 +1841,6 @@ mod tests {
             "work_terminal_cuts",
             "work_acceptance_decisions",
             "work_events",
-            "work_attention_receipts",
         ] {
             assert!(
                 table_names.contains(required),

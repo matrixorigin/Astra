@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-28-v129";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-28-v130";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -2185,6 +2185,14 @@ async fn verify_work_canonical_schema(
             &["deletion_operation_id", "deletion_requested_at"],
         ),
         ("work_events", &["payload_hash"]),
+        (
+            "work_event_sequences",
+            &[
+                "seen_through_event_seq",
+                "receipt_revision",
+                "seen_updated_at",
+            ],
+        ),
         (
             "work_branch_control_operations",
             &[
