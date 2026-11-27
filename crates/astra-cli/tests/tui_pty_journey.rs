@@ -455,22 +455,19 @@ fn required_live_env(name: &str) -> String {
         .unwrap_or_else(|| panic!("ignored live PTY journey requires {name}"))
 }
 
-fn selected_task_slot(screen: &str) -> Option<String> {
+fn selected_task_slot(screen: &str) -> Option<usize> {
     screen.lines().find_map(|line| {
         let numbered = line.trim_start().strip_prefix('›')?.trim_start();
-        let (ordinal, _) = numbered.split_once('.')?;
-        ordinal.parse::<usize>().ok()?;
-        numbered
-            .split_once("slot ")
-            .map(|(_, slot)| slot.split(" · ").next().unwrap().trim().to_string())
+        let (_, slot) = numbered.split_once(". slot ")?;
+        slot.split_once(':')?.0.parse().ok()
     })
 }
 
-fn select_task_slot(astra: &mut PtyAstra, target: &str, timeout: Duration) {
+fn select_task_slot(astra: &mut PtyAstra, target: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let before = selected_task_slot(&astra.current_screen());
-        if before.as_deref() == Some(target) {
+        if before == Some(target) {
             return;
         }
         astra.write(b"\x1b[B");
@@ -2294,7 +2291,7 @@ async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"keep_this_turn_active_until_shutdown\r");
+    astra.paste_and_submit("keep_this_turn_active_until_shutdown");
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
     astra.signal(nix::sys::signal::Signal::SIGHUP);
@@ -2606,15 +2603,14 @@ async fn exit_after_a_completed_turn_prints_a_copyable_resume_command() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Message", Duration::from_secs(15));
-    astra.write(b"create_a_resumable_session\r");
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit("create_a_resumable_session");
     astra.wait_for("successfully.", Duration::from_secs(10));
     // The completion text can be painted before the input surface has
     // returned to its idle state. Synchronize on the actual prompt before
     // injecting /exit so a loaded workspace cannot race the command parser.
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-    astra.write(b"/exit\r");
-    astra.wait_for("Stopping", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/exit");
 
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -2626,28 +2622,28 @@ async fn exit_after_a_completed_turn_prints_a_copyable_resume_command() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::Slow,
-    )
-    .await
-    .expect("start scripted slow LLM server");
+    let mock =
+        astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response(axum::Router::new())
+            .await
+            .expect("start scripted slow LLM server");
     let home = tempfile::tempdir().expect("temporary isolated Astra home");
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"complete_this_live_transcript_journey\r");
+    astra.paste_and_submit("complete_this_live_transcript_journey");
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]); // Ctrl+O while the HTTP turn is still pending.
     astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
     astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
     astra.wait_for("successfully.", Duration::from_secs(10));
 
     astra.write(&[0x0f]);
     astra.wait_for_absent("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Message Astra", Duration::from_secs(10));
-    astra.write(b"/exit\r");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
@@ -2699,9 +2695,9 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"/allow prompt\r");
+    astra.paste_and_submit("/allow prompt");
     astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
-    astra.write(b"exercise_tool_history_in_transcript\r");
+    astra.paste_and_submit("exercise_tool_history_in_transcript");
     // The Server stream continues only after the real host has accepted and
     // executed its tool request and posted the exact callback.
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
@@ -2711,13 +2707,12 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     assert_committed_mock_write(&mock, home.path());
 
     astra.write(&[0x0f]); // Ctrl+O after the compact view observed the tool.
-    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Edited mock-output-astra-cli.txt", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-    astra.write(b"/exit\r");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
@@ -4154,15 +4149,14 @@ async fn fanout_partial_refresh_preserves_slot_selection() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"launch_three_reviews_as_one_group\r");
+    astra.paste_and_submit("launch_three_reviews_as_one_group");
     astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     for slot in 1..=3 {
         astra.wait_for(&format!("Mock review {slot}"), UI_TRANSITION_TIMEOUT);
     }
-    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
-    let selected = selected_task_slot(&astra.current_screen()).unwrap();
+    select_task_slot(&mut astra, 2, UI_TRANSITION_TIMEOUT);
     astra.wait_for("X stop", UI_TRANSITION_TIMEOUT);
     mock.publish_partial_fanout_results();
     let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
@@ -4177,10 +4171,7 @@ async fn fanout_partial_refresh_preserves_slot_selection() {
             astra.receive(next_key.saturating_duration_since(Instant::now()));
         }
     }
-    assert_eq!(
-        selected_task_slot(&astra.current_screen()).as_ref(),
-        Some(&selected)
-    );
+    assert_eq!(selected_task_slot(&astra.current_screen()), Some(2));
     let screen = astra.current_screen();
     for slot in 1..=3 {
         assert_eq!(
@@ -4214,12 +4205,12 @@ async fn failed_fanout_slot_cause_is_visible_in_its_transcript() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"review_with_one_failed_slot\r");
+    astra.paste_and_submit("review_with_one_failed_slot");
     astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Mock review 2", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 2, UI_TRANSITION_TIMEOUT);
     mock.publish_partial_fanout_results();
     astra.write(b"r");
     astra.wait_for("1 failed", UI_TRANSITION_TIMEOUT);
@@ -4248,19 +4239,19 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     seed_account(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"inspect_and_cancel_one_child\r");
+    astra.paste_and_submit("inspect_and_cancel_one_child");
     astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Mock review 1", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 1, UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "3: Mock review 3", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 3, UI_TRANSITION_TIMEOUT);
     astra.write(b"r");
-    astra.wait_for("stop available", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("X stop", UI_TRANSITION_TIMEOUT);
     astra.write(b"x");
     let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
     while mock.cancellation_requests().is_empty() {
@@ -4281,8 +4272,8 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.write(b"h");
-    astra.wait_for("Mock review 1", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("H active only", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 1, UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
     assert_eq!(mock.received_requests().len(), 1);
@@ -4292,11 +4283,10 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::Slow,
-    )
-    .await
-    .unwrap();
+    let mock =
+        astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response(axum::Router::new())
+            .await
+            .unwrap();
     let home = tempfile::tempdir().unwrap();
     seed_trusted_workspace(home.path());
     seed_account(home.path());
@@ -4358,6 +4348,7 @@ async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
         } else {
             assert!(context.contains("first objective"), "{context}");
         }
+        mock.release_held_response();
         astra.wait_for(&format!("turn {}", index + 1), UI_TRANSITION_TIMEOUT);
     }
     astra.signal(nix::sys::signal::Signal::SIGHUP);
