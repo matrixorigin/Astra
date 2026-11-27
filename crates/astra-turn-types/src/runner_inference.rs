@@ -341,11 +341,20 @@ impl RunnerInferenceProgressBatch {
         Ok(batch)
     }
 
+    /// An empty batch ends provisional display at the first omitted event.
+    /// It contains no provider data and never participates in terminal custody.
+    pub fn interrupted(attempt: RunnerInferenceAttemptIdentity) -> Self {
+        Self {
+            attempt,
+            events: Vec::new(),
+        }
+    }
+
     /// Validate bounds before any fanout or decoder allocation.  Sequence
     /// gaps are valid (a preview may be dropped), but a batch itself must be
     /// ordered and may not repeat one sequence number.
     pub fn validate_wire_bounds(&self) -> Result<(), &'static str> {
-        if self.events.is_empty() || self.events.len() > RUNNER_INFERENCE_PROGRESS_MAX_EVENTS {
+        if self.events.len() > RUNNER_INFERENCE_PROGRESS_MAX_EVENTS {
             return Err("inference progress event count exceeds bound");
         }
         if self

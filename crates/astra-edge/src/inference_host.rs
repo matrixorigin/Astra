@@ -50,7 +50,7 @@ const INFERENCE_PREVIEW_EVENT_BYTES: usize = RUNNER_INFERENCE_CHUNK_BYTES;
 pub struct InferencePreview {
     pub attempt: RunnerInferenceAttemptIdentity,
     pub sequence: u64,
-    pub event: RunnerInferenceProviderEvent,
+    pub event: Option<RunnerInferenceProviderEvent>,
 }
 
 impl std::fmt::Debug for InferencePreview {
@@ -1462,7 +1462,7 @@ impl InferenceHost {
                     &cancellation,
                     PreviewTarget {
                         progress,
-                        sender: &preview_tx,
+                        sender: Some(&preview_tx),
                         attempt: preview_attempt,
                         clock,
                         deadline_unix_ms: grant.deadline_unix_ms,
@@ -1708,7 +1708,7 @@ fn retain_provider_event(
     events: &mut Vec<RunnerInferenceProviderEvent>,
     encoded_bytes: &mut usize,
     event: ProviderEvent,
-    preview: &PreviewTarget<'_>,
+    preview: &mut PreviewTarget<'_>,
 ) -> Result<bool, InferenceHostError> {
     let event = match event {
         ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value),
@@ -1724,11 +1724,17 @@ fn retain_provider_event(
     *encoded_bytes += size + 1;
     let index = events.len();
     events.push(event);
-    if size <= INFERENCE_PREVIEW_EVENT_BYTES && preview.sender.receiver_count() > 0 {
-        let _ = preview.sender.send(InferencePreview {
+    if let Some(sender) = preview.sender
+        && sender.receiver_count() > 0
+    {
+        let event = (size <= INFERENCE_PREVIEW_EVENT_BYTES).then(|| events[index].clone());
+        if event.is_none() {
+            preview.sender = None;
+        }
+        let _ = sender.send(InferencePreview {
             attempt: preview.attempt.clone(),
             sequence: index as u64,
-            event: events[index].clone(),
+            event,
         });
     }
     Ok(true)
@@ -1822,7 +1828,7 @@ impl StreamProgress {
 
 struct PreviewTarget<'a> {
     progress: Option<StreamProgress>,
-    sender: &'a broadcast::Sender<InferencePreview>,
+    sender: Option<&'a broadcast::Sender<InferencePreview>>,
     attempt: RunnerInferenceAttemptIdentity,
     clock: GrantClock,
     deadline_unix_ms: u64,
@@ -1873,7 +1879,7 @@ async fn execute_and_retain(
                     && progress.observes(&event, protocol) {
                     io_deadline = preview.clock.latest_server_time().saturating_add(progress.idle.get());
                 }
-                if !retain_provider_event(&mut events, &mut encoded_bytes, event, &preview)? {
+                if !retain_provider_event(&mut events, &mut encoded_bytes, event, &mut preview)? {
                     overflow = true;
                     execution_cancel.cancel();
                     receiver.close();
@@ -1884,7 +1890,7 @@ async fn execute_and_retain(
                 // Its last sends may already be queued. Never keep a suffix
                 // after the first event that did not fit.
                 while !overflow && let Ok(event) = receiver.try_recv() {
-                    overflow = !retain_provider_event(&mut events, &mut encoded_bytes, event, &preview)?;
+                    overflow = !retain_provider_event(&mut events, &mut encoded_bytes, event, &mut preview)?;
                 }
                 break;
             }

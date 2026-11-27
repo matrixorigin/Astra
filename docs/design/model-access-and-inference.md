@@ -449,7 +449,10 @@ exhausted subscription capacity disables preview and emits a warning without
 rejecting the provider attempt. A subsequent stream loss, socket replacement,
 or gap stops preview and emits a warning. Durable custody supplies the
 undisplayed suffix and remains the authority for tools, usage and completion.
-Only events that fit in the retained prefix are eligible for preview.
+Only events that fit in the retained prefix are eligible for preview. An Edge
+that omits an oversized event sends an empty progress batch for that attempt.
+A validated terminal transfer header also closes its preview stream before
+credit is issued, so a lost final batch can be detected while custody is pending.
 
 Runner protocol 5 carries the optional rolling stream timeout and the current
 host's execution evidence. An explicit Run or deployment deadline bounds the

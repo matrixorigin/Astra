@@ -171,9 +171,9 @@ async fn worker_cancel_and_preview_progress_while_dispatch_preparation_is_paused
         .send(InferencePreview {
             attempt: grant.attempt.clone(),
             sequence: 0,
-            event: RunnerInferenceProviderEvent::Json(
+            event: Some(RunnerInferenceProviderEvent::Json(
                 serde_json::json!({"choices":[{"delta":{"content":"preview"}}]}),
-            ),
+            )),
         })
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -577,8 +577,8 @@ async fn preview_and_custody_share_the_exact_encoded_size_boundary() {
     for subscribed in [false, true] {
         let (sender, _) = broadcast::channel(4);
         let mut reader = subscribed.then(|| sender.subscribe());
-        let target = PreviewTarget {
-            sender: &sender,
+        let mut target = PreviewTarget {
+            sender: Some(&sender),
             attempt: grant.attempt.clone(),
             clock: fixture.clock,
             deadline_unix_ms: grant.deadline_unix_ms,
@@ -591,25 +591,101 @@ async fn preview_and_custody_share_the_exact_encoded_size_boundary() {
                 &mut events,
                 &mut bytes,
                 ProviderEvent::Json(value.clone()),
-                &target
+                &mut target
             )
             .unwrap()
         );
         assert!(
-            !retain_provider_event(&mut events, &mut bytes, ProviderEvent::Eof, &target).unwrap()
+            !retain_provider_event(&mut events, &mut bytes, ProviderEvent::Eof, &mut target)
+                .unwrap()
         );
         assert_eq!(events, std::slice::from_ref(&expected));
         assert_eq!(bytes, RUNNER_INFERENCE_ARTIFACT_BYTES);
         if let Some(reader) = reader.as_mut() {
             let preview = reader.try_recv().unwrap();
             assert_eq!(preview.sequence, 0);
-            assert_eq!(preview.event, events[0]);
+            assert_eq!(preview.event.as_ref(), Some(&events[0]));
             assert!(matches!(
                 reader.try_recv(),
                 Err(broadcast::error::TryRecvError::Empty)
             ));
         }
     }
+}
+
+#[tokio::test]
+async fn oversized_final_responses_events_interrupt_preview_before_custody_transfer() {
+    let fixture = Fixture::new("http://127.0.0.1:1").await;
+    let grant = fixture.grant("large-final-preview", REQUEST).await;
+    let mut connection = InferenceConnection::new(fixture.host.clone());
+    fixture
+        .host
+        .set_attempt_active_for_test(&grant.attempt, true)
+        .await;
+    connection.hello();
+    connection
+        .handle(EdgeServerMessage::InferenceHelloAck {
+            negotiation: RunnerInferenceNegotiation::Accepted {
+                protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+                delivery_generation: 7,
+                max_artifact_bytes: RUNNER_INFERENCE_ARTIFACT_BYTES as u32,
+                server_unix_ms: 1_000_000,
+            },
+        })
+        .await
+        .unwrap();
+    let mut reader = fixture.host.subscribe_preview();
+    let mut target = PreviewTarget {
+        sender: Some(&fixture.host.preview_tx),
+        attempt: grant.attempt.clone(),
+        clock: fixture.clock,
+        deadline_unix_ms: grant.deadline_unix_ms,
+        progress: None,
+    };
+    let suffix = "x".repeat(INFERENCE_PREVIEW_EVENT_BYTES);
+    let input = [
+        serde_json::json!({"type": "response.output_text.delta", "delta": "a"}),
+        serde_json::json!({"type": "response.output_text.delta", "delta": suffix}),
+        serde_json::json!({"type": "response.completed", "response": {"output": [{"type": "message", "content": [{"type": "output_text", "text": format!("a{suffix}")}]}]}}),
+    ];
+    let mut retained = Vec::new();
+    let mut bytes = 0;
+    for value in &input {
+        assert!(
+            retain_provider_event(
+                &mut retained,
+                &mut bytes,
+                ProviderEvent::Json(value.clone()),
+                &mut target
+            )
+            .unwrap()
+        );
+    }
+    let prefix = connection
+        .handle_preview(reader.try_recv().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        matches!(prefix.as_slice(), [EdgeClientMessage::InferenceProgress { progress, .. }] if progress.events.len() == 1 && progress.events[0].sequence == 0)
+    );
+    // The provider has already finished, but the transfer is still waiting
+    // for credit. Its queued interruption must not depend on active execution.
+    fixture
+        .host
+        .set_attempt_active_for_test(&grant.attempt, false)
+        .await;
+    let end = connection
+        .handle_preview(reader.try_recv().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        matches!(end.as_slice(), [EdgeClientMessage::InferenceProgress { progress, .. }] if progress.events.is_empty() && progress.validate_wire_bounds().is_ok())
+    );
+    assert!(matches!(
+        reader.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(retained, input.map(RunnerInferenceProviderEvent::Json));
 }
 
 #[tokio::test]
@@ -656,15 +732,15 @@ async fn runner_preview_is_attempt_keyed_and_does_not_replace_terminal_custody()
     }));
     assert!(matches!(
         observed[0].event,
-        RunnerInferenceProviderEvent::Json(_)
+        Some(RunnerInferenceProviderEvent::Json(_))
     ));
     assert!(matches!(
         observed[1].event,
-        RunnerInferenceProviderEvent::Done
+        Some(RunnerInferenceProviderEvent::Done)
     ));
     assert!(matches!(
         observed[2].event,
-        RunnerInferenceProviderEvent::Eof
+        Some(RunnerInferenceProviderEvent::Eof)
     ));
 
     let payload = fixture.terminal().await;
@@ -1547,9 +1623,9 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
         .handle_preview(InferencePreview {
             attempt: grant.attempt.clone(),
             sequence: 0,
-            event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+            event: Some(RunnerInferenceProviderEvent::Json(serde_json::json!({
                 "choices": [{"delta": {"content": "first"}}]
-            })),
+            }))),
         })
         .await
         .unwrap();
@@ -1568,9 +1644,9 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
             .handle_preview(InferencePreview {
                 attempt: grant.attempt.clone(),
                 sequence: 0,
-                event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                event: Some(RunnerInferenceProviderEvent::Json(serde_json::json!({
                     "choices": [{"delta": {"content": "first"}}]
-                })),
+                }))),
             })
             .await
             .unwrap()
@@ -1581,7 +1657,7 @@ async fn runner_preview_connection_sends_first_event_and_drops_duplicate_sequenc
         .handle_preview(InferencePreview {
             attempt: grant.attempt,
             sequence: 1,
-            event: RunnerInferenceProviderEvent::Done,
+            event: Some(RunnerInferenceProviderEvent::Done),
         })
         .await
         .unwrap();
@@ -1625,9 +1701,9 @@ async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_m
                 .handle_preview(InferencePreview {
                     attempt: grant.attempt.clone(),
                     sequence: 0,
-                    event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+                    event: Some(RunnerInferenceProviderEvent::Json(serde_json::json!({
                         "choices": [{"delta": {"content": "partial"}}]
-                    })),
+                    }))),
                 })
                 .await
                 .unwrap()
@@ -1683,9 +1759,9 @@ async fn runner_preview_assemblies_are_retired_when_provider_ends_without_done_m
         .handle_preview(InferencePreview {
             attempt: completed_attempts[0].clone(),
             sequence: 1,
-            event: RunnerInferenceProviderEvent::Json(serde_json::json!({
+            event: Some(RunnerInferenceProviderEvent::Json(serde_json::json!({
                 "choices": [{"delta": {"content": "late"}}]
-            })),
+            }))),
         })
         .await
         .unwrap();
@@ -1933,7 +2009,10 @@ async fn device_grant_streams_past_startup_and_accepts_two_hour_explicit_budget(
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(matches!(event.event, RunnerInferenceProviderEvent::Json(_)));
+            assert!(matches!(
+                event.event,
+                Some(RunnerInferenceProviderEvent::Json(_))
+            ));
         }
         drop(send);
         provider.await.unwrap();

@@ -443,6 +443,10 @@ impl DevicePreview {
         if self.stopped {
             return;
         }
+        if events.is_empty() {
+            self.interrupt(callback);
+            return;
+        }
         for item in events {
             if item.sequence < self.sequence as u64 {
                 continue;
@@ -1145,6 +1149,55 @@ mod tests {
                 LlmStreamUpdate::Text("c".into())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn omitted_tail_warns_before_custody_then_replays_only_the_suffix() {
+        let mut preview = DevicePreview::default();
+        let suffix = "x".repeat(32 * 1024);
+        let text = format!("a{suffix}");
+        let first = text_delta("a");
+        let mut updates = Vec::new();
+        preview.observe(
+            &[RunnerInferenceProgressEvent {
+                sequence: 0,
+                event: first.clone(),
+            }],
+            &mut |u| updates.push(u),
+        );
+        preview.observe(&[], &mut |u| updates.push(u));
+        preview.interrupt(&mut |u| updates.push(u)); // delayed terminal header closes the relay
+        assert_eq!(
+            updates,
+            [
+                LlmStreamUpdate::Text("a".into()),
+                LlmStreamUpdate::DevicePreviewInterrupted
+            ]
+        );
+        let retained = response(
+            vec![
+                first,
+                text_delta(&suffix),
+                terminal(
+                    json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}]),
+                ),
+            ],
+            RunnerInferenceTransportStatus::Complete,
+        );
+        let output = collect_custody_response(
+            retained,
+            route(),
+            Instant::now(),
+            &HashSet::new(),
+            None,
+            Some(&mut |u| updates.push(u)),
+            Some(preview),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.full_text, text);
+        assert_eq!(updates[2..], [LlmStreamUpdate::Text(suffix)]);
     }
 
     #[tokio::test]

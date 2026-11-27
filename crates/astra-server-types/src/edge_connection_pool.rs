@@ -1141,6 +1141,15 @@ impl EdgeConnectionPool {
         Some(receiver)
     }
 
+    /// Terminal transfer has started. Let readers drain their existing prefix
+    /// and detect a lost final preview even if credit or custody ACK is delayed.
+    pub fn close_runner_inference_progress(&self, attempt: &RunnerInferenceAttemptIdentity) {
+        self.runner_progress.remove(&(
+            attempt.user_id.clone(),
+            attempt.attempt_id.as_str().to_owned(),
+        ));
+    }
+
     /// Publish one already-authenticated progress batch to same-pod run
     /// owners.  No await or backpressure occurs here: previews are
     /// disposable, and terminal delivery has a separate reserved path.
@@ -3402,7 +3411,12 @@ mod tests {
         )
         .unwrap();
         pool.publish_runner_inference_progress(batch).unwrap();
+        pool.close_runner_inference_progress(&alice);
         let received = alice_rx.recv().await.unwrap();
+        assert!(matches!(
+            alice_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
         assert_eq!(received.attempt, alice);
         assert!(
             tokio::time::timeout(Duration::from_millis(25), bob_rx.recv())

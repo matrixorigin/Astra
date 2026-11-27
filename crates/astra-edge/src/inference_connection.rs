@@ -112,6 +112,22 @@ impl InferenceConnection {
             // terminal custody independently; dropping this preview is safe.
             return Ok(Vec::new());
         };
+        let key = preview.attempt.attempt_id.as_str().to_owned();
+        let Some(event) = preview.event else {
+            let mut messages = Vec::new();
+            if let Some(pending) = self.pending_progress.remove(&key)
+                && !pending.events.is_empty()
+            {
+                let batch = RunnerInferenceProgressBatch::new(pending.attempt, pending.events)
+                    .map_err(|_| InferenceHostError::IdentityConflict)?;
+                messages.push(Self::progress_message(batch, generation));
+            }
+            messages.push(Self::progress_message(
+                RunnerInferenceProgressBatch::interrupted(preview.attempt),
+                generation,
+            ));
+            return Ok(messages);
+        };
         if !self.host.is_attempt_active(&preview.attempt).await {
             // A provider task removes itself from the active-attempt set only
             // after terminal custody is durable. A broadcast event that was
@@ -119,22 +135,24 @@ impl InferenceConnection {
             // recreate connection-local progress after terminal delivery.
             return Ok(Vec::new());
         }
-        let key = preview.attempt.attempt_id.as_str().to_owned();
         let item = RunnerInferenceProgressEvent {
             sequence: preview.sequence,
-            event: preview.event,
+            event,
         };
         let terminal_marker = matches!(
             &item.event,
             RunnerInferenceProviderEvent::Done | RunnerInferenceProviderEvent::Eof
-        );
+        ) || matches!(&item.event, RunnerInferenceProviderEvent::Json(value) if astra_core::model_wire::responses::is_terminal_event(value));
         let first = !self.pending_progress.contains_key(&key);
         if first {
-            let Ok(batch) = RunnerInferenceProgressBatch::new(preview.attempt, vec![item.clone()])
+            let Ok(batch) =
+                RunnerInferenceProgressBatch::new(preview.attempt.clone(), vec![item.clone()])
             else {
                 // The event is too large for the complete bounded envelope.
-                // It remains available in terminal custody; expose the gap.
-                return Ok(Vec::new());
+                return Ok(vec![Self::progress_message(
+                    RunnerInferenceProgressBatch::interrupted(preview.attempt),
+                    generation,
+                )]);
             };
             if !terminal_marker {
                 if self.pending_progress.len() >= MAX_PENDING_PROGRESS {
@@ -234,18 +252,24 @@ impl InferenceConnection {
                 if let Some(previous) = previous {
                     messages.push(Self::progress_message(previous, generation));
                 }
-                if terminal_marker {
-                    if let Ok(singleton) =
-                        RunnerInferenceProgressBatch::new(pending_attempt, vec![item])
-                    {
-                        messages.push(Self::progress_message(singleton, generation));
-                    }
-                    self.pending_progress.remove(&key);
-                } else if RunnerInferenceProgressBatch::new(pending_attempt, vec![item.clone()])
-                    .is_ok()
-                    && let Some(pending) = self.pending_progress.get_mut(&key)
+                match RunnerInferenceProgressBatch::new(pending_attempt.clone(), vec![item.clone()])
                 {
-                    pending.events.push(item);
+                    Ok(singleton) if terminal_marker => {
+                        messages.push(Self::progress_message(singleton, generation));
+                        self.pending_progress.remove(&key);
+                    }
+                    Ok(_) => {
+                        if let Some(pending) = self.pending_progress.get_mut(&key) {
+                            pending.events.push(item);
+                        }
+                    }
+                    Err(_) => {
+                        messages.push(Self::progress_message(
+                            RunnerInferenceProgressBatch::interrupted(pending_attempt),
+                            generation,
+                        ));
+                        self.pending_progress.remove(&key);
+                    }
                 }
             }
         }

@@ -578,6 +578,7 @@ async fn handle_message(
             let result = ResponseAssembly::new(*transfer);
             Some(match result {
                 Ok(mut assembly) => {
+                    pool.close_runner_inference_progress(&assembly.header.attempt);
                     let credit = assembly.credit(generation);
                     transfers.insert(id, assembly);
                     credit
