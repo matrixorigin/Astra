@@ -4986,6 +4986,9 @@ fn handle_global_key_action(
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) -> Option<GlobalKeyHandling> {
+    if handle_conversation_tab_shortcut(&key, bottom_pane, frame_requester) {
+        return Some(GlobalKeyHandling::Handled);
+    }
     let action = AppKeymap::resolve(key)?;
     match action {
         AppAction::ToggleTranscript => {
@@ -11320,13 +11323,6 @@ pub(crate) async fn run_tui_session(
                             )
                             .await;
                             frame_requester.schedule_frame();
-                            continue;
-                        }
-                        if handle_conversation_tab_shortcut(
-                            &key,
-                            &mut bottom_pane,
-                            &frame_requester,
-                        ) {
                             continue;
                         }
                         if is_primary_task_shortcut(&key)

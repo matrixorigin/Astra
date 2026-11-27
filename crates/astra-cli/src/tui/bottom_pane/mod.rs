@@ -3749,7 +3749,7 @@ impl BottomPane {
             "/help keys lists the shortcuts.",
         ];
         const WORKING: &[&str] = &[
-            "Enter guides this run. Ctrl+Q queues for the next turn.",
+            "Ctrl+Q queues the next turn.",
             "Ctrl+O opens the live transcript.",
             "Ctrl+G inspects active runs.",
         ];

@@ -222,7 +222,8 @@ fn focused_agent_activity_line(
     run_id: &str,
     width: u16,
 ) -> Line<'static> {
-    use super::bottom_pane::in_flight_agents_view::{format_elapsed, state_color, state_phrase};
+    use super::bottom_pane::background_task_view::types::format_elapsed;
+    use super::bottom_pane::in_flight_agents_view::{state_color, state_phrase};
     let Some((cell, state, attention)) = widget.agent_run_for_workspace(agent_id, run_id) else {
         return Line::styled(
             super::history_cell::truncate_by_width(
@@ -1216,7 +1217,7 @@ mod compact_surface_tests {
         let (first, height_with_tip) = draw(&mut pane, 80, 24);
         assert!(
             first.lines().any(|row| {
-                row.contains("Message Astra") && row.contains("Tip  Ctrl+Q queues input")
+                row.contains("Message Astra") && row.contains("Tip  Ctrl+Q queues the next turn")
             }),
             "{first}"
         );
@@ -1273,7 +1274,7 @@ mod compact_surface_tests {
             assert_eq!(buffer[(x - 1, y)].symbol(), "i");
             if height == 8 {
                 assert!(
-                    text.contains("ship staging") && text.contains("> ship production"),
+                    text.contains("ship staging") && text.contains("› ship production"),
                     "{text}"
                 );
             } else {

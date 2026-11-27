@@ -1943,7 +1943,7 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
     }
     let text = render(&pane);
     assert!(
-        text.contains("> shred branches") && text.contains("ship staging build"),
+        text.contains("› shred branches") && text.contains("ship staging build"),
         "{text}"
     );
     pane.handle_session_key_at(
@@ -1953,7 +1953,7 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
     );
     let text = render(&pane);
     assert!(
-        text.contains("> ship canary build") && text.contains("ship staging build"),
+        text.contains("› ship canary build") && text.contains("ship staging build"),
         "{text}"
     );
     assert!(!text.contains("shred branches"), "{text}");
@@ -1963,14 +1963,14 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         start + Duration::from_millis(55),
         &history,
     );
-    assert!(render(&pane).contains("> shred branches"));
+    assert!(render(&pane).contains("› shred branches"));
     pane.handle_session_key_at(
         key(KeyCode::Char('i')),
         start + Duration::from_millis(65),
         &history,
     );
 
-    assert!(render(&pane).contains("> ship canary build"));
+    assert!(render(&pane).contains("› ship canary build"));
 
     for (at, code, expected) in [
         (75, KeyCode::Up, "ship staging build"),
@@ -2042,7 +2042,7 @@ fn fuzzy_history_suggestions_rank_matches_without_recalling_commands() {
     pane.handle_session_paste("PC", &history);
     pane.render(area, &mut buffer);
     let text = buffer_to_string(&buffer);
-    assert!(text.contains("> pc probe ready"), "{text}");
+    assert!(text.contains("› pc probe ready"), "{text}");
     assert!(text.contains("deploy production canary"), "{text}");
     assert!(text.contains("dispatch package cache"), "{text}");
     assert!(
@@ -2083,7 +2083,7 @@ fn pasted_fuzzy_history_query_scrolls_to_older_matches() {
     pane.handle_session_paste("部署境", &history);
     let text = render(&pane).replace(' ', "");
     assert!(
-        text.contains(">部署环境6") && text.contains("部署环境5"),
+        text.contains("›部署环境6") && text.contains("部署环境5"),
         "{text}"
     );
     assert!(!text.contains("部署环境1"), "{text}");
@@ -2103,7 +2103,7 @@ fn pasted_fuzzy_history_query_scrolls_to_older_matches() {
     );
     assert_eq!(pane.composer.text(), "部署境");
     let text = render(&pane).replace(' ', "");
-    assert!(text.contains(">部署环境1"), "{text}");
+    assert!(text.contains("›部署环境1"), "{text}");
     assert!(matches!(
         pane.handle_session_key_at(
             key(KeyCode::Tab),
@@ -2161,9 +2161,9 @@ fn typed_history_suggestions_refresh_after_a_fast_input_burst() {
         BottomPaneAction::Consumed
     ));
     assert_eq!(pane.composer.text(), "shi");
-    assert!(render(&pane).contains("> ship canary build"));
+    assert!(render(&pane).contains("› ship canary build"));
     pane.handle_session_key_at(key(KeyCode::Up), at(71), &history);
-    assert!(render(&pane).contains("> ship staging build"));
+    assert!(render(&pane).contains("› ship staging build"));
 
     // An early paste control is still literal input, never acceptance or
     // submission, regardless of whether a frame already flushed the bytes.

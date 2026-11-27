@@ -676,7 +676,13 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
         assert!(pane.mark_user_intent_unconfirmed("intent-agent-1"));
         assert!(!pane.mark_user_intent_unconfirmed("intent-agent-1"));
         let rendered = render_text(&pane, Rect::new(0, 0, 100, 8));
-        assert!(rendered.contains("unknown"), "{rendered}");
+        let disposition = if accepted { "used" } else { "received" };
+        assert!(
+            rendered.contains(&format!(
+                "Can't confirm Reviewer {disposition} your message"
+            )),
+            "{rendered}"
+        );
         assert!(!rendered.contains("Sending"), "{rendered}");
         assert!(!rendered.contains("sending"), "{rendered}");
         assert!(pane.take_client_recoverable_user_intents().is_empty());

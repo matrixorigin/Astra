@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use nix::pty::{Winsize, openpty};
 
 const CPR_REQUEST: &[u8] = b"\x1b[6n";
-const CPR_RESPONSE: &[u8] = b"\x1b[1;1R";
 const DA1_REQUEST: &[u8] = b"\x1b[c";
 const DA1_RESPONSE_WITHOUT_SIXEL: &[u8] = b"\x1b[?1;2c";
 // Full-workspace nextest runs contend for CPU and linker I/O even though each
@@ -343,7 +342,8 @@ impl PtyAstra {
     fn answer_terminal_queries(&mut self) {
         let cpr_requests = count_bytes(&self.output, CPR_REQUEST);
         while self.cpr_replies < cpr_requests {
-            self.write(CPR_RESPONSE);
+            let (row, col) = self.screen.screen().cursor_position();
+            self.write(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
             self.cpr_replies += 1;
         }
         let da1_requests = count_bytes(&self.output, DA1_REQUEST);
@@ -544,6 +544,7 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
         UI_TRANSITION_TIMEOUT,
         |screen| {
             screen.contains("Background tasks")
+                && screen.contains("Enter details · Esc close")
                 && !screen.contains("background navigation draft")
                 && screen.lines().any(|line| {
                     line.contains("Task") && line.contains("State") && line.contains("Time")
@@ -3940,6 +3941,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Returned to root transcript");
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");
         astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);

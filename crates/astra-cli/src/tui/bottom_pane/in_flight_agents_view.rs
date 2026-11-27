@@ -22,6 +22,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::history_cell::truncate_by_width as truncate_to_width;
 
+use super::background_task_view::types::format_elapsed;
 use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ViewActionDisposition,
     ViewActionRequest,
@@ -592,18 +593,6 @@ fn fanout_header(
     }
 
     header
-}
-
-pub(crate) fn format_elapsed(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        let mins = ms / 60_000;
-        let secs = (ms % 60_000) / 1000;
-        format!("{mins}m{secs}s")
-    }
 }
 
 const PAGE_STEP: usize = 8;
