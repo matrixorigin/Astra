@@ -63,6 +63,12 @@ copy of an event. A post-login sync waits briefly for projection and one drain.
 If that wait expires, it reports an unconfirmed result while the owned task
 continues; cancellation of the wait does not cancel that work.
 
+Projection copies the complete, durable source prefix under the journal lock,
+then parses and projects its records without holding the appender lock. A torn
+tail stays behind the cursor, and an invalid source leaves it unchanged. The
+source snapshot, prepared compact events, and retained outbox still consume
+memory in proportion to their size; there is no fixed per-client memory bound.
+
 Cloud audit omits CLI transcript sidecars and local conversation commits.
 Embedded tool records omit exact arguments and results, typed local artifact
 descriptors, and runtime advisories. The projection keeps tool previews,

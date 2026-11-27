@@ -107,9 +107,7 @@ pub enum HistoryWorkSite {
     CloudHistoryGroupingClone,
     CloudSummaryPromptClone,
     CloudSummarySerialization,
-    SyncOutboxPayloadClone,
     SyncOutboxPayloadHash,
-    SyncOutboxJournalDeltaClone,
     SyncOutboxDeliveryClone,
     SyncOutboxDeliverySerialization,
     SyncOutboxQueueRead,
@@ -125,7 +123,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 105;
+    const COUNT: usize = 103;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -219,9 +217,7 @@ impl HistoryWorkSite {
         Self::CloudHistoryGroupingClone,
         Self::CloudSummaryPromptClone,
         Self::CloudSummarySerialization,
-        Self::SyncOutboxPayloadClone,
         Self::SyncOutboxPayloadHash,
-        Self::SyncOutboxJournalDeltaClone,
         Self::SyncOutboxDeliveryClone,
         Self::SyncOutboxDeliverySerialization,
         Self::SyncOutboxQueueRead,
@@ -334,9 +330,7 @@ impl HistoryWorkSite {
             Self::CloudHistoryGroupingClone => "cloud_history_grouping_clone",
             Self::CloudSummaryPromptClone => "cloud_summary_prompt_clone",
             Self::CloudSummarySerialization => "cloud_summary_serialization",
-            Self::SyncOutboxPayloadClone => "sync_outbox_payload_clone",
             Self::SyncOutboxPayloadHash => "sync_outbox_payload_hash",
-            Self::SyncOutboxJournalDeltaClone => "sync_outbox_journal_delta_clone",
             Self::SyncOutboxDeliveryClone => "sync_outbox_delivery_clone",
             Self::SyncOutboxDeliverySerialization => "sync_outbox_delivery_serialization",
             Self::SyncOutboxQueueRead => "sync_outbox_queue_read",
@@ -457,9 +451,7 @@ impl HistoryWorkSite {
             Self::CloudSummaryPromptClone | Self::CloudSummarySerialization => {
                 "turn_core.cloud_summary"
             }
-            Self::SyncOutboxPayloadClone
-            | Self::SyncOutboxPayloadHash
-            | Self::SyncOutboxJournalDeltaClone
+            Self::SyncOutboxPayloadHash
             | Self::SyncOutboxDeliveryClone
             | Self::SyncOutboxDeliverySerialization
             | Self::SyncOutboxQueueRead
