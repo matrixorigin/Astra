@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 type Key = (String, String);
 const MAX_WAITERS: usize = 1024;
 const MAX_WAITERS_PER_USER: usize = 128;
+const READ_BATCH_SIZE: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerReadiness {
@@ -32,30 +33,31 @@ struct Waiter {
     // Only this pod's socket handler can set this hint. It schedules recovery
     // reads; it cannot extend a deadline or prove that a result exists.
     local_socket: Option<CancellationToken>,
-    next_recovery: tokio::time::Instant,
+    fixed_deadline: Option<tokio::time::Instant>,
 }
 
 impl Waiter {
-    fn poll_due(&mut self, now: tokio::time::Instant) -> bool {
-        if self
-            .local_socket
+    fn observe_execution(&self, expires: tokio::time::Instant) {
+        self.readiness.send_if_modified(|previous| {
+            if matches!(*previous, RunnerReadiness::Executing(last) if expires <= last + Duration::from_secs(1)) {
+                return false;
+            }
+            *previous = RunnerReadiness::Executing(expires);
+            true
+        });
+    }
+
+    fn poll_due(&self, now: tokio::time::Instant) -> bool {
+        let RunnerReadiness::Executing(expires) = *self.readiness.borrow() else {
+            return true;
+        };
+        let recover_by = self
+            .fixed_deadline
+            .map_or(expires, |deadline| deadline.min(expires));
+        self.local_socket
             .as_ref()
             .is_none_or(CancellationToken::is_cancelled)
-        {
-            return true;
-        }
-        // Near observation expiry, a missed terminal must be discovered at
-        // the normal cadence. A socket hint alone never proves liveness.
-        let interval = Duration::from_secs(2);
-        if !matches!(*self.readiness.borrow(), RunnerReadiness::Executing(expires) if expires > now + interval)
-        {
-            return true;
-        }
-        if now < self.next_recovery {
-            return false;
-        }
-        self.next_recovery = now + interval;
-        true
+            || recover_by <= now + Duration::from_secs(2)
     }
 }
 
@@ -64,6 +66,16 @@ struct State {
     running: bool,
     waiters: HashMap<Key, Waiter>,
     reservations: HashMap<String, usize>,
+}
+
+impl State {
+    fn due_keys(&self, now: tokio::time::Instant) -> Vec<Key> {
+        self.waiters
+            .iter()
+            .filter(|(_, waiter)| waiter.poll_due(now))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -108,6 +120,7 @@ impl RunnerReadinessReservation {
     pub fn subscribe(
         self,
         identity: &RunnerInferenceAttemptIdentity,
+        fixed_deadline: Option<tokio::time::Instant>,
     ) -> ServiceResult<watch::Receiver<RunnerReadiness>> {
         if identity.user_id != self.user_id {
             return Err(ServiceError::invalid(
@@ -129,8 +142,15 @@ impl RunnerReadinessReservation {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(sender) = state.waiters.get(&key) {
-            return Ok(sender.readiness.subscribe());
+        if let Some(waiter) = state.waiters.get_mut(&key) {
+            if let Some(deadline) = fixed_deadline {
+                waiter.fixed_deadline = Some(
+                    waiter
+                        .fixed_deadline
+                        .map_or(deadline, |existing| existing.min(deadline)),
+                );
+            }
+            return Ok(waiter.readiness.subscribe());
         }
         let (sender, receiver) = watch::channel(RunnerReadiness::Waiting);
         state.waiters.insert(
@@ -138,7 +158,7 @@ impl RunnerReadinessReservation {
             Waiter {
                 readiness: sender,
                 local_socket: None,
-                next_recovery: tokio::time::Instant::now(),
+                fixed_deadline,
             },
         );
         if !state.running {
@@ -173,12 +193,12 @@ impl RunnerContinuationWaiters {
         }
     }
 
-    /// Exact same-pod custody wakes the waiter immediately. Keep bounded
-    /// recovery reads for a missed notification or a socket moving to another pod.
+    /// Publish the committed execution observation with its exact socket lifetime.
+    /// Missing evidence restores durable recovery without declaring a terminal.
     pub fn note_local_execution(
         &self,
         identity: &RunnerInferenceAttemptIdentity,
-        disconnected: CancellationToken,
+        observation: Option<(tokio::time::Instant, CancellationToken)>,
     ) {
         let key = (
             identity.user_id.clone(),
@@ -191,7 +211,13 @@ impl RunnerContinuationWaiters {
             .waiters
             .get_mut(&key)
         {
-            waiter.local_socket = Some(disconnected);
+            if let Some((expires, disconnected)) = observation {
+                waiter.local_socket = Some(disconnected);
+                waiter.observe_execution(expires);
+            } else {
+                waiter.local_socket = None;
+                self.notify();
+            }
         }
     }
 
@@ -204,7 +230,8 @@ impl RunnerContinuationWaiters {
         pool: SharedPool,
         identity: &RunnerInferenceAttemptIdentity,
     ) -> ServiceResult<watch::Receiver<RunnerReadiness>> {
-        self.reserve(&pool, &identity.user_id)?.subscribe(identity)
+        self.reserve(&pool, &identity.user_id)?
+            .subscribe(identity, None)
     }
 
     pub fn reserve(
@@ -261,17 +288,10 @@ impl RunnerContinuationWaiters {
                     state.running = false;
                     return;
                 }
-                let now = tokio::time::Instant::now();
-                let mut due = Vec::new();
-                for (key, waiter) in &mut state.waiters {
-                    if waiter.poll_due(now) {
-                        due.push(key.clone());
-                    }
-                }
-                due
+                state.due_keys(tokio::time::Instant::now())
             };
             let poll_started = tokio::time::Instant::now();
-            for batch in keys.chunks(128) {
+            for batch in keys.chunks(READ_BATCH_SIZE) {
                 match tokio::time::timeout(Duration::from_secs(2), poll_batch(&pool, batch)).await {
                     Ok(Ok(ready)) => {
                         let mut state = self
@@ -286,15 +306,7 @@ impl RunnerContinuationWaiters {
                             match readiness {
                                 RunnerReadiness::Executing(now) => {
                                     if let Some(sender) = state.waiters.get(key) {
-                                        sender.readiness.send_if_modified(|previous| {
-                                            if matches!(*previous, RunnerReadiness::Executing(last)
-                                                if now <= last + Duration::from_secs(1))
-                                            {
-                                                return false;
-                                            }
-                                            *previous = readiness;
-                                            true
-                                        });
+                                        sender.observe_execution(now);
                                     }
                                 }
                                 RunnerReadiness::Waiting => {}
@@ -390,43 +402,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_execution_spaces_recovery_reads_without_postponing_them_on_heartbeat() {
-        let start = tokio::time::Instant::now();
-        let (readiness, _receiver) = watch::channel(RunnerReadiness::Waiting);
+    fn same_pod_fixed_and_rolling_waiters_use_custody_wakeup_with_bounded_recovery() {
+        let now = tokio::time::Instant::now();
+        let (readiness, _rx) = watch::channel(RunnerReadiness::Waiting);
+        let socket = CancellationToken::new();
         let mut waiter = Waiter {
             readiness,
-            local_socket: None,
-            next_recovery: tokio::time::Instant::now(),
+            local_socket: Some(socket.clone()),
+            fixed_deadline: None,
         };
-        assert!(waiter.poll_due(start));
-        assert!(waiter.poll_due(start + Duration::from_millis(550)));
-        let socket = CancellationToken::new();
-        waiter.local_socket = Some(socket.clone());
-        waiter.next_recovery = start;
-        assert!(
-            waiter.poll_due(start),
-            "a local socket alone is insufficient"
-        );
+        assert!(waiter.poll_due(now));
+        let expires = now + Duration::from_secs(60);
         waiter
             .readiness
-            .send_replace(RunnerReadiness::Executing(start + Duration::from_secs(12)));
-        let mut passes = 0;
-        for tick in 0..19 {
-            let now = start + Duration::from_millis(550 * tick);
-            waiter.local_socket = Some(socket.clone());
-            passes += usize::from(waiter.poll_due(now));
+            .send_replace(RunnerReadiness::Executing(expires));
+        for deadline in [None, Some(now + Duration::from_secs(15))] {
+            waiter.fixed_deadline = deadline;
+            let reads = (0..19)
+                .filter(|tick| waiter.poll_due(now + Duration::from_millis(550 * tick)))
+                .count();
+            assert_eq!(reads, 0);
+            assert!(waiter.poll_due(deadline.unwrap_or(expires) - Duration::from_secs(2)));
         }
-        assert_eq!(passes, 5);
         socket.cancel();
-        assert!(
-            waiter.poll_due(start + Duration::from_millis(9950)),
-            "remote takeover restores fast recovery"
+        assert!(waiter.poll_due(now));
+        waiter.local_socket = None;
+        assert!(waiter.poll_due(now));
+    }
+
+    #[test]
+    fn readiness_select_budget_for_full_local_and_remote_batches() {
+        let now = tokio::time::Instant::now();
+        let expires = now + Duration::from_secs(60);
+        let fixed = now + Duration::from_secs(15);
+        let mut state = State::default();
+        let socket = CancellationToken::new();
+        let (readiness, _rx) = watch::channel(RunnerReadiness::Executing(expires));
+        for id in 0..MAX_WAITERS {
+            state.waiters.insert(
+                (
+                    format!("user-{}", id / MAX_WAITERS_PER_USER),
+                    id.to_string(),
+                ),
+                Waiter {
+                    readiness: readiness.clone(),
+                    local_socket: Some(socket.clone()),
+                    fixed_deadline: (id % 2 == 0).then_some(fixed),
+                },
+            );
+        }
+        let batches = |at| state.due_keys(at).chunks(READ_BATCH_SIZE).count();
+        assert_eq!(
+            (0..19)
+                .map(|tick| batches(now + Duration::from_millis(tick * 550)))
+                .sum::<usize>(),
+            0
         );
-        waiter.local_socket = Some(CancellationToken::new());
-        assert!(
-            waiter.poll_due(start + Duration::from_secs(10)),
-            "restore fast polling near expiry"
-        );
+        assert_eq!(batches(fixed - Duration::from_secs(2)), 4);
+        assert_eq!(batches(expires - Duration::from_secs(2)), 8);
+        socket.cancel();
+        assert_eq!(batches(now), 8);
     }
 
     #[test]
@@ -462,7 +497,7 @@ mod tests {
             Waiter {
                 readiness: sender,
                 local_socket: None,
-                next_recovery: tokio::time::Instant::now(),
+                fixed_deadline: None,
             },
         );
         drop(receiver);

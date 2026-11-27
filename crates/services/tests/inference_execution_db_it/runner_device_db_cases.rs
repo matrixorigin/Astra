@@ -371,7 +371,7 @@ async fn late_device_terminal_uses_completed_deletion_fence_and_preserves_other_
             let waiters = Arc::new(RunnerContinuationWaiters::default());
             let mut readiness = waiters.subscribe(shared.clone(), identity).await.unwrap();
             assert_eq!(*readiness.borrow(), RunnerReadiness::Waiting);
-            record_runner_start_evidence(
+            let observed_until = record_runner_start_evidence(
                 &shared,
                 &connection,
                 &issued,
@@ -379,6 +379,13 @@ async fn late_device_terminal_uses_completed_deletion_fence_and_preserves_other_
             )
             .await
             .unwrap();
+            let expires = observed_until.expect("active observation was committed");
+            if !lost_terminal {
+                waiters.note_local_execution(
+                    identity,
+                    Some((expires, tokio_util::sync::CancellationToken::new())),
+                );
+            }
             let executing =
                 readiness.wait_for(|state| matches!(state, RunnerReadiness::Executing(_)));
             drop(

@@ -1365,8 +1365,8 @@ async fn terminal_write_failure_reports_expired_execution_on_the_same_connection
         .mount(&server)
         .await;
     let fixture = Fixture::new(&server.uri()).await;
-    let mut grant = fixture.grant("terminal-io-fail", REQUEST).await;
-    grant.stream_idle_ms = NonZeroU64::new(300_000);
+    let grant = fixture.grant("terminal-io-fail", REQUEST).await;
+    assert!(grant.stream_idle_ms.is_none());
     let (mut connection, _) = negotiated_connection(fixture.host.clone()).await;
     let reconcile = || EdgeServerMessage::InferenceReconcile {
         grant: Box::new(grant.clone()),

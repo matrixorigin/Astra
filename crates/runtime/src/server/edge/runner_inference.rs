@@ -478,17 +478,19 @@ async fn handle_message(
         EdgeClientMessage::InferenceStartEvidence {
             grant, evidence, ..
         } => match record_runner_start_evidence(db, connection, &grant, evidence).await {
-            Ok(()) => {
-                if evidence == RunnerInferenceStartEvidence::ExecutionActive
-                    && grant.stream_idle_ms.is_some()
-                    && let Some(disconnected) = pool.inference_socket_disconnect(
+            Ok(observed_until) => {
+                if matches!(
+                    evidence,
+                    RunnerInferenceStartEvidence::ExecutionActive
+                        | RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal
+                ) {
+                    let socket = pool.inference_socket_disconnect(
                         &connection.user_id,
                         connection.runner_id.as_str(),
                         &connection.edge_id,
-                    )
-                {
+                    );
                     pool.runner_continuation_waiters
-                        .note_local_execution(&grant.attempt, disconnected);
+                        .note_local_execution(&grant.attempt, observed_until.zip(socket));
                 }
                 if evidence == RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal {
                     progress_attempts.remove(grant.attempt.attempt_id.as_str());

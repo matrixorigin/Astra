@@ -741,7 +741,7 @@ impl InferenceConnection {
             | DispatchOutcome::Active
             | DispatchOutcome::EndedWithoutTerminal => {
                 let evidence = match result {
-                    DispatchOutcome::Active if grant.stream_idle_ms.is_some() => {
+                    DispatchOutcome::Started | DispatchOutcome::Active => {
                         RunnerInferenceStartEvidence::ExecutionActive
                     }
                     DispatchOutcome::EndedWithoutTerminal => {

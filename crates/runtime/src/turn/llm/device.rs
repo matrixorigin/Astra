@@ -257,16 +257,17 @@ impl RunDeviceInference {
         if preview_unavailable && let Some(callback) = callback.as_deref_mut() {
             callback(LlmStreamUpdate::DevicePreviewInterrupted);
         }
+        let initial_deadline =
+            tokio::time::Instant::now() + remaining.saturating_sub(started.elapsed());
         let mut readiness = reservation
-            .subscribe(&grant.attempt)
+            .subscribe(&grant.attempt, (!rolling).then_some(initial_deadline))
             .map_err(service_error)?;
         self.edges
             .notify_runner_inference(&self.user_id, grant.attempt.binding.runner_id.as_str());
         // A grant can cross the socket before its acknowledgement. Never retry
         // the provider request on a timeout, disconnect or lost Server future.
         let wait = async {
-            let mut until =
-                tokio::time::Instant::now() + remaining.saturating_sub(started.elapsed());
+            let mut until = initial_deadline;
             loop {
                 match *readiness.borrow_and_update() {
                     RunnerReadiness::Ready => break,

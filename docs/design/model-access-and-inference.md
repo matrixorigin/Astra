@@ -467,10 +467,10 @@ host that owns the fenced provider task. The report expires in at most 60
 seconds. Socket heartbeats and terminal persistence do not renew it. If the
 same host reports that the fenced task has ended without a retained terminal,
 the Server retires execution capacity and reports uncertain delivery.
-Successful local custody wakes the exact waiter immediately. A rolling attempt
-with confirmed local execution and a fresh durable observation uses a slower
-two-second recovery poll. Remote waits and expiring observations use the
-normal polling cadence.
+Successful local custody wakes the exact waiter immediately. While the same socket has fresh, committed execution evidence, fixed and
+rolling attempts wait for this notification. A disconnected socket, an ended
+task, or the approach of the evidence expiry or fixed caller deadline restores
+batched database recovery. Only rolling attempts extend their observation window.
 
 The Responses transport ends at a protocol terminal event. It retains that
 event without inventing HTTP EOF. The shared Responses accumulator validates
@@ -489,7 +489,7 @@ native binding records can be retired locally. Operations and their replay IDs
 are persisted before transmission, and the corresponding ACK state must fit
 within the same journal size limit.
 
-This adds fresh-schema contract `2026-11-26-v130`. An older deployment database
+This adds fresh-schema contract `2026-11-27-v131`. An older deployment database
 cannot be upgraded by replacing only its image. Deployment/schema migration
 and real-account QA verification require separate preparation; this feature
 change performs neither automatically.

@@ -463,7 +463,7 @@ pub async fn record_runner_start_evidence(
     connection: &AuthenticatedRunnerConnection,
     grant: &RunnerInferenceDispatchGrant,
     evidence: RunnerInferenceStartEvidence,
-) -> ServiceResult<()> {
+) -> ServiceResult<Option<tokio::time::Instant>> {
     if connection.user_id != grant.attempt.user_id
         || connection.runner_id != grant.attempt.binding.runner_id
     {
@@ -522,13 +522,14 @@ pub async fn record_runner_start_evidence(
             if row.try_get::<String, _>("status").map_err(persistence)? != "started"
                 || row.try_get::<bool, _>("retired").map_err(persistence)?
             {
-                return Ok(());
+                return Ok(None);
             }
             if evidence == RunnerInferenceStartEvidence::ExecutionActive {
                 "UPDATE inference_provider_attempts
                  SET runner_local_fence_at = COALESCE(runner_local_fence_at, NOW(6)),
                      runner_execution_observed_at = NOW(6)
-                 WHERE user_id = ? AND attempt_id = ? AND runner_cancel_requested_at IS NULL"
+                 WHERE user_id = ? AND attempt_id = ? AND runner_cancel_requested_at IS NULL
+                     AND runner_terminal_hash IS NULL AND runner_terminal_conflict = FALSE"
             } else {
                 // The executing host owns the exclusive journal and knows
                 // it no longer has this task. Free capacity while retaining
@@ -596,16 +597,21 @@ pub async fn record_runner_start_evidence(
                 .bind(reason).bind(&connection.user_id).bind(grant.attempt.attempt_id.as_str())
                 .execute(&mut *tx).await.map_err(persistence)?;
             tx.commit().await.map_err(persistence)?;
-            return Ok(());
+            return Ok(None);
         }
     };
-    sqlx::query(statement)
+    let observed = tokio::time::Instant::now();
+    let write = sqlx::query(statement)
         .bind(&connection.user_id)
         .bind(grant.attempt.attempt_id.as_str())
         .execute(&mut *tx)
         .await
         .map_err(persistence)?;
-    tx.commit().await.map_err(persistence)
+    tx.commit().await.map_err(persistence)?;
+    Ok(
+        (evidence == RunnerInferenceStartEvidence::ExecutionActive && write.rows_affected() > 0)
+            .then_some(observed + std::time::Duration::from_secs(60)),
+    )
 }
 
 fn persistence(error: sqlx::Error) -> ServiceError {
