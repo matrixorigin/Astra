@@ -115,6 +115,8 @@ pub struct SyncOutboxRecord {
     pub next_retry_after_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at_unix_ms: Option<u64>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +176,8 @@ fn hash_canonical_payload(payload_json: &str) -> String {
 pub struct SyncOutboxFile {
     pub schema_version: u32,
     pub ack_watermark: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_last_ack_at_unix_ms: Option<u64>,
     /// Server-wide backpressure applies to newly queued records and other
     /// processes as well as the batch which observed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +250,7 @@ impl Default for SyncOutboxFile {
         Self {
             schema_version: SYNC_OUTBOX_SCHEMA_VERSION,
             ack_watermark: 0,
+            compacted_last_ack_at_unix_ms: None,
             delivery_retry_after_unix_ms: None,
             journal_source_offsets: BTreeMap::new(),
             acked_tombstones: Vec::new(),
@@ -810,6 +815,12 @@ impl SyncOutboxStore {
             let mut claimed = Vec::with_capacity(indices.len());
             for index in indices {
                 let record = &mut state.records[index];
+                // Preserve the last recorded failure time when upgrading an older outbox.
+                if record.last_error.is_some() {
+                    record
+                        .last_error_at_unix_ms
+                        .get_or_insert(record.updated_at_unix_ms);
+                }
                 record.state = SyncOutboxRecordState::InFlight;
                 record.next_retry_after_unix_ms = None;
                 record.updated_at_unix_ms = now;
@@ -970,6 +981,7 @@ impl EnqueueIndex {
                 };
             }
             existing.state = SyncOutboxRecordState::Poisoned;
+            existing.last_error_at_unix_ms = Some(now);
             existing.last_error = Some(format!(
                 "same stable event id has different payload hash: existing={} incoming={}",
                 existing.payload_hash, candidate.payload_hash
@@ -995,6 +1007,7 @@ impl EnqueueIndex {
             record.sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.saturating_add(1);
             record.state = SyncOutboxRecordState::Poisoned;
+            record.last_error_at_unix_ms = Some(now);
             record.last_error = Some(if tombstone.payload_hash.is_empty() {
                 format!(
                     "compacted ack tombstone payload hash missing: record_id={}",
@@ -1132,6 +1145,11 @@ impl SyncOutboxFile {
         let mut new_tombstone_ids = HashSet::new();
         self.records.retain(|record| {
             let remove = record.state == SyncOutboxRecordState::Acked && record.sequence <= cutoff;
+            if remove {
+                self.compacted_last_ack_at_unix_ms = self
+                    .compacted_last_ack_at_unix_ms
+                    .max(record.acked_at_unix_ms);
+            }
             if remove
                 && !existing_tombstones.contains(&record.record_id)
                 && new_tombstone_ids.insert(record.record_id.clone())
@@ -1309,6 +1327,7 @@ fn build_record(
         state: SyncOutboxRecordState::Pending,
         next_retry_after_unix_ms: None,
         last_error: None,
+        last_error_at_unix_ms: None,
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         acked_at_unix_ms: None,
@@ -1428,6 +1447,7 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
     let mut status = SyncOutboxStatus {
         total: state.records.len() as u64,
         ack_watermark: state.ack_watermark,
+        last_ack_at_unix_ms: state.compacted_last_ack_at_unix_ms,
         ack_tombstones: state.acked_tombstones.len() as u64,
         skipped: state.skipped_records.len() as u64,
         pending_high_watermark: SYNC_OUTBOX_PENDING_HIGH_WATERMARK as u64,
@@ -1454,7 +1474,13 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
     }
     let mut last_pending_failure: Option<&SyncOutboxRecord> = None;
     let mut last_historical_failure: Option<&SyncOutboxRecord> = None;
+    let failure_time = |record: &SyncOutboxRecord| {
+        record
+            .last_error_at_unix_ms
+            .unwrap_or(record.updated_at_unix_ms)
+    };
     for record in &state.records {
+        status.last_ack_at_unix_ms = status.last_ack_at_unix_ms.max(record.acked_at_unix_ms);
         match record.state {
             SyncOutboxRecordState::Pending => {
                 status.pending += 1;
@@ -1496,11 +1522,7 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
                     );
                 }
             }
-            SyncOutboxRecordState::Acked => {
-                status.acked += 1;
-                status.last_ack_at_unix_ms =
-                    status.last_ack_at_unix_ms.max(record.acked_at_unix_ms);
-            }
+            SyncOutboxRecordState::Acked => status.acked += 1,
             SyncOutboxRecordState::Poisoned => status.poisoned += 1,
         }
         if record.last_error.is_some() {
@@ -1511,16 +1533,14 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
                 SyncOutboxRecordState::Poisoned => &mut last_historical_failure,
                 SyncOutboxRecordState::Acked => continue,
             };
-            if latest
-                .is_none_or(|previous| previous.updated_at_unix_ms <= record.updated_at_unix_ms)
-            {
+            if latest.is_none_or(|previous| failure_time(previous) <= failure_time(record)) {
                 *latest = Some(record);
             }
         }
     }
     let failure = |record: &SyncOutboxRecord| {
         record.last_error.as_ref().map(|reason| SyncOutboxFailure {
-            at_unix_ms: record.updated_at_unix_ms,
+            at_unix_ms: failure_time(record),
             reason: reason.clone(),
         })
     };
@@ -1609,6 +1629,7 @@ fn acknowledge_record(
         && hash != record.payload_hash
     {
         record.state = SyncOutboxRecordState::Poisoned;
+        record.last_error_at_unix_ms = Some(now);
         record.last_error = Some(format!(
             "ack payload hash mismatch: stored={} ack={}",
             record.payload_hash, hash
@@ -1626,6 +1647,7 @@ fn acknowledge_record(
     record.acked_at_unix_ms = Some(now);
     record.updated_at_unix_ms = now;
     record.last_error = None;
+    record.last_error_at_unix_ms = None;
     record.next_retry_after_unix_ms = None;
     SyncOutboxAckOutcome::Acked {
         record_id: record.record_id.clone(),
@@ -1641,6 +1663,7 @@ fn apply_delivery_rejection(record: &mut SyncOutboxRecord, error: &str, now: u64
         return false;
     }
     record.state = SyncOutboxRecordState::Poisoned;
+    record.last_error_at_unix_ms = Some(now);
     record.last_error = Some(error.to_string());
     record.updated_at_unix_ms = now;
     record.next_retry_after_unix_ms = None;
@@ -1660,6 +1683,7 @@ fn apply_delivery_deferral(
         return false;
     }
     record.state = SyncOutboxRecordState::Pending;
+    record.last_error_at_unix_ms = Some(now);
     record.last_error = Some(error.to_string());
     record.updated_at_unix_ms = now;
     let delay = retry_after.unwrap_or(SYNC_OUTBOX_DEFERRED_RETRY_DELAY);
@@ -3337,6 +3361,41 @@ mod tests {
         assert_eq!(
             status.ack_watermark, 2,
             "terminal poison isolation must not block later acked records"
+        );
+    }
+
+    #[test]
+    fn delivery_diagnostics_order_by_failure_and_confirmation_time() {
+        let (_temp, _guard, store) = test_store();
+        let mut old = build_record(&event("older"), 1, 1).unwrap().unwrap();
+        let mut recent = build_record(&event("newer"), 2, 1).unwrap().unwrap();
+        apply_delivery_deferral(&mut old, "older", 10, Some(std::time::Duration::ZERO));
+        apply_delivery_deferral(&mut recent, "newer", 20, Some(std::time::Duration::ZERO));
+        old.last_error_at_unix_ms = None; // Existing record written before failure timestamps.
+        store
+            .with_state(|s| {
+                s.records = vec![old, recent];
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.claim_ready_records(1, usize::MAX).unwrap().len(), 1);
+        let failure = store.status().unwrap().last_pending_failure.unwrap();
+        assert_eq!((failure.reason.as_str(), failure.at_unix_ms), ("newer", 20));
+
+        let mut state = SyncOutboxFile::default();
+        for i in 0..=SYNC_OUTBOX_ACKED_RETAINED_RECORDS {
+            let mut record = build_record(&event(&i.to_string()), i as u64 + 1, 1)
+                .unwrap()
+                .unwrap();
+            acknowledge_record(&mut record, None, if i == 0 { 100 } else { 20 });
+            state.records.push(record);
+        }
+        state.compact_acked_tail();
+        assert_eq!(state.acked_tombstones.len(), 1);
+        let reopened = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            status_from_state(&reopened, 101).last_ack_at_unix_ms,
+            Some(100)
         );
     }
 

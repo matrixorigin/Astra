@@ -3145,6 +3145,7 @@ mod tests {
             state: SyncOutboxRecordState::Pending,
             next_retry_after_unix_ms: None,
             last_error: None,
+            last_error_at_unix_ms: None,
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             acked_at_unix_ms: None,

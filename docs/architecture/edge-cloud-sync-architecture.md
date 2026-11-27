@@ -218,7 +218,9 @@ The TUI startup check reports an unreadable outbox. Retained failures are
 available on demand in `astra doctor`, which shows the local delivery queue
 and the last confirmed delivery separately from historical failures. The last
 confirmation describes an observed delivery, while a device with no recorded
-confirmation reports cloud delivery as unverified.
+confirmation reports cloud delivery as unverified. Queue compaction preserves the
+latest observed confirmation time. Claiming a record for another attempt
+preserves its last failure time until the attempt has a new outcome.
 
 ## Required operations
 
