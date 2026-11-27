@@ -524,9 +524,7 @@ pub(crate) async fn reveal_background_task_view_with_extra_rows(
     .await
 }
 
-/// Always open the task panel, even if the registry is empty.
-/// Used by Ctrl+B/Shift+Down so the user always lands in a panel they can navigate or
-/// dismiss. Empty-state rendering lives in `BackgroundTaskView`.
+/// Open the task panel even if there are no background tasks.
 pub(crate) async fn force_open_background_task_view(
     background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,

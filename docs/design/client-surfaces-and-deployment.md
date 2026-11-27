@@ -205,7 +205,10 @@ use the missing-reply fallback. Cursor replies are associated with the queried d
 resizes invalidate them. Scheduled frames wait for this reconciliation and
 cannot advance the remembered screen size; viewport growth erases
 transient UI before scrolling. Resize must preserve native history and must
-not purge scrollback. Terminals that do not answer cursor queries fall back to
+not purge scrollback. A terminal can move old composer rows into its scrollback
+before Astra receives the resize. Astra redraws the live composer and preserves
+those terminal-owned rows. Ctrl+O shows the transcript independently of the
+terminal's scrollback. Terminals that do not answer cursor queries fall back to
 height-clamping corrections; width-reflow recovery requires a cursor reply.
 
 The agent navigator and typed run transcript are the active inspection surfaces.

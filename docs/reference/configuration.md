@@ -15,10 +15,6 @@ Use these files as the canonical configuration references:
 
 - `MATRIXONE_HOST`, `MATRIXONE_PORT`, `MATRIXONE_USER`, `MATRIXONE_PASSWORD`
 - `ASTRA_MYSQL_TLS_MODE` (optional) — endpoint TLS policy used by `scripts/dev/mysql-client.sh`: `auto` (default; local endpoints may probe then fall back to plaintext, remote endpoints require TLS), `required`, or `disabled`. The adapter selects the supported MySQL/MariaDB client flag; callers should not pass client-specific `--ssl-mode`/`--skip-ssl` values through configuration.
-- `ASTRA_TUI_THEME` (optional) — terminal rendering profile: `auto` (default), `dark`, `light`, `dark-ansi`, `light-ansi`, or `plain`. Use an ANSI profile for terminals or multiplexers that do not reliably render truecolor; `NO_COLOR=1` also selects `plain`. Welcome-panel accents, conversation surfaces, syntax highlighting, and the exit resume hint follow the selected profile. CLI text written to stderr uses stderr's color capability, independently of redirected stdout.
-  Auto queries the terminal foreground/background once at startup with OSC 10/11 on interactive macOS/Linux terminals, sharing a 300 ms response budget with the existing capability query.
-  An explicit theme, `NO_COLOR`, or a valid `ASTRA_TERMINAL_BG` skips color queries; redirected input/output and `TERM=dumb` are not queried. Color precedence is per channel: `ASTRA_TERMINAL_FG`/`ASTRA_TERMINAL_BG`, then the queried color, then `COLORFGBG`. A background response alone is sufficient. A valid manual background intentionally skips both color queries because theme selection only needs the background; the foreground then uses `ASTRA_TERMINAL_FG`, `COLORFGBG`, or the terminal default. Setting only a foreground still allows querying the background. When the background is unknown, ordinary text and surfaces inherit terminal defaults while headings, the logo, status, and syntax keep terminal-defined ANSI colours. Unknown background does not select `plain`. Other platforms retain environment hints and explicit profiles. The selected theme stays fixed for the session; restart Astra after changing the terminal background. During the bounded startup query, a split Esc prefix may wait up to 40 ms; normal-session Esc handling is unchanged. A malformed, unterminated color response is discarded until its terminator or a new Esc sequence; press Esc to recover input if the terminator never arrives. Sixel query timeouts remain unknown, and late capability replies are consumed by the existing reader without a second terminal query.
-- `ASTRA_TUI_GLYPHS` (optional) — `unicode` (default) or `ascii`. Select `ascii` for terminals or fonts that do not reliably render box-drawing and state glyphs; all state labels and actions remain available.
 - `ASTRA_DATABASE` — logical database name
 - `ASTRA_DATABASE_PREFIX` (optional) — effective name = `{PREFIX}{ASTRA_DATABASE}`
 - `ASTRA_AUTO_CREATE_DATABASE` — `1` to auto-create database at startup
@@ -321,25 +317,39 @@ configuration loader reports a warning and skips an invalid user/project layer.
 - `ASTRA_RUN_CONCURRENCY_LIMIT` — positive agentic loop slots per Astra Server process. For a multi-server deployment, set `ASTRA_CAPACITY_POD_COUNT` to the number of equivalent server processes sharing the same durable admission scope; the cross-pod weighted budget is derived from both values and is fenced when a server presents a different capacity snapshot. Change the declared budget only after active reservations have drained, and use one snapshot across all participating servers.
 - `ASTRA_CAPACITY_POD_COUNT` — positive server process count used for the cluster capacity model and durable canonical-turn admission. This is an operator declaration, not service discovery; keep it identical across pods that share a database.
 
+### Terminal presentation
+
+Open `/config` and search for the setting. Save to user or project defaults.
+The same settings are available under `[tui]` in `runtime.toml`.
+
+| Setting | Values | Applies |
+| --- | --- | --- |
+| Show terminal tips | `show_tips = true` (default) or `false` | Immediately, including in restored sessions |
+| Terminal theme | `theme = "auto"` (default), `dark`, `light`, `dark-ansi`, `light-ansi`, or `plain` | Next launch |
+| Terminal glyphs | `glyphs = "unicode"` (default) or `ascii` | Next launch |
+| Terminal background hint | `background` accepts `"#RRGGBB"` or `"auto"` (default) | Next launch |
+
+With the auto theme, Astra uses configured colors first, then the terminal's
+OSC 10/11 response, then `COLORFGBG`. A manual background or explicit theme
+skips color queries. The hint helps select the theme and blend its surfaces.
+The existing startup capability query shares a 300 ms budget with
+color detection on macOS and Linux. Redirected I/O and `TERM=dumb` skip the
+query. `NO_COLOR` selects the plain profile. Stderr uses its own color
+capability when stdout is redirected.
+
 ### Explain Analyze presentation
 
-The TUI keeps the live Explain Analyze tree in a compact status lane so it
-does not hide the conversation. Configure the row budget in
-`~/.astra/config/runtime.toml` (or the project override):
+The TUI shows one Explain Analyze tree when a turn settles. Choose the local
+report format in `~/.astra/config/runtime.toml` or its project override:
 
 ```toml
 [explain]
-live_rows = 5 # 1–5, default 5
 report_format = "html" # html, markdown, or text; default html
 ```
 
-The same setting is available in the `/config` editor as **Live Explain
-Analyze rows (1–5)** and takes effect for the next live capture immediately.
-The settled Explain cell and the local report are not truncated by this
-live-row setting. HTML is the default because it keeps the report readable
-across terminals and browsers; `/explain --format markdown` and
-`/explain --format text` select a different derived companion for the next
-capture.
+The same setting is available in `/config` as **Explain Analyze report
+format**. `/explain --format markdown` and `/explain --format text` select a
+different derived report for the next capture.
 
 Server harness snapshot persistence, history/stream routes, the `harness_snapshots` trace category and its setting overlay are removed. The harness kernel keeps the same configured verifiers and limits with its existing bounded in-memory sink; CLI `/inspect` remains local. Configurations naming the retired category are unsupported. Persisted prompt hash-diffs and Context manifests are retired, together with the `prompt_assembly`/`context_assembly` categories and overlays. Configurations naming those categories are unsupported. Live Context traces, actual provider request evidence and explicitly enabled full LLM captures retain their independent controls.
 

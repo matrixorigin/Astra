@@ -33,11 +33,11 @@ use super::bottom_pane::{
 };
 use super::chat_widget::UserEvent;
 use super::draw::{active_viewport, do_draw};
-use super::event::{TuiEvent, TuiEventStream};
+use super::event::{TuiEvent, TuiEventStream, is_background_task_manage_key};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
 use super::keymap::{AppAction, AppKeymap};
-use super::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
+use super::render::line_utils::history_cell_lines_for_buffer;
 #[cfg(test)]
 use super::status_line;
 use super::task_status::TaskStatus;
@@ -2569,7 +2569,7 @@ fn apply_memory_read_effect(
                         Some(header),
                     )
                     .with_results(results)
-                    .with_footer_hint("↑↓ navigate · q / Esc close"),
+                    .with_footer_hint("↑↓ select · Enter open · Esc close · Type to filter"),
                 ));
             }
         },
@@ -3376,13 +3376,6 @@ async fn sync_default_model_after_auth(
     apply_model_after_auth(result, state, pane, widget)
 }
 
-fn is_background_task_manage_key(key: &crossterm::event::KeyEvent) -> bool {
-    key.code == crossterm::event::KeyCode::Down
-        && key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::SHIFT)
-}
-
 fn is_ctrl_b_background_key(key: &crossterm::event::KeyEvent) -> bool {
     key.code == crossterm::event::KeyCode::Char('b')
         && key
@@ -3419,10 +3412,10 @@ impl ReopenTarget {
 /// queues raw sixel bytes and we show each here on a clean, paused screen via
 /// `with_restored`, which drops raw mode, hands the whole screen to the image,
 /// and forces a full repaint once the user presses Enter to dismiss it.
-async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
+async fn render_pending_sixel_images(guard: &mut TerminalGuard, input: &mut TuiEventStream) {
     for bytes in astra_tools::display_sixel::take_pending_sixel() {
         let display_result = guard
-            .with_restored(|| async move {
+            .with_restored(input, || async move {
                 tokio::task::spawn_blocking(move || {
                     // Home + clear-to-end, blit the image at the top (full height),
                     // then a prompt line.
@@ -3458,12 +3451,15 @@ async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
 
 async fn edit_composer_in_external_editor(
     guard: &mut TerminalGuard,
+    input: &mut TuiEventStream,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     initial: String,
 ) {
     let edit_result = guard
-        .with_restored(|| crate::tui::external_editor::edit_in_external_editor_async(initial))
+        .with_restored(input, || {
+            crate::tui::external_editor::edit_in_external_editor_async(initial)
+        })
         .await;
     guard.terminal.invalidate_viewport();
     match edit_result {
@@ -3931,24 +3927,14 @@ fn submission_starts_conversation(text: &str) -> bool {
 /// slash/shell controls keep their ordinary dispatcher semantics. A queued
 /// follow-up neither acquires remote guidance custody nor arms the pre-bind
 /// latch: subsequent Enter may still guide a bound, admitting run.
-fn queue_explicit_active_followup(
-    action: &BottomPaneAction,
-    bottom_pane: &mut BottomPane,
-    chat_widget: &mut chat_widget::ChatWidget,
-) -> bool {
+fn queue_explicit_active_followup(action: &BottomPaneAction, bottom_pane: &mut BottomPane) -> bool {
     let BottomPaneAction::QueueFollowUp(text) = action else {
         return false;
     };
     if !submission_starts_conversation(text) {
         return false;
     }
-    if !bottom_pane.queue_next_turn_submission(text.clone()) {
-        return false;
-    }
-    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-        "Queued for the next turn in this client; starts after a safe handoff.".to_string(),
-    ));
-    true
+    bottom_pane.queue_next_turn_submission(text.clone())
 }
 
 fn followup_release_gate(
@@ -4866,12 +4852,7 @@ fn transcript_item_for_cell(
         .downcast_ref::<history_cell::assistant::AssistantCell>()
         && cell.is_live()
     {
-        return TranscriptItem::rendered_cell(
-            id,
-            cell,
-            sanitize_lines_for_buffer(assistant.live_viewport_lines(width, 48)),
-            separator_rows,
-        );
+        return TranscriptItem::assistant_preview(id, assistant, width, separator_rows);
     }
 
     if let Some(reasoning) = cell
@@ -5003,6 +4984,9 @@ fn handle_global_key_action(
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) -> Option<GlobalKeyHandling> {
+    if handle_conversation_tab_shortcut(&key, bottom_pane, frame_requester) {
+        return Some(GlobalKeyHandling::Handled);
+    }
     let action = AppKeymap::resolve(key)?;
     match action {
         AppAction::ToggleTranscript => {
@@ -5761,7 +5745,7 @@ fn explain_mode_observes_graph(mode: crate::cli::session::session_state::Explain
 
 /// Keep every freshly replayed ChatWidget on the same Explain presentation
 /// snapshot as SessionState. Resume and Work/session rebinding construct a new
-/// widget, so setting only the mode or live-row count would otherwise silently
+/// widget, so setting only the mode would otherwise silently
 /// restore the renderer's default report format.
 fn sync_explain_presentation(
     chat_widget: &mut chat_widget::ChatWidget,
@@ -8838,6 +8822,16 @@ async fn dispatch_bottom_pane_view_action(
             bottom_pane.sync_popups();
             frame_requester.schedule_frame();
         }
+        BottomPaneViewAction::DraftExplainQuestion { run_id, turn_id } => {
+            use crate::tui::render::line_utils::sanitize_terminal_text;
+            bottom_pane.start_composer_draft(&format!(
+                "About the Explain report for run {} and turn {} — ",
+                sanitize_terminal_text(&run_id),
+                sanitize_terminal_text(&turn_id),
+            ));
+            bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+        }
         BottomPaneViewAction::InspectAgent {
             agent_id,
             agent_name,
@@ -9846,10 +9840,7 @@ pub(crate) async fn run_tui_session(
     let mut startup_terminal = super::terminal_startup::StartupTerminal::begin()
         .map_err(|error| format!("Terminal startup failed: {error}"))?;
 
-    // ── Initialize the gradient gutter time origin (PR #335) ─────────
-    // Without this, the first cell to finalize before any
-    // `elapsed_since_start()` call would saturate to 0 and the gutter
-    // would jump on freeze. Eager init guarantees `>= PROCESS_START`.
+    // Establish the animation clock before the first status frame.
     super::shimmer::init_time_origin();
 
     // ── Business initialization BEFORE entering TUI ─────────────────────
@@ -10005,13 +9996,18 @@ pub(crate) async fn run_tui_session(
     let (file_writer, file_writer_runtime, mut file_write_errors) = super::file_writer::spawn();
     let mut reported_file_write_errors = std::collections::HashSet::new();
     let mut bottom_pane = BottomPane::new();
+    bottom_pane.set_tips_enabled(astra_config::RuntimeConfig::cached().tui.show_tips());
     bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
     bottom_pane.set_file_writer(file_writer.clone());
     // ── Enter TUI ───────────────────────────────────────────────────────
     let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
-    let mut event_stream = TuiEventStream::new(draw_rx, guard.resize_pending.clone());
+    let mut event_stream = TuiEventStream::new(
+        draw_rx,
+        guard.resize_pending.clone(),
+        guard.alternate_screen.clone(),
+    );
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
     {
@@ -11313,7 +11309,10 @@ pub(crate) async fn run_tui_session(
                             frame_requester.schedule_frame();
                             continue;
                         }
-                        if is_background_task_manage_key(&key) || is_ctrl_b_background_key(&key) {
+                        if is_ctrl_b_background_key(&key)
+                            || (is_background_task_manage_key(&key)
+                                && !bottom_pane.accepts_background_task_rows())
+                        {
                             let _ = force_open_background_task_view(
                                 &mut background_registry,
                                 state.agent_spawner.as_ref(),
@@ -11323,13 +11322,6 @@ pub(crate) async fn run_tui_session(
                             )
                             .await;
                             frame_requester.schedule_frame();
-                            continue;
-                        }
-                        if handle_conversation_tab_shortcut(
-                            &key,
-                            &mut bottom_pane,
-                            &frame_requester,
-                        ) {
                             continue;
                         }
                         if is_primary_task_shortcut(&key)
@@ -11451,7 +11443,7 @@ pub(crate) async fn run_tui_session(
                                         let command_for_child = command.clone();
                                         let shell_shutdown = session_shutdown_token.clone();
                                         let status = guard
-                                            .with_restored(|| async move {
+                                            .with_restored(&mut event_stream, || async move {
                                                 stdout_println!("! {command_for_child}");
                                                 run_interactive_shell_command(
                                                     &command_for_child,
@@ -12567,7 +12559,9 @@ pub(crate) async fn run_tui_session(
                                                                 }
                                                                 None => {}
                                                             }
-                                                            if is_background_task_manage_key(&k) {
+                                                            if is_background_task_manage_key(&k)
+                                                                && !bottom_pane.accepts_background_task_rows()
+                                                            {
                                                                 let _ = force_open_background_task_view(
                                                                     &mut background_registry,
                                                                     agent_spawner_for_cancel.as_ref(),
@@ -12576,7 +12570,6 @@ pub(crate) async fn run_tui_session(
                                                                     &frame_requester,
                                                                 )
                                                                 .await;
-                                                                frame_requester.schedule_frame();
                                                                 continue;
                                                             }
                                                             // Ctrl+B backgrounds foreground work without replacing
@@ -12649,10 +12642,8 @@ pub(crate) async fn run_tui_session(
                                                             let action = bottom_pane.handle_session_key_at(k, input_at, chat_widget.history());
                                                             if queue_explicit_active_followup(
                                                                 &action,
-                                                                &mut bottom_pane,
-                                                                &mut chat_widget,
+                                                                &mut bottom_pane
                                                             ) {
-                                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
@@ -12936,12 +12927,6 @@ pub(crate) async fn run_tui_session(
                                                                             guidance_admission_closed,
                                                                         ) {
                                                                             // Preserve order behind a deferred plan or closed run.
-                                                                            if slash_dispatch::parse_submission(&queued_text).is_command() {
-                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-                                                                                    "Command queued until the current task finishes."
-                                                                                ));
-                                                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                                            }
                                                                             bottom_pane.queue_next_turn_submission(queued_text);
                                                                             frame_requester.schedule_frame();
                                                                             continue;
@@ -13845,7 +13830,7 @@ pub(crate) async fn run_tui_session(
                                             .extend(pending_runtime_notifications);
                                         // Turn fully settled: blit any images display_sixel
                                         // queued this turn on a paused screen (see fn docs).
-                                        render_pending_sixel_images(&mut guard).await;
+                                        render_pending_sixel_images(&mut guard, &mut event_stream).await;
                                         r
                                     };
 
@@ -14179,6 +14164,7 @@ pub(crate) async fn run_tui_session(
                             BottomPaneAction::OpenExternalEditor(initial) => {
                                 edit_composer_in_external_editor(
                                     &mut guard,
+                                    &mut event_stream,
                                     &mut bottom_pane,
                                     &mut chat_widget,
                                     initial,
@@ -14325,7 +14311,8 @@ pub(crate) async fn run_tui_session(
                                             .await;
                                         let msg = match result {
                                             Ok(outcome) => {
-                                                if outcome.save.is_some() {
+                                                if let Some(show_tips) = outcome.show_tips {
+                                                    bottom_pane.set_tips_enabled(show_tips);
                                                     sync_explain_presentation(
                                                         &mut chat_widget,
                                                         &state,
@@ -15577,6 +15564,10 @@ pub(crate) async fn run_tui_session(
     // The pipeline bundle owns the skill watcher. Drop it only after all
     // turn/agent work has stopped so no consumer outlives its provider.
     drop(pipeline_modules);
+    if let Err(error) = guard.prepare_inline_handoff(&mut event_stream).await {
+        tracing::warn!(%error, "could not reconcile the terminal before exit");
+    }
+    drop(event_stream);
     drop(guard);
     if finalization.is_ok()
         && let Some((label, command)) = resume_hint
@@ -19778,7 +19769,7 @@ mod tests {
             .unwrap();
         assert_eq!(assistant.source(), source);
         assert!(!assistant.is_live());
-        let expected = AssistantCell::from_markdown(source).display_lines(80);
+        let expected = assistant.display_lines(80);
         assistant.prepare_scrollback_layout(80);
         let mut emitted = Vec::new();
         let mut start = 0;
@@ -20316,7 +20307,6 @@ mod tests {
     #[test]
     fn explicit_followup_keeps_guidance_custody_and_admission_separate() {
         let mut pane = explicit_followup_pane();
-        let mut chat = chat_widget::ChatWidget::new("");
         pane.try_accept_user_intent(
             "pending-guidance",
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -20337,9 +20327,7 @@ mod tests {
         ] {
             pane.set_task_status(status);
             let action = explicit_followup_action(&mut pane, "also update docs");
-            assert!(queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(queue_explicit_active_followup(&action, &mut pane));
         }
         assert_eq!(pane.queued_next_turn_submission_count(), 3);
         assert_eq!(pane.pending_user_intent_count(), 1);
@@ -20354,9 +20342,7 @@ mod tests {
         assert!(
             matches!(&guidance, BottomPaneAction::SubmitInput(text) if text == "use the existing helper")
         );
-        assert!(!queue_explicit_active_followup(
-            &guidance, &mut pane, &mut chat
-        ));
+        assert!(!queue_explicit_active_followup(&guidance, &mut pane));
         // Explicit next-turn input does not close current-run guidance.
         assert!(!active_submission_routes_to_next_turn(
             "use the existing helper",
@@ -20377,9 +20363,7 @@ mod tests {
             std::time::Instant::now() - Duration::from_secs(1),
         );
         let action = pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         let mut queue = pane.take_queued_next_turn_submissions();
         queue.push_back(NextTurnSubmission::Interactive("second".into()));
         // A stale paste tail is consumed without creating a new draft.
@@ -20611,9 +20595,7 @@ mod tests {
         pane.queue_next_turn_submission("older fallback".into());
         for text in ["explicit first", "explicit second"] {
             let action = explicit_followup_action(&mut pane, text);
-            assert!(queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(queue_explicit_active_followup(&action, &mut pane));
         }
         let mut followups = VecDeque::new();
         let mut post = pane.take_queued_next_turn_submissions();
@@ -20664,7 +20646,6 @@ mod tests {
             (true, false, false, true),
         ] {
             let mut pane = explicit_followup_pane();
-            let mut chat = chat_widget::ChatWidget::new("");
             pane.try_accept_user_intent(
                 "server-guidance",
                 astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -20673,9 +20654,7 @@ mod tests {
             )
             .unwrap();
             let action = explicit_followup_action(&mut pane, "next task\nwith exact text");
-            assert!(queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(queue_explicit_active_followup(&action, &mut pane));
             pane.composer.set_text("unfinished draft");
             let local = pane.take_client_recoverable_user_intents();
             let restored = settle_followup_submissions(
@@ -20700,9 +20679,7 @@ mod tests {
         let mut pane = explicit_followup_pane();
         let mut chat = chat_widget::ChatWidget::new("");
         let action = explicit_followup_action(&mut pane, "next task");
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         let mut followups = pane.take_queued_next_turn_submissions();
         let gate = FollowupReleaseGate {
             model_catalog_loading: false,
@@ -20742,9 +20719,7 @@ mod tests {
 
         pane.composer.set_text("");
         let action = explicit_followup_action(&mut pane, "another task");
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         followups = pane.take_queued_next_turn_submissions();
         pane.composer.set_text("currently editing");
         assert_eq!(
@@ -20759,7 +20734,6 @@ mod tests {
     fn explicit_followup_preserves_the_position_of_a_delayed_guidance_fence() {
         let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let mut pane = explicit_followup_pane();
-        let mut chat = chat_widget::ChatWidget::new("");
         pane.try_accept_user_intent(
             "in-flight-guidance",
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -20770,9 +20744,7 @@ mod tests {
         control.expect_remote_user_intent_submission("in-flight-guidance");
         let queue_index = pane.queued_next_turn_submission_count();
         let action = explicit_followup_action(&mut pane, "later explicit follow-up");
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         assert_eq!(
             control.pending_remote_submission_ids(),
             vec!["in-flight-guidance"]
@@ -20795,13 +20767,10 @@ mod tests {
     #[test]
     fn explicit_followup_leaves_local_controls_in_the_ordinary_dispatcher() {
         let mut pane = explicit_followup_pane();
-        let mut chat = chat_widget::ChatWidget::new("");
         for text in ["/exit", "/stop", "/tasks", "!echo hello", "!echo hello &"] {
             let action = explicit_followup_action(&mut pane, text);
             assert!(matches!(&action, BottomPaneAction::QueueFollowUp(input) if input == text));
-            assert!(!queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(!queue_explicit_active_followup(&action, &mut pane));
             assert_eq!(pane.queued_next_turn_submission_count(), 0);
         }
     }
@@ -22866,7 +22835,10 @@ mod tests {
         })
         .plain();
         assert!(footer.contains("1 local agent unavailable"), "{footer}");
-        assert!(footer.contains("Ctrl+T tasks"), "{footer}");
+        assert!(
+            footer.contains(crate::tui::background_shortcut::background_task_open_hint()),
+            "{footer}"
+        );
         assert!(!footer.contains("stale snapshot"), "{footer}");
         assert!(!counts.is_empty());
     }
@@ -29165,7 +29137,8 @@ mod tests {
         ));
         assert!(pane.take_projection_action().is_none());
         assert!(
-            render_bottom_pane_text(&pane, 100, 24).contains("awaiting durable reconciliation"),
+            render_bottom_pane_text(&pane, 100, 24)
+                .contains("Local live activity · history pending"),
             "equal content from another call cannot retire the real local tool"
         );
         pane.refresh_agent_transcript(
@@ -29262,7 +29235,7 @@ mod tests {
 
         chat_widget.handle_event(chat_widget::AppEvent::wire(
             chat_widget::WireEvent::AnswerDelta {
-                model_item_id: None,
+                model_item_id: Some("019a93c5-d340-7000-8000-000000000001".into()),
                 text: "live durable-root output".into(),
             },
         ));
@@ -29276,8 +29249,13 @@ mod tests {
             refreshed.contains("live durable-root output"),
             "a durable root workspace must project the current root cell before its page catches up: {refreshed:?}"
         );
+        let time = chrono::DateTime::from_timestamp_millis(0x019a93c5d340)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        assert!(refreshed.contains(&format!("Astra  {time}")), "{refreshed}");
         assert!(
-            refreshed.contains("Live local projection"),
+            refreshed.contains("Local live activity · history pending"),
             "live root output must carry local provenance until durable reconciliation: {refreshed:?}"
         );
     }

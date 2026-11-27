@@ -121,7 +121,7 @@ impl ToolCell {
     pub fn complete(
         &mut self,
         status_str: &str,
-        duration_ms: u64,
+        duration_ms: impl Into<Option<u64>>,
         description: String,
         output_summary: Option<String>,
         output: Option<String>,
@@ -132,7 +132,7 @@ impl ToolCell {
             _ if tool_result_status_is_success(status_str) => ToolStatus::Success,
             _ => ToolStatus::Failed,
         };
-        self.duration_ms = Some(duration_ms);
+        self.duration_ms = duration_ms.into();
         if !description.is_empty() {
             self.description = description;
         }
@@ -222,9 +222,13 @@ impl ToolCell {
     }
 
     fn elapsed_str(&self) -> String {
-        let ms = self
-            .duration_ms
-            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64);
+        let ms = match self.duration_ms {
+            Some(ms) => ms,
+            None if self.status == ToolStatus::Running => {
+                self.started_at.elapsed().as_millis() as u64
+            }
+            None => return "—".to_owned(),
+        };
         if ms < 1000 {
             format!("{ms}ms")
         } else {
@@ -469,11 +473,11 @@ impl ToolCell {
     pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
         let has_details = self.has_transcript_details(width);
         let mut lines = self.display_lines_with_details(width, expanded && has_details);
-        if has_details && let Some(header) = lines.first_mut() {
-            let marker = if expanded { "▼ " } else { "▶ " };
-            if let Some(status_marker) = header.spans.first_mut() {
-                status_marker.content = Cow::Borrowed(marker);
+        if let Some(header) = lines.first_mut() {
+            if has_details && let Some(status_marker) = header.spans.first_mut() {
+                status_marker.content = Cow::Borrowed(if expanded { "▼ " } else { "▶ " });
             }
+            crate::tui::style::append_local_time(header, self.ts.as_deref(), width);
         }
         lines
     }
@@ -1284,6 +1288,13 @@ mod tests {
         assert_eq!(t.status, ToolStatus::Success);
         assert_eq!(t.duration_ms, Some(42));
         assert_eq!(t.output_summary.as_deref(), Some("3 entries"));
+    }
+
+    #[test]
+    fn settled_tool_without_a_recorded_duration_shows_unknown() {
+        let mut tool = ToolCell::new_running("bash", "ls");
+        tool.complete("completed", None, String::new(), None, None);
+        assert_eq!(tool.elapsed_str(), "—");
     }
 
     #[test]

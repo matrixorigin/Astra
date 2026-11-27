@@ -2,8 +2,65 @@ use super::color::{blend, is_light};
 use super::terminal_palette::{best_color, default_bg};
 use ratatui::{
     style::{Color, Style},
-    text::Span,
+    text::{Line, Span},
 };
+
+/// Shared inset for conversation, composer and execution-report chrome.
+pub(crate) fn conversation_margin(width: u16) -> u16 {
+    if width >= 60 { 2 } else { 0 }
+}
+
+/// Use the same runtime clock while streaming and when replaying the item.
+pub(crate) fn assistant_timestamp(
+    model_item_id: Option<&str>,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    model_item_id
+        .and_then(astra_turn_core::agentic::model_item::started_at)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(fallback)
+}
+
+/// Use one local clock format for recorded conversation headings.
+pub(crate) fn append_local_time(line: &mut Line<'static>, timestamp: Option<&str>, width: u16) {
+    let Some(timestamp) = timestamp else {
+        return;
+    };
+    if line.width() + "  HH:MM:SS".len() > usize::from(width) {
+        return;
+    }
+    let time = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|time| time.to_utc())
+        .or_else(|_| {
+            // The transcript API also returns the stored UTC DATETIME
+            // without a zone suffix for root and run reads.
+            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|time| time.and_utc())
+        });
+    if let Ok(time) = time {
+        line.spans.push(Span::styled(
+            time.with_timezone(&chrono::Local)
+                .format("  %H:%M:%S")
+                .to_string(),
+            Style::default().fg(super::theme::current().dim),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::{Line, append_local_time};
+
+    #[test]
+    fn durable_clock_matches_the_equivalent_stream_timestamp() {
+        let mut live = Line::raw("Astra");
+        append_local_time(&mut live, Some("2026-06-26T20:00:00+08:00"), 80);
+        assert_eq!(live.spans.len(), 2);
+        let mut reopened = Line::raw("Astra");
+        append_local_time(&mut reopened, Some("2026-06-26T12:00:00"), 80);
+        assert_eq!(reopened, live);
+    }
+}
 
 /// Presentation-only status vocabulary. Owners map their typed runtime state
 /// to this enum; rendered text is never inspected to recover a status.
@@ -68,11 +125,6 @@ pub(crate) fn composer_surface_style() -> Style {
     surface_style(super::theme::current(), default_bg(), composer_surface_rgb)
 }
 
-/// Background and foreground for the deferred-follow-up queue panel.
-pub(crate) fn queue_panel_style() -> Style {
-    surface_style(super::theme::current(), default_bg(), queue_panel_rgb)
-}
-
 pub(crate) fn footer_surface_style() -> Style {
     // The footer uses terminal defaults rather than an opaque panel.
     Style::default()
@@ -131,21 +183,6 @@ fn composer_surface_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
         ((0, 0, 0), 0.06)
     } else {
         ((84, 111, 145), 0.16)
-    };
-    blend(top, terminal_bg, alpha)
-}
-
-/// Distinct tint for the queue panel. Sits between the raw terminal
-/// background and the composer surface in prominence: more present than
-/// bare bg (so the band reads as a real region, not a gap) but less
-/// lifted than the live composer (so the user's typing surface stays the
-/// focal point). Previously 0.18 white was too close to a black terminal
-/// bg — the panel vanished and the queued content looked unanchored.
-fn queue_panel_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
-    let (top, alpha) = if is_light(terminal_bg) {
-        ((0, 0, 0), 0.10)
-    } else {
-        ((84, 111, 145), 0.10)
     };
     blend(top, terminal_bg, alpha)
 }
@@ -223,21 +260,17 @@ mod status_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{composer_surface_rgb, queue_panel_rgb, user_message_rgb};
+    use super::{composer_surface_rgb, user_message_rgb};
 
     #[test]
     fn dark_conversation_surfaces_are_slate_not_opaque_gray_cards() {
         let terminal = (17, 22, 28);
         let (ur, ug, ub) = user_message_rgb(terminal);
         let (cr, cg, cb) = composer_surface_rgb(terminal);
-        let (qr, qg, qb) = queue_panel_rgb(terminal);
 
         assert!(ub > ur && ub > ug, "user surface must keep a slate hue");
         assert!(ur < 50 && ug < 55 && ub < 65, "user surface is too bright");
-        assert!(
-            cr >= qr && cg >= qg && cb >= qb,
-            "composer should lead queue"
-        );
+        assert!(cb > cr && cb > cg, "composer must keep a slate hue");
         assert!(
             cr < 50 && cg < 55 && cb < 65,
             "composer must not become gray"
@@ -261,7 +294,7 @@ mod contrast_tests {
             Theme::dark_256(),
         ] {
             for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
-                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                for tint in [user_message_rgb, composer_surface_rgb] {
                     let style = surface_style(&theme, background, tint);
                     assert_eq!(style.fg, Some(theme.selected_fg));
                     assert_ne!(style.bg, Some(Color::Reset));
@@ -279,7 +312,7 @@ mod contrast_tests {
     fn plain_surfaces_ignore_background_hints() {
         for theme in [Theme::plain(), Theme::terminal_default()] {
             for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
-                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                for tint in [user_message_rgb, composer_surface_rgb] {
                     assert_eq!(surface_style(&theme, background, tint), Style::default());
                 }
             }

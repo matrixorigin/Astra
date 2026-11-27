@@ -9,9 +9,8 @@
 //!
 //! Callers should go through [`current()`] rather than instantiating
 //! directly. `current()` caches the selected theme once per process. It uses
-//! terminal capability and background hints, while `ASTRA_TUI_THEME` gives a
-//! user an explicit escape hatch for a multiplexer or remote terminal whose
-//! capability environment is incomplete.
+//! terminal capability and background hints. The `/config` editor provides
+//! explicit profiles for a multiplexer or remote terminal.
 
 use std::sync::OnceLock;
 
@@ -83,34 +82,7 @@ pub(crate) struct Theme {
     pub stall_error: Color,
 }
 
-/// Rendering colour capability selected for the whole TUI lifetime.
-///
-/// This is deliberately a small presentation choice, not a second theme
-/// framework: all renderers continue to consume the same semantic slots from
-/// [`Theme`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThemeProfile {
-    Auto,
-    Dark,
-    Light,
-    DarkAnsi,
-    LightAnsi,
-    Plain,
-}
-
-impl ThemeProfile {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "dark" => Some(Self::Dark),
-            "light" => Some(Self::Light),
-            "dark-ansi" | "ansi-dark" => Some(Self::DarkAnsi),
-            "light-ansi" | "ansi-light" => Some(Self::LightAnsi),
-            "plain" | "none" | "no-color" => Some(Self::Plain),
-            _ => None,
-        }
-    }
-}
+pub(crate) use astra_config::runtime_config::TuiThemeProfile as ThemeProfile;
 
 impl Theme {
     /// Preset for dark-backgrounded terminals (the previous default).
@@ -118,24 +90,18 @@ impl Theme {
         Self {
             is_light: false,
             fg: Color::Reset,
-            dim: Color::DarkGray,
-            accent: Color::Rgb(0, 215, 215),
-            // A low-saturation slate surface keeps the composer and selected
-            // rows legible without turning the TUI into a stack of cards.
-            selected_bg: Color::Rgb(31, 42, 55),
-            selected_fg: Color::Rgb(231, 238, 248),
-            // Live work gets a high-chroma violet signal distinct from both
-            // blue interactive focus and green completed output.
-            gutter: Color::Rgb(205, 132, 255),
+            dim: Color::Rgb(148, 162, 180),
+            accent: Color::Rgb(162, 214, 236),
+            selected_bg: Color::Rgb(37, 51, 65),
+            selected_fg: Color::Rgb(226, 231, 238),
+            gutter: Color::Rgb(239, 210, 154),
             gutter_frozen: Color::Rgb(91, 115, 136),
-            success: Color::Rgb(54, 226, 157),
+            success: Color::Rgb(173, 211, 157),
             warn: Color::Rgb(244, 192, 102),
-            // Bright red is reserved for confirmed failure or dangerous
-            // permission state. Ordinary activity never receives this role.
-            error: Color::Rgb(255, 103, 112),
-            quote: Color::Rgb(121, 171, 159),
-            link: Color::Rgb(122, 181, 222),
-            path_dim: Color::DarkGray,
+            error: Color::Rgb(244, 162, 151),
+            quote: Color::Rgb(126, 183, 179),
+            link: Color::Rgb(162, 214, 236),
+            path_dim: Color::Rgb(148, 162, 180),
             path_file: Color::White,
             command: Color::Rgb(88, 181, 255),
             // Markdown stays in the same restrained blue/slate language as
@@ -157,7 +123,7 @@ impl Theme {
             diff_context: Color::DarkGray,
             // Status indicator: stall thresholds use warn/error colors.
             stall_warn: Color::Rgb(244, 192, 102),
-            stall_error: Color::Rgb(255, 103, 112),
+            stall_error: Color::Rgb(244, 162, 151),
         }
     }
 
@@ -228,6 +194,7 @@ impl Theme {
             }
             color => color,
         };
+        theme.dim = quantize(theme.dim);
         theme.accent = quantize(theme.accent);
         theme.selected_bg = quantize(theme.selected_bg);
         theme.selected_fg = quantize(theme.selected_fg);
@@ -238,6 +205,7 @@ impl Theme {
         theme.error = quantize(theme.error);
         theme.quote = quantize(theme.quote);
         theme.link = quantize(theme.link);
+        theme.path_dim = quantize(theme.path_dim);
         theme.command = quantize(theme.command);
         theme.md_heading = quantize(theme.md_heading);
         theme.md_code = quantize(theme.md_code);
@@ -563,11 +531,10 @@ fn theme_for_stream(stream: supports_color::Stream) -> Theme {
     if std::env::var_os("NO_COLOR").is_some() {
         return Theme::plain();
     }
-    let profile = std::env::var("ASTRA_TUI_THEME")
-        .ok()
-        .as_deref()
-        .and_then(ThemeProfile::parse)
-        .unwrap_or(ThemeProfile::Auto);
+    let profile = astra_config::RuntimeConfig::cached()
+        .tui
+        .theme
+        .unwrap_or_default();
     match profile {
         ThemeProfile::Auto => Theme::auto_for_stream(stream),
         _ => Theme::for_profile(profile),
@@ -581,7 +548,7 @@ pub(crate) fn set_for_tests(theme: Theme) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Theme, ThemeProfile, color_to_rgb, current, perceived_lightness};
+    use super::{Theme, color_to_rgb, current, perceived_lightness};
     use ratatui::style::Color;
 
     #[test]
@@ -628,20 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_parser_accepts_explicit_terminal_safe_choices() {
-        assert_eq!(
-            ThemeProfile::parse("dark-ansi"),
-            Some(ThemeProfile::DarkAnsi)
-        );
-        assert_eq!(
-            ThemeProfile::parse("ansi-light"),
-            Some(ThemeProfile::LightAnsi)
-        );
-        assert_eq!(ThemeProfile::parse("no-color"), Some(ThemeProfile::Plain));
-        assert_eq!(ThemeProfile::parse("not-a-theme"), None);
-    }
-
-    #[test]
     fn perceived_lightness_basic_bounds() {
         assert!(perceived_lightness(0, 0, 0) < 0.1);
         assert!(perceived_lightness(255, 255, 255) > 0.9);
@@ -669,18 +622,18 @@ mod tests {
             "accent should read as a cool focus color: {theme:?}"
         );
         assert!(
-            gr > gg && gb > gg,
-            "live activity should be a high-chroma violet signal: {theme:?}"
+            gr > gg && gg > gb,
+            "live activity should have the warm activity hue: {theme:?}"
         );
         assert_ne!(theme.gutter, theme.accent);
         assert!(
             sg > sr && sg > sb,
-            "completed success markers should remain emerald: {theme:?}"
+            "completed activity should read green: {theme:?}"
         );
         assert_ne!(theme.gutter, theme.success);
         assert!(
             er > eg && er > eb,
-            "only the error role should carry a warm failure hue: {theme:?}"
+            "errors should have a visible red component: {theme:?}"
         );
         assert_ne!(theme.error, theme.accent);
         assert_ne!(theme.error, theme.warn);
@@ -823,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_profile_environment_reaches_surfaces_and_highlighting() {
+    fn terminal_config_reaches_surfaces_and_highlighting() {
         const CASE: &str = "ASTRA_TEST_TERMINAL_PROFILE";
         if let Ok(expected) = std::env::var(CASE) {
             let theme = current();
@@ -837,7 +790,6 @@ mod tests {
             for style in [
                 crate::tui::style::user_message_style(),
                 crate::tui::style::composer_surface_style(),
-                crate::tui::style::queue_panel_style(),
             ] {
                 if matches!(expected.as_str(), "plain" | "terminal") {
                     assert!(style.bg.is_none() || style.bg == Some(Color::Reset));
@@ -862,7 +814,7 @@ mod tests {
             return;
         }
         let test = format!(
-            "{}::terminal_profile_environment_reaches_surfaces_and_highlighting",
+            "{}::terminal_config_reaches_surfaces_and_highlighting",
             module_path!().split_once("::").unwrap().1
         );
         for (profile, bg, no_color, expected) in [
@@ -880,15 +832,14 @@ mod tests {
             child
                 .args(["--exact", &test, "--nocapture"])
                 .env(CASE, expected)
-                .env("ASTRA_TUI_THEME", profile)
                 .env("COLORTERM", "truecolor")
                 .env_remove("NO_COLOR")
-                .env_remove("COLORFGBG")
-                .env_remove("ASTRA_TERMINAL_BG")
-                .env_remove("ASTRA_TERMINAL_FG");
+                .env_remove("COLORFGBG");
+            let mut settings = format!("theme = {profile:?}");
             if let Some(bg) = bg {
-                child.env("ASTRA_TERMINAL_BG", bg);
+                settings.push_str(&format!("\nbackground = {bg:?}"));
             }
+            let _config = crate::test_utils::configure_terminal(&mut child, &settings);
             if no_color {
                 child.env("NO_COLOR", "1");
             }
@@ -922,13 +873,13 @@ mod tests {
             "{}::stderr_theme_uses_its_own_terminal_capabilities",
             module_path!().split_once("::").unwrap().1
         );
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let _config =
+            crate::test_utils::configure_terminal(&mut command, "background = \"#ffffff\"");
+        let output = command
             .args(["--exact", &test, "--nocapture"])
             .env(CASE, "1")
             .env("TERM", "xterm-256color")
-            .env("ASTRA_TUI_THEME", "auto")
-            .env("ASTRA_TERMINAL_BG", "#ffffff")
-            .env_remove("ASTRA_TERMINAL_FG")
             .env_remove("COLORFGBG")
             .env_remove("COLORTERM")
             .env_remove("TERM_PROGRAM")

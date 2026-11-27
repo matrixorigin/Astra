@@ -328,7 +328,11 @@ fn probe_child() {
         assert!(astra_tools::display_sixel::cached_sixel_support().is_none());
     }
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let mut stream = crate::tui::event::TuiEventStream::new(rx, guard.resize_pending.clone());
+    let mut stream = crate::tui::event::TuiEventStream::new(
+        rx,
+        guard.resize_pending.clone(),
+        guard.alternate_screen.clone(),
+    );
     println!("INPUT_READY");
     if let Some(paste) = queued_paste_input(&case) {
         use crate::tui::{
@@ -636,16 +640,19 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     command
         .args(["--exact", CHILD, "--nocapture"])
         .env("ASTRA_TEST_TERMINAL_PROBE", case)
-        .env("ASTRA_TUI_THEME", "auto")
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env_remove("NO_COLOR")
-        .env_remove("ASTRA_TERMINAL_FG")
-        .env_remove("ASTRA_TERMINAL_BG")
         .env_remove("COLORFGBG")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
+    let settings = match case {
+        "explicit" | "early_theme" => "theme = \"dark\"",
+        "background_override" => "background = \"#ffffff\"",
+        _ => "",
+    };
+    let _config = crate::test_utils::configure_terminal(&mut command, settings);
     match case {
         "light" | "fragmented" => {
             command.env("COLORFGBG", "15;0");
@@ -653,14 +660,8 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
         "dark" | "malformed" => {
             command.env("COLORFGBG", "0;15");
         }
-        "explicit" | "early_theme" => {
-            command.env("ASTRA_TUI_THEME", "dark");
-        }
         "no_color" => {
             command.env("NO_COLOR", "1");
-        }
-        "background_override" => {
-            command.env("ASTRA_TERMINAL_BG", "#ffffff");
         }
         _ => {}
     }
@@ -1015,7 +1016,6 @@ fn redirected_io_does_not_emit_terminal_queries() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD, "--nocapture"])
         .env("ASTRA_TEST_TERMINAL_PROBE", "non_tty")
-        .env("ASTRA_TUI_THEME", "auto")
         .stdin(Stdio::null())
         .output()
         .unwrap();

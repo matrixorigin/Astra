@@ -2,6 +2,7 @@
 source: crates/astra-cli/src/tui/history_cell/assistant.rs
 expression: "render(&c, 60, 5)"
 ---
+  Astra
   Here is the plan:
   • step one
   • step two

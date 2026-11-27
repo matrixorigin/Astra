@@ -19,6 +19,7 @@
 
 use crate::runtime_config::{
     ExplainReportFormat, RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink,
+    TuiColor, TuiGlyphProfile, TuiThemeProfile,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -201,6 +202,7 @@ fn merge_config_fields(base: &mut Value, layer: &Value) {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingKind {
     Bool,
+    Text,
     Number {
         min: f64,
         max: f64,
@@ -318,17 +320,41 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             kind: SettingKind::Bool,
             value: Value::from(config.trace.category_enabled(TraceCategory::Thinking)),
         },
-        // ── Explain Analyze ──
         SettingItem {
-            id: "explain.live_rows".to_string(),
-            label: "Live Explain Analyze rows (1–5)".to_string(),
-            kind: SettingKind::Number {
-                min: 1.0,
-                max: 5.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.explain.effective_live_rows()),
+            id: "tui.show_tips".to_string(),
+            label: "Show terminal tips".to_string(),
+            kind: SettingKind::Bool,
+            value: Value::Bool(config.tui.show_tips()),
         },
+        SettingItem {
+            id: "tui.theme".to_string(),
+            label: "Terminal theme (next launch)".to_string(),
+            kind: SettingKind::Enum {
+                options: TuiThemeProfile::OPTIONS
+                    .iter()
+                    .map(|option| (*option).into())
+                    .collect(),
+            },
+            value: serde_json::json!(config.tui.theme.unwrap_or_default()),
+        },
+        SettingItem {
+            id: "tui.glyphs".to_string(),
+            label: "Terminal glyphs (next launch)".to_string(),
+            kind: SettingKind::Enum {
+                options: TuiGlyphProfile::OPTIONS
+                    .iter()
+                    .map(|option| (*option).into())
+                    .collect(),
+            },
+            value: serde_json::json!(config.tui.glyphs.unwrap_or_default()),
+        },
+        SettingItem {
+            id: "tui.background".to_string(),
+            label: "Terminal background hint (next launch)".to_string(),
+            kind: SettingKind::Text,
+            value: serde_json::json!(config.tui.background.unwrap_or_default()),
+        },
+        // ── Explain Analyze ──
         SettingItem {
             id: "explain.report_format".to_string(),
             label: "Explain Analyze report format".to_string(),
@@ -620,10 +646,23 @@ pub fn apply_edit(
             mark_trace_custom(&mut config);
             return Ok(config);
         }
-        "explain.live_rows" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 1.0, 5.0, id)?;
-            config.explain.live_rows = Some(n as u8);
+        "tui.show_tips" => {
+            config.tui.show_tips = Some(as_bool(&new_value, id)?);
+        }
+        "tui.theme" => config.tui.theme = Some(serde_json::from_value(new_value)?),
+        "tui.glyphs" => config.tui.glyphs = Some(serde_json::from_value(new_value)?),
+        "tui.background" => {
+            let value = new_value
+                .as_str()
+                .ok_or_else(|| OverlayError::TypeMismatch {
+                    path: id.to_string(),
+                    expected: "string".to_string(),
+                    got: describe(&new_value),
+                })?;
+            config.tui.background = Some(
+                TuiColor::try_from(value.to_string())
+                    .map_err(|message| OverlayError::InvalidInvariant(message.into()))?,
+            );
         }
         "explain.report_format" => {
             let value = new_value
@@ -674,17 +713,39 @@ mod tests {
     }
 
     #[test]
-    fn explain_live_rows_is_catalogued_and_bounded() {
+    fn tips_setting_can_be_disabled_and_overridden_by_an_explicit_enable() {
         let config = RuntimeConfig::default();
-        let item = build_settings_catalog(&config)
-            .into_iter()
-            .find(|item| item.id == "explain.live_rows")
-            .expect("catalog must expose live Explain Analyze rows");
-        assert_eq!(item.value, Value::from(5));
-        let updated = apply_edit(config, "explain.live_rows", Value::from(3))
-            .expect("valid Explain Analyze row count should apply");
-        assert_eq!(updated.explain.live_rows, Some(3));
-        assert!(apply_edit(updated, "explain.live_rows", Value::from(6)).is_err());
+        let catalog = build_settings_catalog(&config);
+        let item = catalog
+            .iter()
+            .find(|item| item.id == "tui.show_tips")
+            .unwrap();
+        assert_eq!(item.value, Value::Bool(true));
+        let disabled = apply_edit(config, "tui.show_tips", Value::Bool(false)).unwrap();
+        assert!(!disabled.tui.show_tips());
+        let enabled = apply_edit(disabled.clone(), "tui.show_tips", Value::Bool(true)).unwrap();
+        let config = RuntimeConfigLayer::from_toml(&enabled.to_toml().unwrap())
+            .unwrap()
+            .apply_to(&disabled)
+            .unwrap();
+        assert!(config.tui.show_tips());
+    }
+
+    #[test]
+    fn terminal_profiles_and_colors_use_the_existing_editor_and_toml_layers() {
+        let mut config = RuntimeConfig::default();
+        for (id, value) in [
+            ("tui.theme", "dark-ansi"),
+            ("tui.glyphs", "ascii"),
+            ("tui.background", "#F5F5F5"),
+        ] {
+            config = apply_edit(config, id, Value::from(value)).unwrap();
+        }
+        let from_toml: RuntimeConfig = toml::from_str(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(from_toml.tui, config.tui);
+        assert_eq!(from_toml.tui.background, Some(TuiColor::Rgb(245, 245, 245)));
+        assert!(apply_edit(config, "tui.background", Value::from("#fivenine")).is_err());
+        assert!(RuntimeConfigLayer::from_toml("[tui]\nbackground = \"bad\"").is_err());
     }
 
     #[test]

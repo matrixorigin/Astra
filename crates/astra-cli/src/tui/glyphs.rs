@@ -4,23 +4,8 @@
 //! A user on a constrained terminal can select ASCII without giving up any
 //! state distinction: labels and semantic colours remain the source of truth.
 
-use std::sync::OnceLock;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GlyphProfile {
-    Unicode,
-    Ascii,
-}
-
-impl GlyphProfile {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "unicode" | "auto" => Some(Self::Unicode),
-            "ascii" => Some(Self::Ascii),
-            _ => None,
-        }
-    }
-}
+use astra_config::RuntimeConfig;
+pub(crate) use astra_config::runtime_config::TuiGlyphProfile as GlyphProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Glyphs {
@@ -90,17 +75,8 @@ pub(crate) fn for_profile(profile: GlyphProfile) -> &'static Glyphs {
     }
 }
 
-static ACTIVE: OnceLock<GlyphProfile> = OnceLock::new();
-
 pub(crate) fn current() -> &'static Glyphs {
-    let profile = *ACTIVE.get_or_init(|| {
-        std::env::var("ASTRA_TUI_GLYPHS")
-            .ok()
-            .as_deref()
-            .and_then(GlyphProfile::parse)
-            .unwrap_or(GlyphProfile::Unicode)
-    });
-    for_profile(profile)
+    for_profile(RuntimeConfig::cached().tui.glyphs.unwrap_or_default())
 }
 
 #[cfg(test)]

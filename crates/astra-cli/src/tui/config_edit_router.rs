@@ -22,6 +22,8 @@ use std::path::PathBuf;
 pub(crate) struct FinalizeOutcome {
     pub message: String,
     pub save: Option<SaveRecord>,
+    /// Present after successfully applying the user/project defaults.
+    pub show_tips: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -44,10 +46,12 @@ pub(crate) fn finalize(
         ConfigEditDisposition::Discard => Ok(FinalizeOutcome {
             message: "Discarded config edits. Nothing written.".to_string(),
             save: None,
+            show_tips: None,
         }),
         ConfigEditDisposition::Cancel => Ok(FinalizeOutcome {
             message: "Config edit cancelled.".to_string(),
             save: None,
+            show_tips: None,
         }),
     }
 }
@@ -61,12 +65,16 @@ pub(crate) async fn finalize_async(
         .await
         .map_err(|error| format!("config save task failed: {error}"))??;
     if let Some(save) = &outcome.save {
-        let (has_snapshot, warning) = refresh_session_after_save(state, save).map_err(|error| {
-            format!(
-                "{}. Current session configuration was not changed: {error}",
-                outcome.message
-            )
-        })?;
+        let defaults = RuntimeConfig::load();
+        let show_tips = defaults.tui.show_tips();
+        let (has_snapshot, warning) =
+            refresh_session_after_save(state, save, defaults).map_err(|error| {
+                format!(
+                    "{}. Current session configuration was not changed: {error}",
+                    outcome.message
+                )
+            })?;
+        outcome.show_tips = Some(show_tips);
         if has_snapshot {
             outcome.message.push_str(". This session retains its saved configuration; new conversations use the updated defaults.");
         }
@@ -80,6 +88,7 @@ pub(crate) async fn finalize_async(
 fn refresh_session_after_save(
     state: &mut SessionState,
     save: &SaveRecord,
+    defaults: RuntimeConfig,
 ) -> Result<(bool, Option<String>), String> {
     let workspace = state
         .session_id
@@ -95,7 +104,8 @@ fn refresh_session_after_save(
         .transpose()
         .map_err(|error| format!("invalid saved configuration: {error}"))?;
     let has_snapshot = saved.is_some();
-    let (config, version) = session_startup::prepare_session_runtime_config(state, saved)?;
+    let (config, version) =
+        session_startup::prepare_session_runtime_config(state, saved.or(Some(defaults)))?;
     if version != save.new_version_id
         && let Some(store) = LocalFileStore::at_default_root()
     {
@@ -222,6 +232,7 @@ fn save_and_report(
 
     Ok(FinalizeOutcome {
         message: format!("Saved config to {}", path.display()),
+        show_tips: None,
         save: Some(SaveRecord {
             new_version_id: new_id,
             source,
@@ -459,7 +470,10 @@ mod tests {
         assert_eq!(state.runtime_config.memory.retrieval_top_k, 9);
         assert_eq!(state.context_budget.memory_budget_chars, 1234 * 4);
         let default_version = state.config_version_id.clone();
+        defaults.tui.show_tips = Some(false);
+        let body = toml::to_string_pretty(&defaults).unwrap();
         let mut snapshot = defaults.clone();
+        snapshot.tui.show_tips = Some(true);
         snapshot.memory.retrieval_top_k = 5;
         snapshot.memory.max_memory_tokens = 4321;
         let mut workspace = WorkspaceMetadata::new(sid, "model");
@@ -469,6 +483,7 @@ mod tests {
         let outcome = finalize_async(ConfigEditDisposition::SaveUser, body.clone(), &mut state)
             .await
             .unwrap();
+        assert_eq!(outcome.show_tips, Some(false));
         assert!(outcome.message.contains("retains its saved configuration"));
         snapshot.explain.report_format = Some(ExplainReportFormat::Text);
         let expected = serde_json::to_value(&snapshot).unwrap();

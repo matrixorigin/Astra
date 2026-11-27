@@ -507,8 +507,10 @@ cargo test -p astra-cli --test tui_pty_journey \
 The inline TUI regression drives the real binary through a controlling PTY and
 xterm.js's headless terminal (including native reflow). It checks repeated
 narrow/wide and short/tall transitions, draft input, rapid resizes with delayed
-cursor replies, one live footer/composer across the entire buffer, and
-preservation of pre-existing and committed startup history. A held reply also
+cursor replies, duplicate footer and composer rows, and preservation of
+pre-existing and committed startup history. When native reflow can move old
+composer rows beyond the visible screen, the test checks the full live draft,
+committed history, and a single viewport clear. A held reply also
 outlasts the real cursor-query deadline: paste must remain responsive, no second
 query may overlap the expired request, and releasing its reply must allow a
 fresh resize without damaging history. The initialization cursor getter and
@@ -522,7 +524,7 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-CI runs the default terminal reader, `use-dev-tty` reader and all eight
+CI runs the default terminal reader, `use-dev-tty` reader and the
 production-binary reflow journeys in three parallel Linux jobs. Linux also runs
 the complete vendored units with both reader feature sets. One Mac bundle runs
 the existing default CLI PTY/Bash suite, native workspace coordination/Clippy,

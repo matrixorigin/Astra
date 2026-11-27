@@ -21663,7 +21663,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose, &logical_request_id, attempt_in_round);
             if attempt_in_round > 0 {
-                state.current_model_item_id = Some(uuid::Uuid::new_v4().to_string());
+                state.current_model_item_id = Some(astra_turn_core::agentic::model_item::new_id());
                 self.current_model_item_id = state.current_model_item_id.clone();
                 streamed_text.clear();
                 streamed_reasoning.clear();

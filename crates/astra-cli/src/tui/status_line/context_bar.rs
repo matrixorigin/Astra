@@ -49,7 +49,7 @@ impl ContextBar {
             let compact = compact_label(usage, usize::from(inner_width), self.is_previous);
             let compact_width = u16::try_from(compact.width()).unwrap_or(inner_width);
             let x = inner_x.saturating_add(inner_width.saturating_sub(compact_width));
-            buf.set_string(x, area.y, compact, label_style(usage, self.is_previous));
+            buf.set_string(x, area.y, compact, label_style(usage));
             return;
         }
 
@@ -76,7 +76,7 @@ impl ContextBar {
             inner_x.saturating_add(rail_width + LABEL_GAP),
             area.y,
             label,
-            label_style(usage, self.is_previous),
+            label_style(usage),
         );
     }
 }
@@ -109,14 +109,14 @@ fn capacity_color(usage: ContextWindowUsage) -> Color {
     }
 }
 
-fn label_style(usage: ContextWindowUsage, is_previous: bool) -> Style {
+fn label_style(usage: ContextWindowUsage) -> Style {
     let theme = crate::tui::theme::current();
-    let style = if capacity_color(usage) == theme.quote {
+    let color = capacity_color(usage);
+    if color == theme.quote {
         Style::default().fg(theme.dim)
     } else {
-        Style::default().fg(capacity_color(usage))
-    };
-    evidence_style(style, usage, is_previous)
+        Style::default().fg(color)
+    }
 }
 
 fn context_label(usage: ContextWindowUsage, is_previous: bool) -> String {
@@ -150,8 +150,12 @@ fn compact_label(usage: ContextWindowUsage, max_width: usize, is_previous: bool)
     if compact.width() <= max_width {
         return compact;
     }
-    // Preserve the actual capacity numbers when provenance no longer fits;
-    // estimated/previous values remain visually dimmed by `evidence_style`.
+    if let Some(readout) = compact.strip_prefix("ctx ")
+        && readout.width() <= max_width
+    {
+        return readout.to_string();
+    }
+    // Preserve the capacity numbers when provenance no longer fits.
     let numeric = format!(
         "{}/{}",
         format_tokens_compact(usage.used_tokens),
@@ -175,6 +179,8 @@ fn compact_label(usage: ContextWindowUsage, max_width: usize, is_previous: bool)
 fn format_tokens_compact(tokens: u64) -> String {
     if tokens < 1_000 {
         tokens.to_string()
+    } else if tokens < 9_950 && !tokens.is_multiple_of(1_000) {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
     } else if tokens < 1_000_000 {
         let rounded_k = (tokens + 500) / 1_000;
         if rounded_k >= 1_000 {
@@ -242,6 +248,16 @@ mod tests {
         let rendered = text(&buf);
         assert!(rendered.contains("ctx est 95k / 800k"), "{rendered:?}");
         assert!(!rendered.contains('~'));
+    }
+
+    #[test]
+    fn early_estimated_usage_stays_readable() {
+        let buf = render(ContextWindowUsage::estimated(2_600, 200_000), 50);
+        let rendered = text(&buf);
+        let label = "ctx est 2.6k / 200k";
+        assert!(rendered.contains(label), "{rendered:?}");
+        let label_x = buf.area.width - 2 - label.width() as u16;
+        assert!(!buf[(label_x, 0)].modifier.contains(Modifier::DIM));
     }
 
     #[test]

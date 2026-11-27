@@ -40,12 +40,17 @@ pub(crate) struct TuiEventStream {
     size_check: tokio::time::Interval,
     observed_size: Option<(u16, u16)>,
     resize_pending: Arc<AtomicBool>,
+    alternate_screen: Arc<AtomicBool>,
     draw_stream: ReceiverStream<()>,
     poll_draw_first: bool,
 }
 
 impl TuiEventStream {
-    pub(crate) fn new(draw_rx: mpsc::Receiver<()>, resize_pending: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        draw_rx: mpsc::Receiver<()>,
+        resize_pending: Arc<AtomicBool>,
+        alternate_screen: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             pending: VecDeque::new(),
             crossterm_stream: Some(EventStream::new()),
@@ -53,6 +58,7 @@ impl TuiEventStream {
             size_check: tokio::time::interval(Duration::from_millis(100)),
             observed_size: crossterm::terminal::size().ok(),
             resize_pending,
+            alternate_screen,
             draw_stream: ReceiverStream::new(draw_rx),
             poll_draw_first: false,
         }
@@ -88,7 +94,7 @@ impl TuiEventStream {
                 if let Some(size) = size
                     && (pending || self.observed_size != Some(size))
                 {
-                    return self.start_resize_query(size);
+                    return self.resize_event(size);
                 }
             }
             let Some(stream) = self.crossterm_stream.as_mut() else {
@@ -105,7 +111,7 @@ impl TuiEventStream {
                 Poll::Ready(Some(Ok((event, received_at)))) => {
                     if let Event::Resize(width, height) = event {
                         let size = crossterm::terminal::size().unwrap_or((width, height));
-                        return self.start_resize_query(size);
+                        return self.resize_event(size);
                     }
                     if let Some(mapped) = map_crossterm_event(event, received_at) {
                         return Poll::Ready(Some(mapped));
@@ -117,22 +123,24 @@ impl TuiEventStream {
         }
     }
 
-    fn start_resize_query(&mut self, size: (u16, u16)) -> Poll<Option<TuiEvent>> {
+    fn resize_event(&mut self, size: (u16, u16)) -> Poll<Option<TuiEvent>> {
+        if self.alternate_screen.load(Ordering::Acquire) {
+            // Full-screen workspaces are anchored at the origin and only need dimensions.
+            self.observed_size = Some(size);
+            return Poll::Ready(Some(TuiEvent::Resize {
+                size,
+                cursor: None,
+                interrupted: false,
+            }));
+        }
         let Some(mut stream) = self.crossterm_stream.take() else {
             return Poll::Ready(None);
         };
+        // Prevent a draw from changing screens before the input owner has
+        // received the report, including resizes back to the original size.
+        self.resize_pending.store(true, Ordering::Release);
         self.resize_query = Some(tokio::task::spawn_blocking(move || {
-            let result = stream.pause().and_then(|()| {
-                #[cfg(unix)]
-                {
-                    crossterm::event::query_cursor_position(Duration::from_millis(150))
-                        .map(|report| (report.size, report.position, report.interrupted))
-                }
-                #[cfg(windows)]
-                {
-                    crossterm::cursor::position().map(|cursor| (size, Some(cursor), false))
-                }
-            });
+            let result = stream.pause().and_then(|()| read_resize_cursor());
             let (size, cursor, interrupted) = result.unwrap_or((size, None, false));
             (
                 stream,
@@ -143,13 +151,31 @@ impl TuiEventStream {
                 },
             )
         }));
-        // Mark the viewport pending before the async query can yield to a draw,
-        // including narrow/wide round trips ending at the original dimensions.
         Poll::Ready(Some(TuiEvent::Resize {
             size,
             cursor: None,
             interrupted: true,
         }))
+    }
+
+    /// Release the shared input reader and join any outstanding resize query
+    /// before its caller changes screens or hands stdin to another consumer.
+    pub(crate) async fn pause_for_handoff(&mut self) -> std::io::Result<()> {
+        self.crossterm_stream = if let Some(query) = self.resize_query.take() {
+            let (stream, _) = query.await?;
+            Some(stream)
+        } else if let Some(mut stream) = self.crossterm_stream.take() {
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    stream.pause()?;
+                    Ok::<_, std::io::Error>(stream)
+                })
+                .await??,
+            )
+        } else {
+            None
+        };
+        Ok(())
     }
 
     fn poll_draw_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
@@ -161,9 +187,28 @@ impl TuiEventStream {
     }
 }
 
+pub(super) type ResizeCursor = ((u16, u16), Option<(u16, u16)>, bool);
+
+pub(super) fn read_resize_cursor() -> std::io::Result<ResizeCursor> {
+    #[cfg(unix)]
+    {
+        crossterm::event::query_cursor_position(Duration::from_millis(150))
+            .map(|report| (report.size, report.position, report.interrupted))
+    }
+    #[cfg(windows)]
+    {
+        let size = crossterm::terminal::size()?;
+        crossterm::cursor::position().map(|cursor| (size, Some(cursor), false))
+    }
+}
+
 pub(super) fn is_text_key(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(c)
         if !c.is_control() && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+}
+
+pub(super) fn is_background_task_manage_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Down && key.modifiers == KeyModifiers::SHIFT
 }
 
 fn map_crossterm_event(event: Event, received_at: Instant) -> Option<TuiEvent> {

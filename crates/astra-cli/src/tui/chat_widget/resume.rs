@@ -335,7 +335,10 @@ fn canonical_root_turn_events(
                     .filter(|text| !text.is_empty())
                 {
                     out.push(TurnEvent::Assistant {
-                        ts: Some(event.ts),
+                        ts: Some(crate::tui::style::assistant_timestamp(
+                            item.model_item_id.as_deref(),
+                            || event.ts,
+                        )),
                         markdown: content.to_string(),
                     });
                 }
@@ -491,6 +494,7 @@ mod tests {
                         "role": "assistant",
                         "reasoning_content": "inspect the state",
                         "content": "all good",
+                        "model_item_id": "019a93c5-d340-7000-8000-000000000001",
                     }),
                 ),
                 event(
@@ -522,6 +526,11 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("what's up"), "{text}");
         assert!(text.contains("all good"), "{text}");
+        let time = chrono::DateTime::from_timestamp_millis(0x019a93c5d340)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        assert!(text.contains(&format!("Astra  {time}")), "{text}");
         assert!(!text.contains("child-only"), "{text}");
         assert!(!text.contains("retry must not win"), "{text}");
         session_journal::set_journal_content_redact_override(None);

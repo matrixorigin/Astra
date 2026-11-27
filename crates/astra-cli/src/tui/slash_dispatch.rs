@@ -870,6 +870,38 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── Explain ─────────────────────────────────────────────────
+        "/explain" if args.trim().eq_ignore_ascii_case("report") => {
+            use std::sync::Arc;
+
+            use crate::tui::bottom_pane::transcript_view::{
+                TranscriptItem, TranscriptItemId, TranscriptView,
+            };
+            use crate::tui::history_cell::explain_analyze::ExplainAnalyzeCell;
+
+            if let Some((index, cell)) = ctx
+                .chat_widget
+                .history()
+                .iter()
+                .enumerate()
+                .rfind(|(_, cell)| cell.as_any_ref().is::<ExplainAnalyzeCell>())
+            {
+                let item = TranscriptItem::committed(
+                    TranscriptItemId::from_widget_id(ctx.chat_widget.history_cell_id(index)),
+                    Arc::clone(cell),
+                    0,
+                );
+                let height = crossterm::terminal::size().map_or(0, |(_, height)| height);
+                ctx.bottom_pane
+                    .push_view(Box::new(TranscriptView::explain_report(
+                        item, height, ctx.width,
+                    )));
+            } else {
+                ctx.show_info(
+                    "No settled Explain report in this session · /explain enables capture".into(),
+                );
+            }
+            SlashResult::Handled
+        }
         "/explain" => {
             let command = match explain_command_for_command(args) {
                 Ok(command) => command,
@@ -887,15 +919,15 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.state.set_explain_report_format_override(format);
                 ctx.chat_widget.set_explain_report_format(format);
             }
-            let label = match ctx.state.explain {
-                ExplainMode::Off => "off",
-                ExplainMode::On => "on",
-                ExplainMode::Verbose => "verbose",
+            let format = ctx.state.runtime_config.explain.effective_report_format();
+            let message = match ctx.state.explain {
+                ExplainMode::Off => "Explain off · no report for subsequent turns".to_string(),
+                ExplainMode::On => format!("Explain on · report after each turn ({format})"),
+                ExplainMode::Verbose => {
+                    format!("Explain verbose · detailed report after each turn ({format})")
+                }
             };
-            ctx.show_response(format!(
-                "Explain mode: {label} · report: {}",
-                ctx.state.runtime_config.explain.effective_report_format()
-            ));
+            ctx.show_response(message);
             SlashResult::Handled
         }
 
@@ -3104,10 +3136,9 @@ fn context_dump_argument(args: &str) -> Option<&str> {
 
 // ── /model subcommand helpers ───────────────────────────────────
 
-pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
-    "Type to filter | Enter to choose | Some models then ask for thinking mode | Esc to go back";
+pub(crate) const MODEL_PICKER_FOOTER_HINT: &str = "↑↓ select · Enter choose · Esc close · Type to filter · Supported models ask for thinking mode";
 pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
-    "Type to filter | Enter to finish model selection | Esc to go back";
+    "↑↓ select · Enter finish model selection · Esc back · Type to filter";
 
 /// `/model` with no args (or `list`) — fetch the catalog and push
 /// the picker. The typed result lets the outer loop check the model's

@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion, ViewResult};
@@ -90,10 +90,6 @@ impl FormView {
         }
     }
 
-    fn hint_text(&self) -> &'static str {
-        "  Tab / ↑↓ switch field · Enter submit · Esc cancel"
-    }
-
     fn rendered_value(&self, index: usize) -> String {
         match self.fields()[index].kind {
             FieldKind::Plain => self.values[index].clone(),
@@ -110,12 +106,11 @@ impl BottomPaneView for FormView {
         let theme = crate::tui::theme::current();
         let outer = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.dim))
             .title(Line::from(Span::styled(
                 self.title,
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
             )));
         let inner = outer.inner(area);
         outer.render(area, buf);
@@ -124,7 +119,7 @@ impl BottomPaneView for FormView {
         lines.push(Line::default());
         for (index, field) in self.fields().iter().enumerate() {
             let focused = index == self.focus;
-            let caret = if focused { "▸" } else { " " };
+            let caret = if focused { "›" } else { " " };
             let value = self.rendered_value(index);
             lines.push(Line::from(vec![
                 Span::styled(format!("  {caret} "), Style::default().fg(theme.accent)),
@@ -147,18 +142,13 @@ impl BottomPaneView for FormView {
                 Style::default().fg(theme.error),
             )));
         }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            self.hint_text(),
-            Style::default().fg(theme.dim),
-        )));
 
         Paragraph::new(lines).render(inner, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
         let error_rows = u16::from(self.error.is_some()) * 2;
-        self.fields().len() as u16 + 5 + error_rows
+        self.fields().len() as u16 + 3 + error_rows
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
@@ -215,12 +205,18 @@ impl BottomPaneView for FormView {
         if self.cancelled || self.submitted.is_some() {
             return None;
         }
-        let x = 6
-            + self.fields()[self.focus].label.width() as u16
-            + 2
-            + self.rendered_value(self.focus).width() as u16;
-        let y = 2 + self.focus as u16;
-        Some((area.x.saturating_add(x), area.y.saturating_add(y)))
+        let field = self.fields().get(self.focus)?;
+        let x = 7 + field.label.width() + self.rendered_value(self.focus).width();
+        let y = 2 + self.focus;
+        if x >= usize::from(area.width.saturating_sub(1))
+            || y >= usize::from(area.height.saturating_sub(1))
+        {
+            return None;
+        }
+        Some((
+            area.x.saturating_add(x as u16),
+            area.y.saturating_add(y as u16),
+        ))
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -253,7 +249,7 @@ impl BottomPaneView for FormView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        None
+        Some("Tab/↑↓ field · Enter submit · Esc cancel".into())
     }
 
     fn reserve_status_footer(&self) -> bool {

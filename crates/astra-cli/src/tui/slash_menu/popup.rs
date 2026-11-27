@@ -1,318 +1,99 @@
-//! Inline slash-menu popup widget.
-//!
-//! Renders a lightweight dropdown of filtered commands directly above
-//! the composer, matching the style of reference-agent and cursor: no
-//! decorative border, no title, no footer — just the list of commands.
-//!
-//! Visual anatomy (80-col example, 5 matches):
-//! ```text
-//!   ▌ /help        show this help screen
-//!     /history     browse session history
-//!     /model       pick a model
-//!     ↓ 2 more
-//! ```
-//!
-//! Key features:
-//! * **Group headers**: detailed renderers can group items by task (Common,
-//!   Sessions, Work, Inspect, …) with dim `── Group Name ──` dividers.
-//! * **Composer compact mode**: the live `/` picker omits those headers and
-//!   inline subcommand previews so every selectable action fits in the input
-//!   area. `/help` remains the place for taxonomy and long-form discovery.
-//! * **Matched characters** (from the filter token) render in the
-//!   accent colour with UNDERLINE so the user can see why the row ranked.
-//! * **Scroll hints**: `↑ N more` / `↓ N more` above/below the window
-//!   when the list overflows.
-//! * **Aliases**: shown inline as a dim `(h)` badge right of the name.
-//! * **Responsive**: at <18 cols descriptions drop and only names render.
-//!
-//! Group-aware anatomy:
-//! ```text
-//!     ── Common ──
-//!   ▌ /help        show this help screen
-//!     /clear       clear screen
-//!     ── Sessions ──
-//!     /resume      resume a session
-//!     ↓ 2 more
-//! ```
+//! Inline command discovery under the composer.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::Widget;
+use unicode_width::UnicodeWidthStr;
 
 use super::SlashMenu;
-use crate::cli::command_registry::CommandGroup;
-use crate::tui::truncate_ellipsis;
+use crate::tui::history_cell::truncate_by_width;
 
-/// Maximum number of **data rows** shown at once. Does not include the
-/// scroll-indicator rows (↑ N more / ↓ N more).
-pub(crate) const MAX_VISIBLE_ROWS: u16 = 10;
+const MAX_VISIBLE_ROWS: u16 = 10;
 
-/// Minimum width at which descriptions are shown. Below this we only
-/// render names.
-const MIN_DESC_WIDTH: u16 = 18;
-
-/// Height the popup would like to occupy for the given menu.
-///
-/// Just the visible rows — no border, no header, no footer. Always at
-/// least 1 row so the "no matches" line fits.
-pub(crate) fn desired_height(menu: &SlashMenu) -> u16 {
-    if menu.is_empty() {
-        1 // "no matching commands"
-    } else {
-        (menu.len() as u16).min(MAX_VISIBLE_ROWS)
-    }
-}
-
-/// Height for the inline composer picker. It uses the compact presentation
-/// below, so one selectable command always consumes one visual row.
 pub(crate) fn desired_composer_height(menu: &SlashMenu) -> u16 {
-    desired_height(menu)
+    (menu.len() as u16).clamp(1, MAX_VISIBLE_ROWS)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PopupPresentation {
-    show_group_headers: bool,
-    show_selected_subcommands: bool,
-}
-
-const DETAILED_PRESENTATION: PopupPresentation = PopupPresentation {
-    show_group_headers: true,
-    show_selected_subcommands: true,
-};
-
-const COMPOSER_PRESENTATION: PopupPresentation = PopupPresentation {
-    show_group_headers: false,
-    show_selected_subcommands: false,
-};
-
-/// Render `menu` into `area` of `buf`. Safe to call with any area size;
-/// rows beyond `area.height` are clipped.
-pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
-    render_with_presentation(menu, area, buf, DETAILED_PRESENTATION);
-}
-
-/// Render the compact slash picker embedded below the composer.
-///
-/// Typing a trailing space still opens the real subcommand completion mode;
-/// repeating those options beneath a selected command wastes the limited
-/// vertical space and can hide other selectable actions.
 pub(crate) fn render_composer(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
-    render_with_presentation(menu, area, buf, COMPOSER_PRESENTATION);
-}
-
-fn render_with_presentation(
-    menu: &SlashMenu,
-    area: Rect,
-    buf: &mut Buffer,
-    presentation: PopupPresentation,
-) {
-    if area.width == 0 || area.height == 0 {
+    if area.is_empty() {
         return;
     }
-
     let theme = crate::tui::theme::current();
-
-    if menu.is_empty() {
-        render_empty(area, buf, theme);
+    let dim = Style::default().fg(theme.dim);
+    let width = usize::from(area.width);
+    let matches = menu.matches();
+    if matches.is_empty() {
+        let message = if width >= 22 {
+            "  No matching commands"
+        } else {
+            "  No matches"
+        };
+        buf.set_line(area.x, area.y, &Line::styled(message, dim), area.width);
         return;
     }
 
-    // Decide how many rows the body gets.
-    let body_height = area.height.min(MAX_VISIBLE_ROWS);
-
-    let matches = menu.matches();
     let selected = menu.selected().unwrap_or(0);
-
-    // Compute which window of items is visible, keeping the selection
-    // roughly centred.
-    let (window_start, window_end) = window_around(selected, matches.len(), body_height as usize);
-
-    // Reserve one body-row for each scroll indicator if needed.
-    let need_top_hint = window_start > 0;
-    let need_bot_hint = window_end < matches.len();
-    let hint_rows = need_top_hint as usize + need_bot_hint as usize;
-    let visible_slots = (body_height as usize).saturating_sub(hint_rows);
-
-    // Re-compute window so that, after reserving hint rows, the selected
-    // item is inside `[window_start + top_hint, window_start + top_hint + visible_slots)`.
-    let (window_start, window_end) = window_around(selected, matches.len(), visible_slots.max(1));
-    let need_top_hint = window_start > 0;
-    let need_bot_hint = window_end < matches.len();
-
-    // Width of the name column — pad to the widest visible name so
-    // descriptions align cleanly.
-    let name_col_width = matches[window_start..window_end]
+    let slots = area.height.min(MAX_VISIBLE_ROWS);
+    let (start, end) = window_around(selected, matches.len(), usize::from(slots));
+    let visible = &matches[start..end];
+    let name_width = matches
         .iter()
-        .map(|i| i.name.chars().count())
+        .map(|item| item.name.width())
         .max()
-        .unwrap_or(0);
-
-    // Layout columns: gutter (2) + name_col + 2 + description.
-    let content_width = area.width as usize;
-    let show_desc = area.width >= MIN_DESC_WIDTH;
-    let gutter_w = 2;
-    let sep_w = 2;
-    let desc_budget = if show_desc {
-        content_width
-            .saturating_sub(gutter_w)
-            .saturating_sub(name_col_width)
-            .saturating_sub(sep_w)
-    } else {
-        0
-    };
-
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
-
-    // ── Scroll-up hint ───────────────────────────────────────────
-    if need_top_hint {
-        lines.push(scroll_hint(format!("↑ {} more", window_start), theme));
-    }
-
-    // ── Visible data rows (with group headers) ─────────────────
-    let highlights = menu.match_indices();
-    let prev_group_idx = if presentation.show_group_headers {
-        matches
-            .get(window_start.saturating_sub(1))
-            .and_then(|it| it.group)
-    } else {
-        None
-    };
-    let mut cur_group: Option<CommandGroup> = prev_group_idx;
-
-    for (idx, item) in matches[window_start..window_end].iter().enumerate() {
-        let absolute = window_start + idx;
-        let is_selected = absolute == selected;
-        let hi = highlights.get(absolute).cloned().unwrap_or_default();
-
-        // Insert group header when group changes.
-        let item_group = item.group;
-        if presentation.show_group_headers && item_group != cur_group {
-            cur_group = item_group;
-            if let Some(g) = item_group {
-                let label = g.title();
-                // Ensure the gutter column is included.
-                let mut group_spans: Vec<Span<'static>> = Vec::with_capacity(3);
-                group_spans.push(Span::raw("  "));
-                group_spans.push(Span::styled(
-                    format!("── {label} ──"),
-                    Style::default()
-                        .fg(theme.accent_dim())
-                        .add_modifier(Modifier::ITALIC)
-                        .add_modifier(Modifier::DIM),
-                ));
-                // Add the rest as separator.
-                group_spans.push(Span::styled(
-                    "─".repeat(
-                        content_width
-                            .saturating_sub(label.chars().count() + 8)
-                            .min(80),
-                    ),
-                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-                ));
-                lines.push(Line::from(group_spans));
-            }
-        }
-
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
-
-        // Gutter / cursor.
-        spans.push(if is_selected {
-            Span::styled("▌ ", Style::default().fg(theme.gutter))
+        .unwrap_or(0)
+        .min(if width >= 44 {
+            (width * 2 / 5).max(12)
         } else {
-            Span::raw("  ")
+            width.saturating_sub(2)
         });
-
-        // Name — with per-char highlights.
+    let desc_width = width.saturating_sub(name_width + 4);
+    let highlights = menu.match_indices();
+    for (index, item) in visible.iter().enumerate() {
+        let absolute = start + index;
+        let focused = selected == absolute;
+        let marker = if focused { "›" } else { " " };
+        let marker_style = Style::default().fg(theme.accent).bold();
+        let mut spans = vec![Span::styled(format!("{marker} "), marker_style)];
+        let name = truncate_by_width(&item.name, name_width);
         spans.extend(render_name_spans(
-            item.name.as_ref(),
-            &hi,
-            name_col_width,
-            is_selected,
+            &name,
+            highlights
+                .get(absolute)
+                .map_or(&[], |indices| indices.as_slice()),
+            name_width,
+            focused,
             theme,
         ));
-
-        // Description column.
-        if show_desc && desc_budget > 0 {
-            spans.push(Span::raw("  "));
-            let desc = truncate_ellipsis(item.description.as_ref(), desc_budget);
-            let desc_style = if is_selected {
+        if desc_width >= 12 {
+            let style = if focused {
                 Style::default().fg(theme.selected_fg)
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                dim
             };
-            spans.push(Span::styled(desc, desc_style));
+            spans.push(Span::styled(
+                format!("  {}", truncate_by_width(&item.description, desc_width)),
+                style,
+            ));
         }
-
-        let mut line = Line::from(spans);
-        if is_selected {
-            line = line.style(Style::default().bg(theme.selected_bg));
-        }
-        lines.push(line);
-        // Show subcommands below the selected item (single-line, compact).
-        if presentation.show_selected_subcommands && is_selected && !item.subcommands.is_empty() {
-            let max_subs = 3.min(item.subcommands.len());
-            for (name, desc) in item.subcommands.iter().take(max_subs) {
-                let sub_spans: Vec<Span<'static>> = vec![
-                    Span::raw("   · "),
-                    Span::styled(
-                        name.to_string(),
-                        Style::default()
-                            .fg(theme.accent_dim())
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    Span::styled(
-                        [" — ", desc].concat(),
-                        Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-                    ),
-                ];
-                lines.push(Line::from(sub_spans));
-            }
-            if item.subcommands.len() > max_subs {
-                lines.push(Line::from(Span::styled(
-                    format!("   … {} more", item.subcommands.len() - max_subs),
-                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-                )));
-            }
+        let line = Line::from(spans);
+        let rect = Rect::new(area.x, area.y + index as u16, area.width, 1);
+        if focused {
+            Widget::render(
+                crate::tui::render::line_utils::FullRowParagraph::new(vec![
+                    line.style(Style::default().bg(theme.selected_bg)),
+                ]),
+                rect,
+                buf,
+            );
+        } else {
+            line.render(rect, buf);
         }
     }
-
-    // ── Scroll-down hint ────────────────────────────────────────
-    if need_bot_hint {
-        let remaining = matches.len() - window_end;
-        lines.push(scroll_hint(format!("↓ {} more", remaining), theme));
-    }
-
-    Paragraph::new(lines).render(area, buf);
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
-
-fn render_empty(area: Rect, buf: &mut Buffer, theme: &crate::tui::theme::Theme) {
-    let lines = vec![Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "no matching commands — try a shorter prefix",
-            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-        ),
-    ])];
-    Paragraph::new(lines).render(area, buf);
-}
-
-fn scroll_hint(label: String, theme: &crate::tui::theme::Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            label,
-            Style::default()
-                .fg(theme.accent_dim())
-                .add_modifier(Modifier::ITALIC),
-        ),
-    ])
-}
-
-/// Split `name` into styled spans so that bytes whose offsets appear in
+/// Split `name` into styled spans so that character indices in
 /// `match_indices` render with the accent colour + UNDERLINE, and the
 /// whole string is padded to `col_width` characters.
 fn render_name_spans(
@@ -338,9 +119,8 @@ fn render_name_spans(
         // Walk char-by-char, grouping runs of (matched?).
         let mut cur = String::new();
         let mut cur_hit = false;
-        let set: std::collections::HashSet<u32> = match_indices.iter().copied().collect();
-        for (i, ch) in name.char_indices() {
-            let hit = set.contains(&(i as u32));
+        for (i, ch) in name.chars().enumerate() {
+            let hit = match_indices.contains(&(i as u32));
             if hit != cur_hit && !cur.is_empty() {
                 spans.push(Span::styled(
                     std::mem::take(&mut cur),
@@ -356,9 +136,9 @@ fn render_name_spans(
     }
 
     // Trailing padding to align into `col_width`.
-    let name_chars = name.chars().count();
-    if col_width > name_chars {
-        spans.push(Span::raw(" ".repeat(col_width - name_chars)));
+    let name_width = name.width();
+    if col_width > name_width {
+        spans.push(Span::raw(" ".repeat(col_width - name_width)));
     }
 
     spans
@@ -382,19 +162,6 @@ fn window_around(selected: usize, total: usize, max_rows: usize) -> (usize, usiz
     (start, end)
 }
 
-fn pad_right_chars(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    if n >= width {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + (width - n));
-    out.push_str(s);
-    for _ in n..width {
-        out.push(' ');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::{SlashItem, SlashMenu};
@@ -403,275 +170,34 @@ mod tests {
 
     fn menu_fixture() -> SlashMenu {
         SlashMenu::new(vec![
-            SlashItem::simple("/help", "show help"),
-            SlashItem::simple("/history", "browse session history"),
-            SlashItem::simple("/model", "pick a model"),
+            SlashItem::simple("/help", "Show keyboard shortcuts"),
+            SlashItem::simple("/history", "Open the session transcript"),
+            SlashItem::simple("/model", "Choose a model and thinking depth"),
         ])
     }
 
-    /// Tiny adapter widget so we can reuse the harness.
-    struct PopupWidget<'a>(&'a SlashMenu);
-    impl Widget for PopupWidget<'_> {
-        fn render(self, area: Rect, buf: &mut Buffer) {
-            render(self.0, area, buf);
-        }
-    }
+    struct Picker<'a>(&'a SlashMenu);
 
-    struct ComposerPopupWidget<'a>(&'a SlashMenu);
-    impl Widget for ComposerPopupWidget<'_> {
+    impl Widget for Picker<'_> {
         fn render(self, area: Rect, buf: &mut Buffer) {
             render_composer(self.0, area, buf);
         }
     }
 
-    fn render_menu(menu: &SlashMenu, w: u16, h: u16) -> String {
-        let buf = draw_widget(PopupWidget(menu), w, h);
-        buffer_to_string(&buf)
-    }
-
     #[test]
-    fn snapshot_three_items_default_selection() {
-        let menu = menu_fixture();
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_three_default_80",
-            render_menu(&menu, 80, 5)
-        );
-    }
-
-    #[test]
-    fn snapshot_filtered_to_one() {
+    fn one_row_shows_the_selected_action() {
         let mut menu = menu_fixture();
-        menu.set_filter("/he");
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_filtered_he_80",
-            render_menu(&menu, 80, 5)
-        );
+        menu.go_last();
+        let output = buffer_to_string(&draw_widget(Picker(&menu), 24, 1));
+        assert!(output.contains("/model"), "{output}");
     }
 
     #[test]
-    fn snapshot_second_item_selected() {
+    fn fuzzy_match_shows_only_the_matching_command() {
         let mut menu = menu_fixture();
-        menu.move_down();
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_second_selected_80",
-            render_menu(&menu, 80, 5)
-        );
-    }
-
-    #[test]
-    fn snapshot_no_matches_shows_message() {
-        let mut menu = menu_fixture();
-        menu.set_filter("/zzz_no_match_here");
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_no_matches_80",
-            render_menu(&menu, 80, 3)
-        );
-    }
-
-    #[test]
-    fn snapshot_narrow_truncates_description() {
-        let menu = menu_fixture();
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_narrow_28",
-            render_menu(&menu, 28, 5)
-        );
-    }
-
-    #[test]
-    fn snapshot_long_list_windows_around_selection() {
-        // 12 items, body fits 10 — selecting #11 must scroll AND show
-        // the "↑ N more" hint at the top.
-        let items: Vec<SlashItem> = (0..12)
-            .map(|i| SlashItem {
-                name: format!("/cmd{i:02}").into(),
-                description: format!("description {i}").into(),
-                ..Default::default()
-            })
-            .collect();
-        let mut menu = SlashMenu::new(items);
-        for _ in 0..11 {
-            menu.move_down();
-        }
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_long_list_sel11_80",
-            render_menu(&menu, 80, 12)
-        );
-    }
-
-    #[test]
-    fn snapshot_groups_with_headers() {
-        // 6 items across 3 groups — should render group headers.
-        use crate::cli::command_registry::CommandGroup;
-        let items: Vec<SlashItem> = vec![
-            SlashItem {
-                name: "/help".into(),
-                description: "show help".into(),
-                group: Some(CommandGroup::Common),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/clear".into(),
-                description: "clear screen".into(),
-                group: Some(CommandGroup::Common),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/resume".into(),
-                description: "resume a session".into(),
-                group: Some(CommandGroup::Sessions),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/plan".into(),
-                description: "manage plan".into(),
-                group: Some(CommandGroup::Sessions),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/model".into(),
-                description: "pick a model".into(),
-                group: Some(CommandGroup::Common),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/config".into(),
-                description: "runtime config".into(),
-                group: Some(CommandGroup::Inspect),
-                ..Default::default()
-            },
-        ];
-        let menu = SlashMenu::new(items);
-        crate::tui::testing::assert_tui_snapshot!(
-            "slash_popup_groups_with_headers_80",
-            render_menu(&menu, 80, 10)
-        );
-    }
-
-    #[test]
-    fn composer_picker_prioritizes_selectable_actions_over_group_chrome() {
-        use crate::cli::command_registry::CommandGroup;
-        let menu = SlashMenu::new(vec![
-            SlashItem {
-                name: "/help".into(),
-                description: "show help".into(),
-                group: Some(CommandGroup::Common),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/plan".into(),
-                description: "plan work".into(),
-                group: Some(CommandGroup::Sessions),
-                ..Default::default()
-            },
-            SlashItem {
-                name: "/context".into(),
-                description: "inspect context".into(),
-                group: Some(CommandGroup::Inspect),
-                ..Default::default()
-            },
-        ]);
-
-        let output = buffer_to_string(&draw_widget(
-            ComposerPopupWidget(&menu),
-            80,
-            desired_composer_height(&menu),
-        ));
-
-        for command in ["/help", "/plan", "/context"] {
-            assert!(
-                output.contains(command),
-                "composer picker dropped {command}: {output}"
-            );
-        }
-        assert!(
-            !output.contains("── Common ──"),
-            "group chrome belongs in help, not the constrained composer picker: {output}"
-        );
-    }
-
-    #[test]
-    fn desired_height_clamps_at_max_plus_chrome() {
-        let items: Vec<SlashItem> = (0..20)
-            .map(|i| SlashItem {
-                name: format!("/x{i}").into(),
-                ..Default::default()
-            })
-            .collect();
-        let menu = SlashMenu::new(items);
-        assert_eq!(desired_height(&menu), MAX_VISIBLE_ROWS);
-    }
-
-    #[test]
-    fn desired_height_minimum_for_empty_menu() {
-        let mut menu = menu_fixture();
-        menu.set_filter("/zzz");
-        assert_eq!(desired_height(&menu), 1);
-    }
-
-    #[test]
-    fn pad_and_truncate_behaviour() {
-        assert_eq!(pad_right_chars("abc", 5), "abc  ");
-        assert_eq!(pad_right_chars("abcdef", 3), "abcdef");
-        assert_eq!(truncate_ellipsis("abcdef", 4), "abc…");
-        assert_eq!(truncate_ellipsis("abc", 4), "abc");
-        assert_eq!(truncate_ellipsis("abc", 1), "…");
-        assert_eq!(truncate_ellipsis("abc", 0), "");
-    }
-
-    #[test]
-    fn window_around_keeps_selection_visible_and_centred() {
-        // Small list → full window.
-        assert_eq!(window_around(0, 3, 10), (0, 3));
-        // Big list, selection at end → window pinned to bottom.
-        assert_eq!(window_around(11, 12, 10), (2, 12));
-        // Selection in middle centres roughly.
-        let (s, e) = window_around(5, 20, 10);
-        assert_eq!(e - s, 10);
-        assert!(s <= 5 && 5 < e);
-        // Edge: empty list or zero rows.
-        assert_eq!(window_around(0, 0, 10), (0, 0));
-        assert_eq!(window_around(0, 10, 0), (0, 0));
-    }
-
-    #[test]
-    fn narrow_terminal_falls_back_to_chromeless() {
-        // Width below MIN_CHROME_WIDTH should still render something.
-        let menu = menu_fixture();
-        let out = render_menu(&menu, 14, 5);
-        // No border glyphs.
-        assert!(
-            !out.contains('╭'),
-            "narrow popup should not draw box: {out}"
-        );
-        assert!(out.contains("/help"), "name must still render: {out}");
-    }
-
-    #[test]
-    fn selected_item_shows_subcommands() {
-        const SUBS: &[(&str, &str)] = &[
-            ("list", "List all memories"),
-            ("search", "Search memories by query"),
-            ("inspect", "Inspect a single memory by ID"),
-        ];
-        let item = SlashItem {
-            name: "/memory".into(),
-            description: "Memory operations".into(),
-            subcommands: SUBS,
-            extra_subcommands: Vec::new(),
-            usage_boost: 0,
-            primary: true,
-            group: Some(CommandGroup::Tools),
-            usage_examples: &[],
-        };
-        let menu = SlashMenu::new(vec![item]);
-        let output = render_menu(&menu, 80, 10);
-        assert!(
-            output.contains("list"),
-            "should show 'list' subcommand: {output}"
-        );
-        assert!(
-            output.contains("Search memories"),
-            "should show 'search' subcommand desc: {output}"
-        );
+        menu.set_filter("/hstry");
+        assert_eq!(desired_composer_height(&menu), 1);
+        let output = buffer_to_string(&draw_widget(Picker(&menu), 80, 1));
+        assert!(output.contains("/history"), "{output}");
     }
 }

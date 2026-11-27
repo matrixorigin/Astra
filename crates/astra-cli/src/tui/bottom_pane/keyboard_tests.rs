@@ -36,7 +36,7 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
     {
         let area = Rect::new(0, 0, 80, 3);
         let mut buffer = Buffer::empty(area);
-        pane.composer.render(area, &mut buffer, false);
+        pane.composer.render(area, &mut buffer, false, None);
         let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(rendered.contains("(reverse-i-search)`': "), "{rendered:?}");
         assert!(!rendered.contains("cargo test"), "{rendered:?}");
@@ -65,7 +65,7 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
     ));
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("(reverse-i-search)`cargo test': cargo test"),
@@ -130,7 +130,7 @@ fn ctrl_r_paste_filters_without_touching_suspended_draft() {
     assert_eq!(pane.composer.pasted_blob_count(), 0);
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("(reverse-i-search)`cargo test': cargo test --workspace"),
@@ -161,7 +161,7 @@ fn ctrl_r_multiline_paste_matches_raw_history_and_restores_draft_on_esc() {
     assert_eq!(pane.composer.pasted_blob_count(), 0);
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("(reverse-i-search)`cargo ↩ --workspace': cargo ↩ --workspace"),
@@ -214,7 +214,7 @@ fn unbracketed_paste_in_search_cannot_submit_a_partial_message() {
     assert_eq!(pane.composer.text(), "unsent draft");
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("no matching history ↩ x ↩"),
@@ -423,13 +423,13 @@ fn history_search_stays_visible_in_narrow_terminals() {
     pane.handle_paste("target");
     let area = Rect::new(0, 0, 20, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.contains("target"), "{rendered:?}");
 
     pane.handle_paste("-a-very-long-query-结尾");
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.replace(' ', "").contains("结尾"), "{rendered:?}");
     let (cursor_x, _) = pane.composer.cursor_position(area).unwrap();
@@ -1062,10 +1062,11 @@ fn focused_conversation_replaces_the_root_composer_canvas() {
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
 
-    // The 50-row primary canvas makes the tail window start at row 54;
-    // the former 80%-high pane would have started at row 64. The composer is
-    // intentionally absent while a transcript owns the current conversation.
-    assert!(rendered.contains("conversation row 54"), "{rendered}");
+    // The 50-row primary canvas leaves two rows for the session footer
+    // and shortcuts while showing the latest 44 conversation rows.
+    assert!(rendered.contains("conversation row 56"), "{rendered}");
+    assert!(rendered.contains("conversation row 99"), "{rendered}");
+    assert!(rendered.contains("Enter details · / search"), "{rendered}");
     assert!(!rendered.contains("root draft must stay off this canvas"));
 }
 
@@ -1312,7 +1313,7 @@ fn pending_agent_tab_survives_live_binding_and_monitor_name_update() {
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
-        rendered.contains("Real reviewer · Transcript"),
+        rendered.contains("Transcript · Real reviewer"),
         "{rendered}"
     );
 }
@@ -1942,7 +1943,7 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
     }
     let text = render(&pane);
     assert!(
-        text.contains("> shred branches") && text.contains("ship staging build"),
+        text.contains("› shred branches") && text.contains("ship staging build"),
         "{text}"
     );
     pane.handle_session_key_at(
@@ -1952,7 +1953,7 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
     );
     let text = render(&pane);
     assert!(
-        text.contains("> ship canary build") && text.contains("ship staging build"),
+        text.contains("› ship canary build") && text.contains("ship staging build"),
         "{text}"
     );
     assert!(!text.contains("shred branches"), "{text}");
@@ -1962,14 +1963,14 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         start + Duration::from_millis(55),
         &history,
     );
-    assert!(render(&pane).contains("> shred branches"));
+    assert!(render(&pane).contains("› shred branches"));
     pane.handle_session_key_at(
         key(KeyCode::Char('i')),
         start + Duration::from_millis(65),
         &history,
     );
 
-    assert!(render(&pane).contains("> ship canary build"));
+    assert!(render(&pane).contains("› ship canary build"));
 
     for (at, code, expected) in [
         (75, KeyCode::Up, "ship staging build"),
@@ -1981,8 +1982,22 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
         assert_eq!(pane.composer.text(), "shi");
         let text = render(&pane);
-        assert!(text.contains(&format!("> {expected}")), "{text}");
-        assert_eq!(text.matches("> ship").count(), 1, "{text}");
+        assert!(text.contains(&format!("› {expected}")), "{text}");
+        assert_eq!(text.matches("› ship").count(), 1, "{text}");
+    }
+
+    for (at, code, query) in [
+        (103, KeyCode::Left, "shi"),
+        (105, KeyCode::Backspace, "si"),
+        (108, KeyCode::Char('h'), "shi"),
+    ] {
+        pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
+        assert_eq!(pane.composer.text(), query);
+        let text = render(&pane);
+        assert!(
+            text.contains("ship canary build") && text.contains("ship staging build"),
+            "{text}"
+        );
     }
 
     assert!(matches!(
@@ -2041,7 +2056,7 @@ fn fuzzy_history_suggestions_rank_matches_without_recalling_commands() {
     pane.handle_session_paste("PC", &history);
     pane.render(area, &mut buffer);
     let text = buffer_to_string(&buffer);
-    assert!(text.contains("> pc probe ready"), "{text}");
+    assert!(text.contains("› pc probe ready"), "{text}");
     assert!(text.contains("deploy production canary"), "{text}");
     assert!(text.contains("dispatch package cache"), "{text}");
     assert!(
@@ -2082,7 +2097,7 @@ fn pasted_fuzzy_history_query_scrolls_to_older_matches() {
     pane.handle_session_paste("部署境", &history);
     let text = render(&pane).replace(' ', "");
     assert!(
-        text.contains(">部署环境6") && text.contains("部署环境5"),
+        text.contains("›部署环境6") && text.contains("部署环境5"),
         "{text}"
     );
     assert!(!text.contains("部署环境1"), "{text}");
@@ -2102,7 +2117,7 @@ fn pasted_fuzzy_history_query_scrolls_to_older_matches() {
     );
     assert_eq!(pane.composer.text(), "部署境");
     let text = render(&pane).replace(' ', "");
-    assert!(text.contains(">部署环境1"), "{text}");
+    assert!(text.contains("›部署环境1"), "{text}");
     assert!(matches!(
         pane.handle_session_key_at(
             key(KeyCode::Tab),
@@ -2160,9 +2175,9 @@ fn typed_history_suggestions_refresh_after_a_fast_input_burst() {
         BottomPaneAction::Consumed
     ));
     assert_eq!(pane.composer.text(), "shi");
-    assert!(render(&pane).contains("> ship canary build"));
+    assert!(render(&pane).contains("› ship canary build"));
     pane.handle_session_key_at(key(KeyCode::Up), at(71), &history);
-    assert!(render(&pane).contains("> ship staging build"));
+    assert!(render(&pane).contains("› ship staging build"));
 
     // An early paste control is still literal input, never acceptance or
     // submission, regardless of whether a frame already flushed the bytes.

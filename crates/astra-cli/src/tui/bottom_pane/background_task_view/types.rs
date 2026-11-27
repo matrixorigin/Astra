@@ -112,14 +112,6 @@ impl LiveControlState {
     pub(crate) fn can_stop(self) -> bool {
         matches!(self, Self::Available)
     }
-
-    pub(crate) fn list_label(self) -> Option<&'static str> {
-        match self {
-            Self::Available => None,
-            Self::StaleHandle => Some("stale snapshot"),
-            Self::UnsupportedInMode => Some("no control"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,10 +389,18 @@ pub(crate) fn format_elapsed(ms: u64) -> String {
         format!("{ms}ms")
     } else if ms < 60_000 {
         format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
+    } else if ms < 3_600_000 {
         let mins = ms / 60_000;
         let secs = (ms % 60_000) / 1000;
-        format!("{mins}m{secs}s")
+        format!("{mins}m{secs:02}s")
+    } else if ms < 86_400_000 {
+        let hours = ms / 3_600_000;
+        let minutes = (ms % 3_600_000) / 60_000;
+        format!("{hours}h{minutes:02}m")
+    } else {
+        let days = ms / 86_400_000;
+        let hours = (ms % 86_400_000) / 3_600_000;
+        format!("{days}d{hours:02}h")
     }
 }
 
@@ -418,13 +418,5 @@ pub(crate) fn pluralize_with_count(count: usize, singular: &str, plural: &str) -
         format!("1 {singular}")
     } else {
         format!("{count} {plural}")
-    }
-}
-
-pub(crate) fn detail_actions_label(can_stop: bool, width: usize) -> &'static str {
-    match (can_stop, width) {
-        (true, 26..) => "  actions: stop · return",
-        (true, _) => "  actions: stop",
-        (false, _) => "  actions: return",
     }
 }

@@ -532,7 +532,7 @@ impl ChatComposer {
         }
         let framed = self.frame_allowed && width >= 4;
         let horizontal_chrome = if framed { 2 } else { 0 };
-        let vertical_chrome = if framed { 2 } else { 1 };
+        let vertical_chrome = horizontal_chrome;
         if self.is_history_search_active() {
             return vertical_chrome + 1;
         }
@@ -540,7 +540,7 @@ impl ChatComposer {
         self.textarea
             .desired_height(inner_w)
             .saturating_add(vertical_chrome)
-            .clamp(if framed { 3 } else { 2 }, if framed { 6 } else { 4 })
+            .clamp(vertical_chrome + 1, if framed { 6 } else { 4 })
     }
 
     pub(super) fn is_explicit_followup_key(key: KeyEvent) -> bool {
@@ -759,12 +759,11 @@ impl ChatComposer {
             return;
         }
         let query = input.trim();
-        self.history_search = if self.draft.is_none()
-            && self.pasted_blobs.is_empty()
-            && self.textarea.cursor_byte() == input.len()
+        self.history_search = if self.pasted_blobs.is_empty()
             && !query.is_empty()
             && !query.starts_with(['/', '!', '$'])
             && !input.contains(['\n', '\r', '\t'])
+            && !(self.draft.is_some() && self.matches_recalled_entry(input))
         {
             let entries = self.suggestion_entries(history, query);
             (!entries.is_empty()).then_some(HistorySearch {
@@ -808,8 +807,13 @@ impl ChatComposer {
             self.textarea.swap_paste_burst(&mut query);
             self.take_recoverable_drafts()
         } else {
-            // A suggestion completes what is already in the input box.
-            Vec::new()
+            // Complete the visible query and keep any draft suspended by
+            // Up/Down history navigation available for later editing.
+            self.draft
+                .take()
+                .filter(|draft| !draft.is_empty())
+                .into_iter()
+                .collect()
         };
         self.textarea.set_text(&text);
         self.history_entry = Some(entry);
@@ -1089,7 +1093,7 @@ impl ChatComposer {
             .filter(|_| include_preview)
             .and_then(|index| search.entries.get(index))
             .and_then(|entry| self.history_entry_text(entry))
-            .map(|entry| history_preview(entry, preview_width))
+            .map(|entry| input_preview(entry, preview_width))
             .unwrap_or_default();
         let cursor = opening.width() + display_query.width();
         let dim = Style::default().fg(theme.dim).bg(panel_bg);
@@ -1112,7 +1116,7 @@ impl ChatComposer {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, queueing: bool) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, queueing: bool, tip: Option<&str>) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -1180,12 +1184,22 @@ impl ChatComposer {
         );
 
         if self.textarea.is_empty() {
-            let placeholder = Span::styled(
-                truncate_end(COMPOSER_PLACEHOLDER, text_area.width as usize),
-                Style::default().fg(theme.dim).bg(panel_bg),
-            );
+            const TIP_LABEL: &str = " · Tip  ";
+            let style = Style::default().fg(theme.dim).bg(panel_bg);
+            let width = usize::from(text_area.width);
+            let mut placeholder = Line::styled(truncate_end(COMPOSER_PLACEHOLDER, width), style);
+            // The hint shares the input row so it cannot become an extra
+            // physical line when a terminal reflows the inline viewport.
+            if let Some(tip) = tip
+                && COMPOSER_PLACEHOLDER.width() + TIP_LABEL.width() + tip.width() <= width
+            {
+                placeholder
+                    .spans
+                    .push(Span::styled(TIP_LABEL, style.bold()));
+                placeholder.spans.push(Span::styled(tip, style));
+            }
             Widget::render(
-                Line::from(placeholder),
+                placeholder,
                 Rect::new(text_area.x, text_area.y, text_area.width, 1),
                 buf,
             );
@@ -1233,13 +1247,16 @@ impl ChatComposer {
             else {
                 continue;
             };
+            let y = area.y + row as u16;
             let (marker, style) = if index == selected {
-                ("> ", Style::default().fg(theme.accent).bold())
+                let selected = Style::default().bg(theme.selected_bg);
+                buf.set_style(Rect::new(area.x, y, area.width, 1), selected);
+                ("› ", selected.fg(theme.selected_fg).bold())
             } else {
                 ("  ", Style::default().fg(theme.fg))
             };
             let line = Line::styled(format!("{marker}{preview}"), style);
-            buf.set_line(area.x, area.y + row as u16, &line, area.width);
+            buf.set_line(area.x, y, &line, area.width);
             painted[index] = true;
         }
         search.painted.set(painted);
@@ -1254,6 +1271,9 @@ impl ChatComposer {
 
     /// Preserve a preview when the terminal has no row for the list.
     pub(super) fn render_compact_history_suggestion(&self, area: Rect, buf: &mut Buffer) {
+        if self.textarea.cursor_byte() != self.textarea.text().len() {
+            return;
+        }
         let Some((search, selected)) = self.history_suggestions() else {
             return;
         };
@@ -1327,13 +1347,13 @@ fn history_match_hash(text: &str) -> u64 {
 }
 
 fn suggestion_preview(text: &str, width: usize) -> Option<String> {
-    let preview = history_preview(text, width);
+    let preview = input_preview(text, width);
     let visible = preview.trim_matches(|ch: char| ch.is_whitespace() || ch == '…');
     (visible.width() > 0).then_some(preview)
 }
 
-fn history_preview(text: &str, width: usize) -> String {
-    // Only the visible prefix is needed; a history entry can be large.
+pub(super) fn input_preview(text: &str, width: usize) -> String {
+    // Only the visible prefix is needed; a message can be large.
     let prefix: String = text.graphemes(true).take(width.saturating_add(1)).collect();
     truncate_end(&history_search_display(&prefix), width)
 }
@@ -1457,7 +1477,7 @@ mod paste_tests {
         composer.set_text("你好ab\n  z");
         let area = Rect::new(0, 0, 10, 4);
         let mut buffer = Buffer::empty(area);
-        composer.render(area, &mut buffer, false);
+        composer.render(area, &mut buffer, false, None);
         assert_eq!(buffer[(0, 0)].symbol(), "╭");
         assert_eq!(buffer[(1, 1)].symbol(), "›");
         assert_eq!(
@@ -1698,7 +1718,7 @@ mod paste_tests {
         let composer = ChatComposer::new_ephemeral();
         let area = Rect::new(2, 3, 42, 3);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 48, 8));
-        composer.render(area, &mut buffer, false);
+        composer.render(area, &mut buffer, false, None);
 
         assert_eq!(buffer[(2, 3)].symbol(), "╭");
         assert_eq!(buffer[(43, 3)].symbol(), "╮");
@@ -1712,7 +1732,7 @@ mod paste_tests {
         let composer = ChatComposer::new_ephemeral();
         let area = Rect::new(0, 0, 3, 2);
         let mut buffer = Buffer::empty(area);
-        composer.render(area, &mut buffer, false);
+        composer.render(area, &mut buffer, false, None);
 
         assert_eq!(buffer[(0, 0)].symbol(), "›");
         assert!(

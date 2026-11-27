@@ -263,6 +263,7 @@ fn every_catalog_item_is_editable_via_apply_edit() {
     for item in &items {
         let value_json = match &item.kind {
             SettingKind::Bool => serde_json::json!(item.value_as_bool().unwrap_or(false)),
+            SettingKind::Text => serde_json::json!(item.value_as_string().unwrap_or_default()),
             SettingKind::Number { .. } => {
                 serde_json::json!(item.value_as_number().unwrap_or(0.0))
             }

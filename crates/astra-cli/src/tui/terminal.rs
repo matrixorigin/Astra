@@ -14,13 +14,18 @@ use crossterm::{
     },
     execute, queue,
     style::Print,
-    terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        is_raw_mode_enabled,
+    },
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::text::Line;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use super::custom_terminal;
+use super::event::TuiEventStream;
 use super::frame_requester::FrameRequester;
 use super::history_cell::{HistoryCell, assistant::AssistantCell};
 use super::render::line_utils::{history_cell_rows_for_terminal, sanitize_lines_for_terminal};
@@ -85,10 +90,14 @@ fn pop_keyboard_enhancement_if_owned() {
 pub(crate) struct TerminalGuard {
     pub terminal: CustomTerminal,
     pending_history: VecDeque<PendingHistory>,
+    workspace: Option<WorkspaceScreen>,
     is_zellij: bool,
     pub(crate) resize_pending: Arc<AtomicBool>,
+    pub(crate) alternate_screen: Arc<AtomicBool>,
+    clear_viewport_from: Option<u16>,
     clipped_reflow_below_cursor: Option<u16>,
     unreconciled_width: bool,
+    inline_recovery_deadline: Option<Instant>,
     /// Scrollback is deliberately drained over several frames for very long
     /// replies. This keeps terminal writes from monopolising the same event
     /// loop that owns keyboard input and the composer.
@@ -98,6 +107,11 @@ pub(crate) struct TerminalGuard {
     /// regardless, matching how `DisableBracketedPaste` is already handled
     /// in this file.
     keyboard_enhancement_supported: bool,
+}
+
+struct WorkspaceScreen {
+    inline: custom_terminal::InlineScreen,
+    resized: bool,
 }
 
 // A terminal write can block on a slow terminal emulator or remote PTY. Keep
@@ -193,10 +207,14 @@ impl TerminalGuard {
         let guard = Self {
             terminal,
             pending_history: VecDeque::new(),
+            workspace: None,
             is_zellij,
             resize_pending: Arc::new(AtomicBool::new(false)),
+            alternate_screen: Arc::new(AtomicBool::new(false)),
+            clear_viewport_from: None,
             clipped_reflow_below_cursor: None,
             unreconciled_width: false,
+            inline_recovery_deadline: None,
             history_drain_requester: None,
             keyboard_enhancement_supported,
         };
@@ -324,17 +342,54 @@ impl TerminalGuard {
         interrupted: bool,
     ) -> io::Result<()> {
         let size = self.terminal.size()?;
+        if let Some(workspace) = &mut self.workspace {
+            workspace.resized = true;
+            let pending = interrupted || (size.width, size.height) != queried_size;
+            self.resize_pending.store(pending, Ordering::Release);
+            if !pending {
+                // The workspace is always anchored at the top of its own screen.
+                self.clear_viewport_from = Some(0);
+                self.terminal.resize(size)?;
+            }
+            return Ok(());
+        }
         // Treat out-of-screen replies as missing, never as scroll distances.
         let cursor = cursor.filter(|&(x, y)| x < queried_size.0 && y < queried_size.1);
         self.unreconciled_width |= size.width != self.terminal.last_known_screen_size.width
             || queried_size.0 != self.terminal.last_known_screen_size.width;
-        self.resize_pending.store(
-            interrupted
-                || size.width != queried_size.0
-                || size.height != queried_size.1
-                || (self.unreconciled_width && cursor.is_none()),
-            Ordering::Release,
-        );
+        let superseded = interrupted || (size.width, size.height) != queried_size;
+        let needs_anchor = self.unreconciled_width && cursor.is_none();
+        if !superseded {
+            let append_pending =
+                self.terminal.viewport_area.top() >= self.terminal.last_known_screen_size.height;
+            let timed_out = needs_anchor && {
+                let now = Instant::now();
+                let deadline = self
+                    .inline_recovery_deadline
+                    .get_or_insert(now + Duration::from_millis(500));
+                now >= *deadline
+            };
+            if append_pending || timed_out {
+                // The reader keeps the unanswered cursor request quarantined.
+                // Reflow may have moved committed rows into the old frame's
+                // footprint. Allocate fresh rows after the physical bottom.
+                self.terminal.set_viewport_area(ratatui::layout::Rect::new(
+                    0,
+                    size.height,
+                    size.width,
+                    0,
+                ));
+                self.terminal.resize(size)?;
+                self.clear_viewport_from = None;
+                self.clipped_reflow_below_cursor = None;
+                self.unreconciled_width = false;
+                self.inline_recovery_deadline = None;
+                self.resize_pending.store(false, Ordering::Release);
+                return Ok(());
+            }
+        }
+        self.resize_pending
+            .store(superseded || needs_anchor, Ordering::Release);
         if self.resize_pending.load(Ordering::Acquire) {
             // xterm can discard the footer's newly wrapped rows below a
             // bottom-clamped cursor before a narrow/wide round trip settles.
@@ -347,6 +402,7 @@ impl TerminalGuard {
             }
             return Ok(());
         }
+        self.inline_recovery_deadline = None;
         let unreconciled_width = std::mem::take(&mut self.unreconciled_width);
         if !unreconciled_width
             && self.clipped_reflow_below_cursor.is_none()
@@ -389,10 +445,101 @@ impl TerminalGuard {
         } else {
             area.y
         };
+        // Repaint together with the clear. A second SIGWINCH can defer the
+        // draw below without leaving the user staring at an erased screen.
         self.terminal.set_viewport_area(area);
-        self.terminal
-            .clear_after_position(ratatui::layout::Position { x: 0, y: clear_y })?;
+        self.clear_viewport_from = Some(clear_y);
         self.terminal.resize(size)?;
+        Ok(())
+    }
+
+    fn defer_draw_for_resize(&self) -> io::Result<bool> {
+        if self.terminal.size()? != self.terminal.last_known_screen_size {
+            self.resize_pending.store(true, Ordering::Release);
+        }
+        Ok(self.resize_pending.load(Ordering::Acquire))
+    }
+
+    /// Draw a focused workspace without moving or clearing the inline chat.
+    /// Committed lines stay in the normal history queue until chat is visible.
+    pub(crate) fn draw_workspace(
+        &mut self,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> io::Result<()> {
+        if self.defer_draw_for_resize()? {
+            return Ok(());
+        }
+        stdout().sync_update(|_| {
+            if self.workspace.is_none() {
+                // Leave only scrollback on the normal screen. Its cursor then
+                // tracks the start of the footer across native terminal reflow.
+                // The composer draft itself stays in the pane.
+                let size = self.terminal.last_known_screen_size;
+                let top = self.terminal.viewport_area.top();
+                if top >= size.height {
+                    let bottom = size.height.saturating_sub(1);
+                    execute!(
+                        self.terminal.backend_mut(),
+                        cursor::MoveTo(0, bottom),
+                        Print("\r\n")
+                    )?;
+                    self.terminal
+                        .set_viewport_area(ratatui::layout::Rect::new(0, bottom, size.width, 0));
+                }
+                let top = self.terminal.viewport_area.top();
+                let clear_from = self.clear_viewport_from.take().map_or(top, |y| y.min(top));
+                self.terminal
+                    .clear_after_position(ratatui::layout::Position::new(0, clear_from))?;
+                if clear_from != top {
+                    self.terminal
+                        .set_cursor_position(ratatui::layout::Position::new(0, top))?;
+                }
+                pop_keyboard_enhancement_if_owned_fallible()?;
+                execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+                self.alternate_screen.store(true, Ordering::Release);
+                self.workspace = Some(WorkspaceScreen {
+                    inline: self.terminal.take_inline_screen(),
+                    resized: false,
+                });
+                if self.keyboard_enhancement_supported {
+                    push_keyboard_enhancement()?;
+                }
+            }
+            let terminal = &mut self.terminal;
+            let size = terminal.last_known_screen_size;
+            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            if self.clear_viewport_from.take().is_some() || terminal.viewport_area != area {
+                terminal.clear_after_position(ratatui::layout::Position::ORIGIN)?;
+                terminal.set_viewport_area(area);
+            }
+            terminal.draw(draw_fn)
+        })?
+    }
+
+    fn restore_inline_screen(&mut self) -> io::Result<()> {
+        if self.workspace.is_none() {
+            return Ok(());
+        }
+        pop_keyboard_enhancement_if_owned_fallible()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.alternate_screen.store(false, Ordering::Release);
+        let workspace = self
+            .workspace
+            .take()
+            .expect("workspace owns alternate screen");
+        self.terminal.restore_inline_screen(workspace.inline);
+        self.clear_viewport_from = None;
+        self.clipped_reflow_below_cursor = None;
+        self.unreconciled_width = false;
+        self.inline_recovery_deadline = None;
+        if workspace.resized {
+            // A cursor report from the alternate screen cannot locate the
+            // resized inline composer. Ask the existing input owner for one.
+            self.resize_pending.store(true, Ordering::Release);
+        }
+        if self.keyboard_enhancement_supported {
+            push_keyboard_enhancement()?;
+        }
         Ok(())
     }
 
@@ -406,24 +553,20 @@ impl TerminalGuard {
         height: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> io::Result<()> {
-        // A scheduled frame or a runtime event can arrive before SIGWINCH is
-        // consumed. Preserve the old cursor anchor until the input owner has
-        // queried its position in the resized terminal.
-        if self.terminal.size()? != self.terminal.last_known_screen_size {
-            self.resize_pending.store(true, Ordering::Release);
+        // A runtime overlay may arrive while the input owner is still reading
+        // a workspace cursor report. Keep that report on its own screen.
+        if self.defer_draw_for_resize()? {
+            return Ok(());
         }
-        if self.resize_pending.load(Ordering::Acquire) {
+        self.restore_inline_screen()?;
+        if self.defer_draw_for_resize()? {
             return Ok(());
         }
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
-            let mut needs_full_repaint = Self::update_inline_viewport(terminal, height)?;
-
-            needs_full_repaint |=
-                Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)?;
-
-            if needs_full_repaint {
+            Self::update_inline_viewport(terminal, height, self.clear_viewport_from.take())?;
+            if Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)? {
                 terminal.invalidate_viewport();
             }
 
@@ -442,39 +585,38 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// If viewport would extend past screen bottom, add only the missing rows
-    /// at the bottom so displaced content enters native terminal scrollback.
-    /// Once enough space exists below a shrunken viewport, later growth reuses
-    /// that space instead of printing more blank lines.
-    /// If viewport area changed, clear old area and set new one.
-    fn update_inline_viewport(terminal: &mut CustomTerminal, height: u16) -> io::Result<bool> {
+    /// Use spare rows before scrolling history. A shorter inline frame
+    /// keeps its origin so the composer stays next to the conversation.
+    fn update_inline_viewport<B: Backend + Write>(
+        terminal: &mut custom_terminal::Terminal<B>,
+        height: u16,
+        clear_from: Option<u16>,
+    ) -> io::Result<()> {
         let size = terminal.last_known_screen_size;
-        let mut area = terminal.viewport_area;
-        area.height = height.min(size.height);
-        area.width = size.width;
-        let mut needs_full_repaint = false;
-
-        if area.bottom() > size.height {
+        let old = terminal.viewport_area;
+        let height = height.min(size.height);
+        let requested_bottom = old.top().saturating_add(height);
+        let bottom = requested_bottom.min(size.height);
+        let area = ratatui::layout::Rect::new(0, bottom - height, size.width, height);
+        // The recovered resize origin already covers the old viewport.
+        // Clear it once, before allocating any rows for the new layout.
+        if let Some(y) = clear_from {
+            terminal.clear_after_position(ratatui::layout::Position::new(0, y))?;
+        } else if area != old {
             terminal.clear()?;
-            let scroll_by = area.bottom() - size.height;
-            queue!(
-                terminal.backend_mut(),
-                cursor::MoveTo(0, size.height.saturating_sub(1))
-            )?;
+        }
+        if area == old {
+            return Ok(());
+        }
+        let scroll_by = requested_bottom.saturating_sub(size.height);
+        if scroll_by > 0 {
+            queue!(terminal.backend_mut(), cursor::MoveTo(0, size.height - 1))?;
             for _ in 0..scroll_by {
                 queue!(terminal.backend_mut(), Print("\n"))?;
             }
-            needs_full_repaint = true;
-            area.y = size.height - area.height;
         }
-
-        if area != terminal.viewport_area {
-            terminal.clear()?;
-            terminal.set_viewport_area(area);
-            needs_full_repaint = true;
-        }
-
-        Ok(needs_full_repaint)
+        terminal.set_viewport_area(area);
+        Ok(())
     }
 
     fn flush_pending_history<B: Backend + Write>(
@@ -509,27 +651,73 @@ impl TerminalGuard {
             })
     }
 
+    /// Take input ownership for an external command or final scrollback drain.
+    pub(crate) async fn prepare_inline_handoff(
+        &mut self,
+        input: &mut TuiEventStream,
+    ) -> io::Result<()> {
+        input.pause_for_handoff().await?;
+        self.restore_inline_screen()?;
+        if self.defer_draw_for_resize()? {
+            let (size, cursor, interrupted) =
+                tokio::task::spawn_blocking(super::event::read_resize_cursor).await??;
+            self.reconcile_resize(cursor, size, interrupted)?;
+        }
+        Ok(())
+    }
+
+    /// Return the inline footer's origin when its geometry is known. If a
+    /// cursor report is unavailable, callers can append past the bottom row.
+    fn clear_inline_footer(&mut self) -> io::Result<Option<u16>> {
+        self.restore_inline_screen()?;
+        if self.defer_draw_for_resize()? {
+            return Ok(None);
+        }
+        let top = self
+            .clear_viewport_from
+            .take()
+            .unwrap_or(self.terminal.viewport_area.top());
+        if top < self.terminal.last_known_screen_size.height {
+            self.terminal
+                .clear_after_position(ratatui::layout::Position::new(0, top))?;
+            Ok(Some(top))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Temporarily leave TUI mode for an external interactive process, then
     /// restore. Workbench slash actions must not use this transition.
-    pub async fn with_restored<F, Fut, T>(&mut self, f: F) -> io::Result<T>
+    pub async fn with_restored<F, Fut, T>(
+        &mut self,
+        input: &mut TuiEventStream,
+        f: F,
+    ) -> io::Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        // Clear viewport area before leaving TUI so the old composer/footer
-        // doesn't remain visible while the slash command runs.
-        let area = self.terminal.viewport_area;
-        if area.height > 0 {
-            queue!(
-                self.terminal.backend_mut(),
-                cursor::MoveTo(0, area.top()),
-                Print("\x1b[J"), // ED: clear from viewport top to screen bottom
-            )?;
-            std::io::Write::flush(self.terminal.backend_mut())?;
-        }
-
-        // Position cursor at viewport top and show it
-        execute!(stdout(), cursor::MoveTo(0, area.top()), cursor::Show)?;
+        self.prepare_inline_handoff(input).await?;
+        let top = match self.clear_inline_footer()? {
+            Some(top) => top,
+            None => {
+                // An unanchored footer must not clear reflowed history.
+                let size = self.terminal.size()?;
+                let bottom = size.height.saturating_sub(1);
+                execute!(stdout(), cursor::MoveTo(0, bottom), Print("\r\n"))?;
+                self.terminal
+                    .set_viewport_area(ratatui::layout::Rect::new(0, bottom, size.width, 0));
+                self.terminal
+                    .set_cursor_position(ratatui::layout::Position::new(0, bottom))?;
+                self.terminal.resize(size)?;
+                self.resize_pending.store(false, Ordering::Release);
+                self.unreconciled_width = false;
+                self.clipped_reflow_below_cursor = None;
+                self.inline_recovery_deadline = None;
+                bottom
+            }
+        };
+        execute!(stdout(), cursor::MoveTo(0, top), cursor::Show)?;
 
         // Leave TUI modes. Pop while still in the raw-mode session that
         // pushed it, mirroring the enable/disable ordering below. Consumes
@@ -691,11 +879,24 @@ fn take_pending_history_batch(pending: &mut VecDeque<PendingHistory>) -> (Vec<Ma
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let top = self.clear_inline_footer().ok().flatten();
+        if self.workspace.is_none()
+            && let Ok(size) = self.terminal.size()
+        {
+            // With no confirmed origin, append after the physical bottom.
+            // Closing the workspace never guessed a row inside scrollback.
+            self.terminal.set_viewport_area(ratatui::layout::Rect::new(
+                0,
+                top.unwrap_or(size.height),
+                size.width,
+                0,
+            ));
+        }
         // Interactive rendering is deliberately time-sliced, but terminal
         // shutdown is a terminal boundary: flush the remaining canonical
         // scrollback rather than silently discarding a reply tail when the
         // user exits immediately after it starts painting.
-        while !self.pending_history.is_empty() {
+        while self.workspace.is_none() && !self.pending_history.is_empty() {
             if Self::flush_pending_history(
                 &mut self.terminal,
                 &mut self.pending_history,
@@ -708,7 +909,15 @@ impl Drop for TerminalGuard {
         }
         astra_tools::display_sixel::set_tui_active(false);
         let area = self.terminal.viewport_area;
-        let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
+        let bottom = self
+            .terminal
+            .size()
+            .map_or(area.bottom(), |size| size.height.saturating_sub(1));
+        let _ = execute!(
+            stdout(),
+            cursor::MoveTo(0, area.bottom().min(bottom)),
+            cursor::Show
+        );
         pop_keyboard_enhancement_if_owned();
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
@@ -815,6 +1024,34 @@ mod tests {
         terminal
     }
 
+    #[test]
+    fn filling_a_workspace_keeps_the_inline_origin_and_history_geometry() {
+        let mut terminal = recording_terminal(80, 14);
+        terminal.note_history_rows_inserted(12);
+        let inline = terminal.take_inline_screen();
+        super::TerminalGuard::update_inline_viewport(&mut terminal, 40, None).unwrap();
+        assert_eq!(terminal.visible_history_rows(), 0);
+
+        terminal.restore_inline_screen(inline);
+        assert_eq!(
+            terminal.viewport_area,
+            ratatui::layout::Rect::new(0, 14, 80, 4)
+        );
+        assert_eq!(terminal.visible_history_rows(), 12);
+        super::TerminalGuard::update_inline_viewport(&mut terminal, 4, None).unwrap();
+    }
+
+    #[test]
+    fn settling_live_output_reuses_the_space_above_the_composer() {
+        let mut terminal = recording_terminal(80, 10);
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 10, 80, 18));
+        super::TerminalGuard::update_inline_viewport(&mut terminal, 6, None).unwrap();
+        assert_eq!(
+            terminal.viewport_area,
+            ratatui::layout::Rect::new(0, 10, 80, 6)
+        );
+    }
+
     fn settled_guttered_text(source: &str) -> String {
         source
             .lines()
@@ -876,6 +1113,33 @@ mod tests {
     }
 
     #[test]
+    fn assistant_prose_keeps_its_gutter_across_long_paths() {
+        let markdown = "新增文件： `pkg/embed/indexed_equality_delete_test.go`、\
+                        `pkg/sql/plan/equality_row_bound.go`、\
+                        `pkg/vm/engine/disttae/long_component/equality_row_bound.go`；改动";
+        // The reply may have been laid out while the terminal was wider.
+        for (layout_width, width) in [(40_u16, 40_u16), (80, 80), (120, 40)] {
+            for zellij in [false, true] {
+                let mut terminal = recording_terminal(width, 2);
+                let mut parser = vt100::Parser::new(40, width, 256);
+                let mut pending = queued_assistant(markdown, layout_width);
+                drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                let rows = parser
+                    .screen()
+                    .rows(0, width)
+                    .take(usize::from(terminal.viewport_area.y))
+                    .filter(|row| !row.trim().is_empty())
+                    .collect::<Vec<_>>();
+                assert!(rows.len() > 1, "{rows:?}");
+                assert_eq!(rows[0], "  Astra");
+                assert!(rows[1].starts_with("  新增文件"), "{rows:?}");
+                assert!(rows.iter().all(|row| row.starts_with("  ")), "{rows:?}");
+                assert!(rows.concat().contains("改动"), "{rows:?}");
+            }
+        }
+    }
+
+    #[test]
     fn multi_page_code_survives_composer_repaint_and_following_reply() {
         for width in [40_u16, 80] {
             for top in [12_u16, 36] {
@@ -893,7 +1157,7 @@ mod tests {
                         }
                         let mut pending = queued_assistant(&format!("```\n{code}\n```"), width);
                         drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
-                        let expected_top = (top + physical_rows).min(36);
+                        let expected_top = (top + physical_rows + 1).min(36);
                         assert_eq!(terminal.viewport_area.y, expected_top);
                         assert!(
                             parser
@@ -1054,9 +1318,9 @@ mod tests {
                 "existing-code",
                 "earlier history overwritten zellij={zellij}"
             );
-            assert_eq!(parser.screen().rows(0, 40).nth(13).unwrap(), "  first-A");
-            assert_eq!(parser.screen().rows(0, 40).nth(15).unwrap(), "  first-C");
-            assert_eq!(terminal.viewport_area.y, 16);
+            assert_eq!(parser.screen().rows(0, 40).nth(14).unwrap(), "  first-A");
+            assert_eq!(parser.screen().rows(0, 40).nth(16).unwrap(), "  first-C");
+            assert_eq!(terminal.viewport_area.y, 17);
 
             let second = format!("second-batch-{}", "x".repeat(40));
             pending.extend(queued_assistant(&format!("```\n{second}\n```"), 40));
@@ -1068,7 +1332,7 @@ mod tests {
                 "existing-code"
             );
             assert_eq!(
-                parser.screen().rows(0, 40).nth(13).unwrap(),
+                parser.screen().rows(0, 40).nth(14).unwrap(),
                 "  first-A",
                 "later batch overwrote previous reply zellij={zellij}",
             );
@@ -1076,12 +1340,12 @@ mod tests {
                 parser
                     .screen()
                     .rows(0, 40)
-                    .nth(17)
+                    .nth(19)
                     .unwrap()
                     .starts_with("  second-batch-")
             );
             assert!(parser.screen().contents().contains(&second));
-            assert_eq!(terminal.viewport_area.y, 19);
+            assert_eq!(terminal.viewport_area.y, 21);
         }
     }
 
@@ -1117,9 +1381,9 @@ mod tests {
                         parser
                             .screen()
                             .rows(0, width)
-                            .filter(|row| !row.is_empty())
+                            .filter(|row| !row.trim().is_empty())
                             .count(),
-                        3,
+                        4,
                         "code placement width={width} top={top} zellij={zellij}"
                     );
                     assert!((0..40).any(|row| parser.screen().row_wrapped(row)));
