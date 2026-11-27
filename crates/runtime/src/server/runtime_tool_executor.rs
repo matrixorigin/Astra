@@ -4924,13 +4924,14 @@ impl RuntimeToolExecutor {
         let result = ledger.finish(&identity, &owner_id, result).await;
         lease_heartbeat.stop().await;
         if let (Some(fill), Some(outcome)) = (cache_fill, route_outcome) {
+            let durably_confirmed = result.confirms_dispatched_outcome(&outcome);
             tokio::spawn(async move {
                 crate::server::semantic_read_observation_runtime::settle_fill(
-                    &ledger,
                     &identity,
                     fill.claim,
                     outcome,
                     fill.provider_confirmed,
+                    durably_confirmed,
                 )
                 .await;
             });
@@ -11308,12 +11309,19 @@ pub(crate) mod tests {
         let outcome = crate::server::tool_invocation_runtime::terminal_outcome_from_result(&raw);
         let durable = ledger.finish(&first_identity, &dispatch_owner, raw).await;
         assert!(!durable.result.is_error);
+        let durably_confirmed = durable.confirms_dispatched_outcome(&outcome);
+        assert!(durably_confirmed);
+        let different_outcome =
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(
+                &astra_tools::ToolResult::text("a different provider result".to_string()),
+            );
+        assert!(!durable.confirms_dispatched_outcome(&different_outcome));
         crate::server::semantic_read_observation_runtime::settle_fill(
-            &ledger,
             &first_identity,
             fill,
             outcome,
             true,
+            durably_confirmed,
         )
         .await;
 
@@ -11391,8 +11399,13 @@ pub(crate) mod tests {
         let outcome = crate::server::tool_invocation_runtime::terminal_outcome_from_result(&raw);
         let durable = ledger.finish(&identity, &dispatch_owner, raw).await;
         assert!(!durable.result.is_error);
+        let durably_confirmed = durable.confirms_dispatched_outcome(&outcome);
         crate::server::semantic_read_observation_runtime::settle_fill(
-            &ledger, &identity, fill, outcome, false,
+            &identity,
+            fill,
+            outcome,
+            false,
+            durably_confirmed,
         )
         .await;
 
@@ -11471,12 +11484,14 @@ pub(crate) mod tests {
             durable.result.metadata.as_ref().unwrap()["durable_invocation_state"],
             "outcome_unknown"
         );
+        let durably_confirmed = durable.confirms_dispatched_outcome(&outcome);
+        assert!(!durably_confirmed);
         crate::server::semantic_read_observation_runtime::settle_fill(
-            &ledger,
             &first_identity,
             fill,
             outcome,
             true,
+            durably_confirmed,
         )
         .await;
 

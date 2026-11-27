@@ -29,6 +29,18 @@ pub(crate) struct FinishedToolInvocation {
     pub record: Option<Box<ToolInvocationRecord>>,
 }
 
+impl FinishedToolInvocation {
+    pub(crate) fn confirms_dispatched_outcome(
+        &self,
+        expected: &ToolInvocationTerminalOutcome,
+    ) -> bool {
+        self.record.as_deref().is_some_and(|record| {
+            record.dispatch_certainty == DispatchCertainty::Dispatched
+                && record.outcome.as_ref() == Some(expected)
+        })
+    }
+}
+
 impl From<astra_tools::ToolResult> for FinishedToolInvocation {
     fn from(result: astra_tools::ToolResult) -> Self {
         Self {
@@ -1169,17 +1181,6 @@ impl RuntimeToolInvocationLedger {
                 )
             }
         }
-    }
-
-    pub(crate) async fn confirms_dispatched_outcome(
-        &self,
-        identity: &ToolInvocationIdentity,
-        expected: &ToolInvocationTerminalOutcome,
-    ) -> Result<bool, RuntimeInvocationLedgerError> {
-        Ok(self.get(identity).await?.is_some_and(|record| {
-            record.dispatch_certainty == DispatchCertainty::Dispatched
-                && record.outcome.as_ref() == Some(expected)
-        }))
     }
 
     /// Prepare and atomically claim the route boundary. A terminal row is

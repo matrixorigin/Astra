@@ -337,11 +337,11 @@ pub(crate) async fn before_dispatch(
 }
 
 pub(crate) async fn settle_fill(
-    ledger: &crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
     identity: &ToolInvocationIdentity,
     fill: Box<SemanticReadFillClaim>,
     outcome: astra_turn_types::ToolInvocationTerminalOutcome,
     provider_confirmed: bool,
+    durably_confirmed: bool,
 ) {
     if !matches!(
         outcome,
@@ -365,6 +365,25 @@ pub(crate) async fn settle_fill(
             identity,
             &fill,
             "provider did not confirm the exact conditional read",
+        )
+        .await;
+        return;
+    }
+    if !durably_confirmed {
+        tracing::warn!(
+            user_id = %identity.user_id,
+            session_id = %identity.session_id,
+            run_id = %identity.run_id,
+            turn_chain_id = %identity.turn_chain_id,
+            invocation_id = %identity.invocation_id,
+            semantic_read_cache_state = "durability_unconfirmed",
+            semantic_read_cache_key_id = %fill.key.key_id,
+            "read result did not match a durable dispatched terminal outcome; observation will not be published"
+        );
+        abandon_fill(
+            identity,
+            &fill,
+            "durable dispatched outcome was not confirmed",
         )
         .await;
         return;
@@ -393,43 +412,6 @@ pub(crate) async fn settle_fill(
                 return;
             }
         };
-    match ledger.confirms_dispatched_outcome(identity, &outcome).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                user_id = %identity.user_id,
-                session_id = %identity.session_id,
-                run_id = %identity.run_id,
-                turn_chain_id = %identity.turn_chain_id,
-                invocation_id = %identity.invocation_id,
-                semantic_read_cache_state = "durability_unconfirmed",
-                semantic_read_cache_key_id = %fill.key.key_id,
-                "read result did not match a durable dispatched terminal outcome; observation will not be published"
-            );
-            abandon_fill(
-                identity,
-                &fill,
-                "durable dispatched outcome was not confirmed",
-            )
-            .await;
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(
-                user_id = %identity.user_id,
-                session_id = %identity.session_id,
-                run_id = %identity.run_id,
-                turn_chain_id = %identity.turn_chain_id,
-                invocation_id = %identity.invocation_id,
-                semantic_read_cache_state = "durability_check_failed",
-                semantic_read_cache_key_id = %fill.key.key_id,
-                %error,
-                "could not confirm durable read outcome; observation will not be published"
-            );
-            abandon_fill(identity, &fill, "durable outcome confirmation failed").await;
-            return;
-        }
-    }
     let observation_id = observation.observation_id.clone();
     match tokio::time::timeout(
         SEMANTIC_READ_CACHE_OPERATION_DEADLINE,

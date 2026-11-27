@@ -209,8 +209,10 @@ The dashboard reads existing process-local counters. Exact historical usage
 queries retain their Run and inference ledger sources.
 
 The existing executor-local cache owns optional MCP pure-read reuse. A hit
-does no cache SQL and can still complete the exact invocation in the existing
-tool ledger. Ending the executor releases its cache. Session deletion has no
+completes the exact invocation through the tool ledger. A fill uses the
+confirmed terminal record returned by settlement and the provider's
+acknowledgement of the exact read condition. Both cache operations use local
+memory. Ending the executor releases its cache. Session deletion has no
 cache-table cleanup. A v127 database requires replacement under the existing
 fresh-schema contract.
 
