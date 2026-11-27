@@ -12,10 +12,10 @@ const { Terminal } = require('@xterm/headless');
 const binary = path.resolve(process.env.ASTRA_TEST_BINARY || '../../target/debug/astra');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function journey(sizes, draft = false, rapid = false, displacedCursor = false, expiredReply = false) {
+async function journey(sizes, { draft = false, rapid = false, displacedCursor = false, expiredReply = false,
+  historyRows = 0 } = {}) {
   const checkTranscriptReturn = draft && sizes.length === 0 && !rapid;
   const checkContextReturn = !draft && sizes.length === 0 && !rapid;
-  const historyRows = expiredReply === 'width' ? 18 : 0;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
   const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root, String(historyRows)], {
@@ -315,6 +315,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     tracingResize = rapid;
     for (const [index, [cols, rows]] of sizes.entries()) {
       const reportsBeforeResize = cursorReports;
+      const outputBeforeResize = output.length;
       if (rapid && index === 0) holdCursorReply = true;
       // Apply the final cursor displacement before ACK-following output can
       // issue a query, rather than depending on the JavaScript continuation.
@@ -333,7 +334,21 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
         await delay(10);
       } else {
         await settle();
-        check(`${cols}x${rows}`);
+        const label = `${cols}x${rows}`;
+        const redraw = Buffer.concat(output.slice(outputBeforeResize)).toString();
+        const screenClears = redraw.match(/\x1b\[J/g) ?? [];
+        assert.equal(screenClears.length, 1, 'resize must clear the old viewport once: ' + label);
+        if (historyRows > 0) {
+          // An emulator can move old composer rows into native history before
+          // replying. Assert the live input and committed output we can keep.
+          assert.equal(liveDraft(), 'DRAFT_SENTINEL' + 'draft'.repeat(20), label);
+          const visible = lines().slice(terminal.buffer.active.baseY);
+          assert.equal(visible.filter(line => line.includes('DRAFT_SENTINEL')).length, 1, label);
+          checkHistory(label);
+          console.log('PASS', label, 'with wrapped history');
+        } else {
+          check(label);
+        }
       }
     }
     if (rapid) {
@@ -355,13 +370,15 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   assert(fs.existsSync(binary), 'build astra or set ASTRA_TEST_BINARY');
   await journey([[40, 30], [160, 30], [100, 30], [40, 30], [160, 30]]);
   await journey([[100, 15], [100, 30], [100, 10], [100, 35], [40, 15], [160, 30]]);
-  await journey([[40, 30], [160, 30], [40, 15], [100, 30]], true);
-  await journey([], true);
+  await journey([[40, 30], [160, 30], [40, 15], [100, 30]], { draft: true });
+  await journey([[100, 15], [100, 30], [100, 10], [100, 35], [40, 15], [160, 30]],
+    { draft: true, historyRows: 18 });
+  await journey([], { draft: true });
   await journey([]);
   const rapidSizes = Array.from({ length: 3 }, () => [[40, 30], [160, 30], [100, 15], [100, 30]]).flat();
-  await journey(rapidSizes, false, true);
-  await journey(rapidSizes, true, true);
-  await journey(rapidSizes, true, true, true);
-  await journey([], true, true, false, true);
-  await journey([], true, true, false, 'width');
+  await journey(rapidSizes, { rapid: true });
+  await journey(rapidSizes, { draft: true, rapid: true });
+  await journey(rapidSizes, { draft: true, rapid: true, displacedCursor: true });
+  await journey([], { draft: true, rapid: true, expiredReply: true });
+  await journey([], { draft: true, rapid: true, expiredReply: 'width', historyRows: 18 });
 })().catch(error => { console.error(error); process.exitCode = 1; });

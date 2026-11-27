@@ -565,15 +565,8 @@ impl TerminalGuard {
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
-            if let Some(y) = self.clear_viewport_from.take() {
-                terminal.clear_after_position(ratatui::layout::Position { x: 0, y })?;
-            }
-            let mut needs_full_repaint = Self::update_inline_viewport(terminal, height)?;
-
-            needs_full_repaint |=
-                Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)?;
-
-            if needs_full_repaint {
+            Self::update_inline_viewport(terminal, height, self.clear_viewport_from.take())?;
+            if Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)? {
                 terminal.invalidate_viewport();
             }
 
@@ -597,17 +590,24 @@ impl TerminalGuard {
     fn update_inline_viewport<B: Backend + Write>(
         terminal: &mut custom_terminal::Terminal<B>,
         height: u16,
-    ) -> io::Result<bool> {
+        clear_from: Option<u16>,
+    ) -> io::Result<()> {
         let size = terminal.last_known_screen_size;
         let old = terminal.viewport_area;
         let height = height.min(size.height);
         let requested_bottom = old.top().saturating_add(height);
         let bottom = requested_bottom.min(size.height);
         let area = ratatui::layout::Rect::new(0, bottom - height, size.width, height);
-        if area == old {
-            return Ok(false);
+        // The recovered resize origin already covers the old viewport.
+        // Clear it once, before allocating any rows for the new layout.
+        if let Some(y) = clear_from {
+            terminal.clear_after_position(ratatui::layout::Position::new(0, y))?;
+        } else if area != old {
+            terminal.clear()?;
         }
-        terminal.clear()?;
+        if area == old {
+            return Ok(());
+        }
         let scroll_by = requested_bottom.saturating_sub(size.height);
         if scroll_by > 0 {
             queue!(terminal.backend_mut(), cursor::MoveTo(0, size.height - 1))?;
@@ -616,7 +616,7 @@ impl TerminalGuard {
             }
         }
         terminal.set_viewport_area(area);
-        Ok(true)
+        Ok(())
     }
 
     fn flush_pending_history<B: Backend + Write>(
@@ -1029,7 +1029,7 @@ mod tests {
         let mut terminal = recording_terminal(80, 14);
         terminal.note_history_rows_inserted(12);
         let inline = terminal.take_inline_screen();
-        assert!(super::TerminalGuard::update_inline_viewport(&mut terminal, 40).unwrap());
+        super::TerminalGuard::update_inline_viewport(&mut terminal, 40, None).unwrap();
         assert_eq!(terminal.visible_history_rows(), 0);
 
         terminal.restore_inline_screen(inline);
@@ -1038,14 +1038,14 @@ mod tests {
             ratatui::layout::Rect::new(0, 14, 80, 4)
         );
         assert_eq!(terminal.visible_history_rows(), 12);
-        assert!(!super::TerminalGuard::update_inline_viewport(&mut terminal, 4).unwrap());
+        super::TerminalGuard::update_inline_viewport(&mut terminal, 4, None).unwrap();
     }
 
     #[test]
     fn settling_live_output_reuses_the_space_above_the_composer() {
         let mut terminal = recording_terminal(80, 10);
         terminal.set_viewport_area(ratatui::layout::Rect::new(0, 10, 80, 18));
-        assert!(super::TerminalGuard::update_inline_viewport(&mut terminal, 6).unwrap());
+        super::TerminalGuard::update_inline_viewport(&mut terminal, 6, None).unwrap();
         assert_eq!(
             terminal.viewport_area,
             ratatui::layout::Rect::new(0, 10, 80, 6)
