@@ -140,7 +140,10 @@ notifies the current owner. Reconciliation of that same source journal allows
 a subsequent projection failure to notify again. Browser and password login
 share a background sync operation. If projection and delivery take longer than
 the login notice window, or the drain finds unconfirmed work, that operation
-reports the outcome once while synchronization continues.
+reports the outcome once while synchronization continues. At display time the
+TUI discards a queued pending notice if the login has settled, and a queued
+projection warning if its failed journals have reconciled. Only a status read that starts
+after the login projected its records can confirm their delivery.
 Local outbox I/O failures remain eligible for bounded background retry.
 
 A projected event must fit the 4 MiB encoded singleton request, including the

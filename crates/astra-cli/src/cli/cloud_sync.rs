@@ -27,7 +27,7 @@ use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, StreamExt};
@@ -103,6 +103,10 @@ impl SyncOutboxNotice {
 struct SyncNoticeState {
     terminal: u64,
     login_pending: u64,
+    active_login: Option<u64>,
+    login_projected: bool,
+    failed_journals: Arc<BTreeSet<String>>,
+    unbound_projection_failed: bool,
     projection_failures: u64,
     retry_notices: u64,
     last_retry_count: u32,
@@ -163,7 +167,13 @@ impl SyncNoticeState {
             SyncOutboxNotice::Blocked(blocker) => {
                 (self.blocker == Some(blocker)).then_some(self.blocker_notices)
             }
-            _ => Some(0), // A permanent transition or the outcome of a login operation.
+            SyncOutboxNotice::NewlyTerminal(_) => Some(0),
+            SyncOutboxNotice::LoginSyncPending => {
+                self.active_login.filter(|id| *id == self.login_pending)
+            }
+            SyncOutboxNotice::JournalProjectionFailed => (self.unbound_projection_failed
+                || !self.failed_journals.is_empty())
+            .then_some(self.projection_failures),
         }
     }
 
@@ -183,10 +193,15 @@ impl SyncNoticeState {
                 u32::try_from(new_terminal).unwrap_or(u32::MAX),
             ));
         }
-        if self.login_pending != seen.login_pending {
+        if self.login_pending != seen.login_pending && self.active_login == Some(self.login_pending)
+        {
             notices.push(SyncOutboxNotice::LoginSyncPending);
         }
-        if self.projection_failures != seen.projection_failures {
+        if self.projection_failures != seen.projection_failures
+            && self
+                .active_incident(SyncOutboxNotice::JournalProjectionFailed)
+                .is_some()
+        {
             notices.push(SyncOutboxNotice::JournalProjectionFailed);
         }
         notices
@@ -435,24 +450,22 @@ struct JournalIngestOverflow {
     reconcile_owner_ids: BTreeSet<String>,
 }
 
-// Only failed, user-initiated projections are tracked. Normal reconciliation
-// neither broadcasts recovery traffic nor consults retained outbox records.
-static LOGIN_PROJECTION_FAILURES: LazyLock<Mutex<BTreeSet<JournalIngestHint>>> =
-    LazyLock::new(|| Mutex::new(BTreeSet::new()));
-
 fn notify_login_projection_failure(owner: &astra_services::OwnerScope, session_id: Option<&str>) {
-    if let Some(id) = session_id {
-        let hint = JournalIngestHint::new(owner, id);
-        let mut failures = recover_mutex_lock(&LOGIN_PROJECTION_FAILURES);
-        if failures.contains(&hint) {
-            return;
+    SYNC_OUTBOX_NOTICES.update(owner, |state| {
+        if let Some(id) = session_id {
+            if state.failed_journals.contains(id) {
+                return;
+            }
+            let failed = Arc::make_mut(&mut state.failed_journals);
+            if failed.len() == SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY {
+                failed.pop_first();
+            }
+            failed.insert(id.to_owned());
+        } else {
+            state.unbound_projection_failed = true;
         }
-        // At capacity, still report an explicitly requested login's failure.
-        if failures.len() < SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY {
-            failures.insert(hint);
-        }
-    }
-    SYNC_OUTBOX_NOTICES.update(owner, |state| state.projection_failures += 1);
+        state.projection_failures += 1;
+    });
 }
 
 fn defer_journal_ingest_hint(session_id: String) -> JournalIngestScheduleOutcome {
@@ -871,13 +884,18 @@ async fn reconcile_sync_outbox_journals_for_owner(
     .await
     {
         Ok(outcomes) => {
-            let mut failures = recover_mutex_lock(&LOGIN_PROJECTION_FAILURES);
-            if !failures.is_empty() {
-                for (session_id, outcome) in &outcomes {
-                    if outcome.is_ok() {
-                        failures.remove(&JournalIngestHint::new(owner_scope, session_id.as_str()));
+            let has_failures =
+                SYNC_OUTBOX_NOTICES.0.borrow().as_ref().is_some_and(|s| {
+                    s.owner == *owner_scope && !s.state.failed_journals.is_empty()
+                });
+            if has_failures {
+                SYNC_OUTBOX_NOTICES.update(owner_scope, |state| {
+                    for (id, result) in &outcomes {
+                        if result.is_ok() && state.failed_journals.contains(id) {
+                            Arc::make_mut(&mut state.failed_journals).remove(id);
+                        }
                     }
-                }
+                });
             }
             outcomes
         }
@@ -1247,7 +1265,7 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
             blocker.retry_delay()
         } else {
             match SyncOutboxStore::for_owner(&auth_snapshot.owner_scope) {
-                Ok(store) => match run_sync_outbox_io(store, |store| store.status()).await {
+                Ok(store) => match delivery_status_for_snapshot(store, &auth_snapshot).await {
                     Ok(status) => next_sync_outbox_drain_delay(&status),
                     Err(error) => {
                         tracing::warn!(target: "astra_cli::cloud_sync", ?error, "failed to read sync outbox status while scheduling the next drain");
@@ -1503,6 +1521,34 @@ async fn try_drain_sync_outbox_for_snapshot(
     report
 }
 
+/// Bind an empty status observation to the login that had already projected
+/// its journal at the start of this read. A drain may have started earlier
+/// and still be the one that delivers the newly projected records.
+async fn delivery_status_for_snapshot(
+    store: SyncOutboxStore,
+    snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> std::io::Result<SyncOutboxStatus> {
+    let login = SYNC_OUTBOX_NOTICES
+        .0
+        .borrow()
+        .as_ref()
+        .filter(|s| s.owner == snapshot.owner_scope && s.state.login_projected)
+        .and_then(|s| s.state.active_login);
+    let status = run_sync_outbox_io(store, |store| store.status()).await?;
+    if let Some(login) = login
+        && status.pending == 0
+        && status.in_flight == 0
+        && snapshot.is_current()
+    {
+        SYNC_OUTBOX_NOTICES.update(&snapshot.owner_scope, |state| {
+            if state.active_login == Some(login) {
+                state.active_login = None;
+            }
+        });
+    }
+    Ok(status)
+}
+
 async fn drain_sync_outbox_for_snapshot(
     limit: usize,
     auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
@@ -1543,7 +1589,7 @@ async fn drain_sync_outbox_for_snapshot(
             return report;
         }
     };
-    match run_sync_outbox_io(store.clone(), |store| store.status()).await {
+    match delivery_status_for_snapshot(store.clone(), auth_snapshot).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
             report.remaining_unconfirmed = status
@@ -1639,7 +1685,7 @@ async fn drain_sync_outbox_for_snapshot(
     if !auth_snapshot.is_current() {
         return report;
     }
-    match run_sync_outbox_io(store, |store| store.status()).await {
+    match delivery_status_for_snapshot(store, auth_snapshot).await {
         Ok(status) => {
             report.retry_clear = status.last_pending_failure.is_none();
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
@@ -2736,13 +2782,50 @@ async fn wait_for_post_auth_sync(
     let binding_matches = binding
         .as_ref()
         .is_none_or(|(owner, _)| owner == &snapshot.owner_scope);
-    let mut job = tokio::spawn(run_post_auth_sync(projection, binding, snapshot.clone()));
+    static NEXT_LOGIN: AtomicU64 = AtomicU64::new(1);
+    let login = NEXT_LOGIN.fetch_add(1, Ordering::Relaxed);
+    let owner = snapshot.owner_scope.clone();
+    if binding_matches && snapshot.is_current() {
+        SYNC_OUTBOX_NOTICES.update(&owner, |state| {
+            state.active_login = Some(login);
+            state.login_projected = false;
+        });
+    }
+    let job_snapshot = snapshot.clone();
+    let failure_session = binding.as_ref().map(|(_, id)| id.clone());
+    let mut job = tokio::spawn(async move {
+        let projection = async {
+            let result = projection.await;
+            if result.is_ok() {
+                // Independent drains may settle delivery only after the journal
+                // has finished projecting all records for this login.
+                SYNC_OUTBOX_NOTICES.update(&owner, |state| {
+                    if state.active_login == Some(login) {
+                        state.login_projected = true;
+                        state.unbound_projection_failed = false;
+                    }
+                });
+            }
+            result
+        };
+        let report = run_post_auth_sync(projection, binding, job_snapshot).await;
+        if report.blocker != Some(SyncOutboxDrainBlocker::LocalSyncPending)
+            || report.remaining_unconfirmed == 0
+        {
+            SYNC_OUTBOX_NOTICES.update(&owner, |state| {
+                if state.active_login == Some(login) {
+                    state.active_login = None;
+                }
+            });
+        }
+        report
+    });
     let report = match tokio::time::timeout(wait, &mut job).await {
         Ok(Ok(report)) => report,
         Ok(Err(error)) => {
             tracing::warn!(?error, "post-login sync task failed");
             if binding_matches && snapshot.is_current() {
-                notify_login_projection_failure(&snapshot.owner_scope, None);
+                notify_login_projection_failure(&snapshot.owner_scope, failure_session.as_deref());
             }
             SyncOutboxDrainReport {
                 cloud_configured,
@@ -2769,7 +2852,11 @@ async fn wait_for_post_auth_sync(
         && binding_matches
         && snapshot.is_current()
     {
-        SYNC_OUTBOX_NOTICES.update(&snapshot.owner_scope, |state| state.login_pending += 1);
+        SYNC_OUTBOX_NOTICES.update(&snapshot.owner_scope, |state| {
+            if state.active_login == Some(login) {
+                state.login_pending = login;
+            }
+        });
     }
     report
 }
@@ -5050,8 +5137,14 @@ mod notice_tests {
             duplicate.is_err(),
             "partial settlement emitted {duplicate:?}"
         );
-        channel.update(&owner, |state| state.login_pending += 1);
-        channel.update(&owner, |state| state.projection_failures += 1);
+        channel.update(&owner, |state| {
+            state.login_pending += 1;
+            state.active_login = Some(state.login_pending);
+        });
+        channel.update(&owner, |state| {
+            state.projection_failures += 1;
+            state.unbound_projection_failed = true;
+        });
         // The authoritative recovery and a distinct next failure both occur
         // while the observer cannot consume anything.
         settle(SyncOutboxDrainReport {

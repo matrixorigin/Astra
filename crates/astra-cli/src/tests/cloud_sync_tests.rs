@@ -1078,6 +1078,7 @@ async fn post_auth_reports_late_projection_failure_and_drains_other_sessions() {
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _auth = install_test_cloud_auth(Some("token"));
     let mut warnings = crate::tui::SyncWarningProbe::subscribe();
+    let mut delayed_reader = crate::tui::SyncWarningProbe::subscribe();
     let mut state = session_state_with_journal("broken-journal".into());
     std::fs::create_dir_all(state.journal.as_ref().unwrap().path()).unwrap();
     let store = SyncOutboxStore::local();
@@ -1157,6 +1158,7 @@ async fn post_auth_reports_late_projection_failure_and_drains_other_sessions() {
     .await
     .expect("repaired source must reconcile and deliver");
     assert_quiet(&mut warnings).await;
+    assert_quiet(&mut delayed_reader).await;
     std::fs::rename(writer.path(), temp.path().join("recovered.journal")).unwrap();
     std::fs::create_dir(writer.path()).unwrap();
     let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
@@ -1179,6 +1181,7 @@ async fn timed_out_login_projection_finishes_and_wakes_the_drain() {
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _auth = install_test_cloud_auth(Some("token"));
     let mut warnings = crate::tui::SyncWarningProbe::subscribe();
+    let mut delayed_reader = crate::tui::SyncWarningProbe::subscribe();
     let sid = "slow-login-projection";
     let mut state = session_state_with_journal(sid.into());
     state
@@ -1255,6 +1258,7 @@ async fn timed_out_login_projection_finishes_and_wakes_the_drain() {
     .await
     .expect("the completed projection must wake cloud delivery");
     assert_quiet(&mut warnings).await;
+    assert_quiet(&mut delayed_reader).await;
     server.verify().await;
 }
 
