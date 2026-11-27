@@ -87,6 +87,7 @@ pub(crate) struct TerminalGuard {
     pending_history: VecDeque<PendingHistory>,
     is_zellij: bool,
     pub(crate) resize_pending: Arc<AtomicBool>,
+    clear_viewport_from: Option<u16>,
     clipped_reflow_below_cursor: Option<u16>,
     unreconciled_width: bool,
     /// Scrollback is deliberately drained over several frames for very long
@@ -195,6 +196,7 @@ impl TerminalGuard {
             pending_history: VecDeque::new(),
             is_zellij,
             resize_pending: Arc::new(AtomicBool::new(false)),
+            clear_viewport_from: None,
             clipped_reflow_below_cursor: None,
             unreconciled_width: false,
             history_drain_requester: None,
@@ -389,9 +391,10 @@ impl TerminalGuard {
         } else {
             area.y
         };
+        // Repaint together with the clear. A second SIGWINCH can defer the
+        // draw below without leaving the user staring at an erased screen.
         self.terminal.set_viewport_area(area);
-        self.terminal
-            .clear_after_position(ratatui::layout::Position { x: 0, y: clear_y })?;
+        self.clear_viewport_from = Some(clear_y);
         self.terminal.resize(size)?;
         Ok(())
     }
@@ -418,6 +421,9 @@ impl TerminalGuard {
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
+            if let Some(y) = self.clear_viewport_from.take() {
+                terminal.clear_after_position(ratatui::layout::Position { x: 0, y })?;
+            }
             let mut needs_full_repaint = Self::update_inline_viewport(terminal, height)?;
 
             needs_full_repaint |=
@@ -442,8 +448,9 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// Reclaim rows below a growing frame before scrolling. When it shrinks,
-    /// keep its old bottom edge so the composer stays near the user's hands.
+    /// Use spare rows before scrolling history. Only the transition out of a
+    /// full workspace needs to keep the old bottom edge. Shrinking an inline
+    /// frame must leave its origin in place for the next committed chat rows.
     fn update_inline_viewport<B: Backend + Write>(
         terminal: &mut custom_terminal::Terminal<B>,
         height: u16,
@@ -451,10 +458,11 @@ impl TerminalGuard {
         let size = terminal.last_known_screen_size;
         let old = terminal.viewport_area;
         let height = height.min(size.height);
-        let requested_bottom = old
-            .bottom()
-            .min(size.height)
-            .max(old.top().saturating_add(height));
+        let requested_bottom = if old.height >= size.height {
+            size.height.max(old.top().saturating_add(height))
+        } else {
+            old.top().saturating_add(height)
+        };
         let bottom = requested_bottom.min(size.height);
         let area = ratatui::layout::Rect::new(0, bottom - height, size.width, height);
         if area == old {
@@ -824,6 +832,17 @@ mod tests {
         assert_eq!(
             terminal.viewport_area,
             ratatui::layout::Rect::new(0, 32, 80, 8)
+        );
+    }
+
+    #[test]
+    fn settling_live_output_reuses_the_space_above_the_composer() {
+        let mut terminal = recording_terminal(80, 10);
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 10, 80, 18));
+        assert!(super::TerminalGuard::update_inline_viewport(&mut terminal, 6).unwrap());
+        assert_eq!(
+            terminal.viewport_area,
+            ratatui::layout::Rect::new(0, 10, 80, 6)
         );
     }
 

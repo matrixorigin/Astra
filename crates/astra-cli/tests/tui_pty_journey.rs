@@ -2447,8 +2447,18 @@ async fn settled_explain_report_expands_evidence_and_prepares_a_follow_up() {
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit("/explain on");
     astra.wait_for("Explain on · report after each turn", UI_TRANSITION_TIMEOUT);
-    astra.paste_and_submit("Record the execution evidence.");
-    astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
+    let question = "记录本次执行的证据。";
+    astra.paste_and_submit(question);
+    astra.wait_for_screen(
+        "question, sending state, and composer share the first frame",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains(question)
+                && screen.contains("Sending")
+                && screen.contains("Message Astra")
+        },
+    );
+    astra.record_frame("First frame after submit");
     assert!(!astra.current_screen().contains("Explain Analyze"));
 
     mock.release_held_response();
@@ -2457,6 +2467,30 @@ async fn settled_explain_report_expands_evidence_and_prepares_a_follow_up() {
         UI_TRANSITION_TIMEOUT,
     );
     astra.wait_for("Explain Analyze HTML report ready", UI_TRANSITION_TIMEOUT);
+    let settled = astra.current_screen();
+    let lines = settled.lines().collect::<Vec<_>>();
+    let submitted = lines
+        .iter()
+        .position(|line| line.contains(question))
+        .expect("visible user question");
+    let reply = lines
+        .iter()
+        .enumerate()
+        .skip(submitted + 1)
+        .find_map(|(index, line)| line.trim_start().starts_with("Astra").then_some(index))
+        .expect("visible assistant reply");
+    let mut blank = 0;
+    for line in &lines[submitted + 1..reply] {
+        if line.trim().is_empty() {
+            blank += 1;
+            assert!(
+                blank <= 1,
+                "extra vertical space in a short question and answer:\n{settled}"
+            );
+        } else {
+            blank = 0;
+        }
+    }
     astra.paste_and_submit("/explain report");
     astra.wait_for_screen("settled report", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("Explain · mock-run-1")
