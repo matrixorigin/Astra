@@ -1,3 +1,4 @@
+use astra_tools::memory_tool_contract::MemoryAction;
 use axum::extract::Extension;
 use serde_json::Value;
 
@@ -292,26 +293,27 @@ pub(super) async fn auth_me_handler(
 async fn memory_proxy_call(
     state: &AppState,
     headers: &HeaderMap,
+    operation: MemoryAction,
     method: reqwest::Method,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let principal = state.auth_service.current_principal(headers).await?;
-    memory_proxy_call_for_user(state, &principal, method, endpoint, body).await
+    memory_proxy_call_for_user(state, &principal, operation, method, endpoint, body).await
 }
 
 async fn memory_proxy_call_for_user(
     state: &AppState,
     principal: &astra_services::AuthPrincipal,
+    operation: MemoryAction,
     method: reqwest::Method,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user_id = &principal.user.user_id;
-    let requires_write = method != reqwest::Method::GET
-        && !endpoint.ends_with("/retrieve")
-        && !endpoint.ends_with("/search");
-    let requires_read = !requires_write || endpoint == "/v1/reflect";
+    // The authenticated route owns the operation. Record IDs are opaque.
+    let requires_write = astra_tools::memoria::memory_operation_requires_write(operation.as_str());
+    let requires_read = !requires_write || operation == MemoryAction::Reflect;
     let requested_scope = memory_proxy_scope(&body, user_id)?;
     let moi = matches!(
         &principal.origin,
@@ -395,17 +397,8 @@ async fn memory_proxy_call_for_user(
                 map_memoria_forward_error(MemoriaForwardError::Backend(error))
             })?;
     if let Some(args) = receipt_args.as_ref() {
-        let operation = if endpoint == "/v1/memories" {
-            "remember"
-        } else if endpoint.ends_with("/feedback") {
-            "feedback"
-        } else if endpoint.ends_with("/correct") {
-            "update"
-        } else {
-            "forget"
-        };
         let receipt = astra_tools::memoria::memory_write_receipt(
-            operation,
+            operation.as_str(),
             args,
             status,
             &response.to_string(),
@@ -962,6 +955,7 @@ pub(super) async fn memory_proxy_store_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Remember,
         reqwest::Method::POST,
         "/v1/memories",
         body,
@@ -977,6 +971,7 @@ pub(super) async fn memory_proxy_retrieve_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Recall,
         reqwest::Method::POST,
         "/v1/memories/retrieve",
         body,
@@ -992,6 +987,7 @@ pub(super) async fn memory_proxy_search_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Recall,
         reqwest::Method::POST,
         "/v1/memories/search",
         body,
@@ -1025,6 +1021,7 @@ pub(super) async fn memory_proxy_purge_handler(
     let response = memory_proxy_call_for_user(
         &state,
         &principal,
+        MemoryAction::Forget,
         reqwest::Method::POST,
         "/v1/memories/purge",
         request,
@@ -1045,6 +1042,7 @@ pub(super) async fn memory_proxy_expand_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Expand,
         reqwest::Method::GET,
         &format!("/v1/memories/{memory_id}"),
         serde_json::json!({}),
@@ -1060,6 +1058,7 @@ pub(super) async fn memory_proxy_correct_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Update,
         reqwest::Method::POST,
         "/v1/memories/correct",
         body,
@@ -1077,6 +1076,7 @@ pub(super) async fn memory_proxy_correct_by_id_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Update,
         reqwest::Method::PUT,
         &format!("/v1/memories/{memory_id}/correct"),
         body,
@@ -1094,6 +1094,7 @@ pub(super) async fn memory_proxy_feedback_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Feedback,
         reqwest::Method::POST,
         &format!("/v1/memories/{memory_id}/feedback"),
         body,
@@ -1110,6 +1111,7 @@ pub(super) async fn memory_proxy_delete_by_id_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Forget,
         reqwest::Method::DELETE,
         &format!("/v1/memories/{memory_id}"),
         serde_json::json!({}),
@@ -1124,6 +1126,7 @@ pub(super) async fn memory_proxy_profile_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Profile,
         reqwest::Method::GET,
         "/v1/profiles/me",
         serde_json::json!({}),
@@ -1136,7 +1139,15 @@ pub(super) async fn memory_proxy_reflect_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, reqwest::Method::POST, "/v1/reflect", body).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        MemoryAction::Reflect,
+        reqwest::Method::POST,
+        "/v1/reflect",
+        body,
+    )
+    .await
 }
 
 async fn memoria_management_proxy_call(

@@ -504,7 +504,7 @@ fn memory_status_counts_toward_circuit(status: reqwest::StatusCode) -> bool {
         )
 }
 
-fn memory_operation_requires_write(operation: &str) -> bool {
+pub fn memory_operation_requires_write(operation: &str) -> bool {
     matches!(
         operation,
         "remember" | "forget" | "update" | "reflect" | "feedback"

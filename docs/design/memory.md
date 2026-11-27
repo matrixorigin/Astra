@@ -394,8 +394,11 @@ and the Memoria request has a separate 30-second deadline.
 After the owning Server settles a Run, it can send one best-effort observation
 using bounded public conversation evidence. A new Run can retain the
 verified adjacent public exchange from its Session to preserve the meaning of
-a reply. Consecutive user
-inputs stay together. If acknowledged guidance follows a public assistant
+a reply. If a tool, a history rewrite or the byte limit makes the adjacent
+exchange unusable, the new Run sends only its current user input to
+`POST /v1/observe/standalone`. The extractor can retain an independent
+preference and discard a confirmation whose referent is missing. Consecutive
+user inputs stay together. If acknowledged guidance follows a public assistant
 reply, the observer sends the exchange as one content string containing
 ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
 the confirmation and its referent together. The complete opening or guided

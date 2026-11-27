@@ -2399,34 +2399,27 @@ fn observer_preceding_exchange<'a>(
     current_input: &str,
 ) -> Result<Option<(&'a str, &'a str)>, ()> {
     use astra_turn_types::{is_human_user_message, is_runtime_owned_message, model_replay_origin};
-    let Some(index) = state.messages.iter().rposition(is_human_user_message) else {
-        return Ok(None);
-    };
+    let index = state
+        .messages
+        .iter()
+        .rposition(is_human_user_message)
+        .ok_or(())?;
     if state.messages[index]["content"].as_str().map(str::trim) != Some(current_input.trim()) {
-        return Ok(None);
+        return Err(());
     }
-    let Some((prior_assistant, earlier)) = state.messages[..index].split_last() else {
-        return Ok(None);
-    };
-    let Some(reply) = prior_assistant["content"].as_str().map(str::trim) else {
-        return Ok(None);
-    };
-    if prior_assistant["role"] != "assistant" || reply.is_empty() {
-        return Ok(None);
-    }
-
-    // A completed memory-tool turn is excluded from extraction as a whole.
-    // Its receipt cannot be replayed as dialogue, but it must not suppress
-    // independent input in the next turn.
-    let is_memory_tool_message = astra_turn_core::observer::is_memory_tool_message;
-    if is_memory_tool_message(prior_assistant)
-        || earlier
-            .iter()
-            .rev()
-            .take_while(|message| !is_human_user_message(message))
-            .any(is_memory_tool_message)
+    let history = &state.messages[..index];
+    if state.session_turn <= 1
+        && history.iter().all(|m| {
+            matches!(m["role"].as_str(), Some("system" | "developer"))
+                || is_runtime_owned_message(m)
+        })
     {
         return Ok(None);
+    }
+    let (prior_assistant, earlier) = history.split_last().ok_or(())?;
+    let reply = prior_assistant["content"].as_str().ok_or(())?.trim();
+    if prior_assistant["role"] != "assistant" || reply.is_empty() {
+        return Err(());
     }
 
     // Check the public evidence regardless of how the assistant ended its
@@ -2518,34 +2511,35 @@ fn build_server_loop_observer_request(
             ("content".to_owned(), serde_json::Value::String(content)),
         ])
     };
-    // Preserve the entire user exchange when only the optional answer would
-    // overflow Memoria's complete extraction window.
-    let standalone_guidance = state
+    let mut standalone_guidance = state
         .user_intents
         .observer_guidance
         .as_ref()
         .is_some_and(|w| w.standalone);
+    let mut messages = Vec::with_capacity(4);
+    let mut evidence_bytes = "[user]: \n".len() + content.len();
+    if applied.is_empty() {
+        match observer_preceding_exchange(state, session_id, user_message) {
+            Ok(Some((opening, reply))) => {
+                evidence_bytes += "[user]: \n[assistant]: \n".len() + opening.len() + reply.len();
+                if evidence_bytes <= OBSERVER_EXCHANGE_BYTES {
+                    messages.push(message("user", opening.to_owned()));
+                    messages.push(message("assistant", reply.to_owned()));
+                } else {
+                    standalone_guidance = true;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => standalone_guidance = true,
+        }
+    }
+    // Only the extractor can tell if a user statement stands on its own.
+    // Never send omitted history or the current answer as substitute evidence.
     if standalone_guidance
-        || "[user]: \n[assistant]: \n".len() + content.len() + answer.len()
-            > OBSERVER_EXCHANGE_BYTES
+        || answer.trim().is_empty()
+        || evidence_bytes + "[assistant]: \n".len() + answer.len() > OBSERVER_EXCHANGE_BYTES
     {
         answer = "";
-    }
-    let mut messages = Vec::with_capacity(4);
-    let mut exchange_bytes = "[user]: \n[assistant]: \n".len() + content.len() + answer.len();
-    if applied.is_empty()
-        && let Some((opening, reply)) =
-            observer_preceding_exchange(state, session_id, user_message).ok()?
-    {
-        exchange_bytes += "[user]: \n[assistant]: \n".len() + opening.len() + reply.len();
-        if exchange_bytes.saturating_sub(answer.len()) > OBSERVER_EXCHANGE_BYTES {
-            return None;
-        }
-        if exchange_bytes > OBSERVER_EXCHANGE_BYTES {
-            answer = "";
-        }
-        messages.push(message("user", opening.to_owned()));
-        messages.push(message("assistant", reply.to_owned()));
     }
     messages.push(message("user", content));
     if !answer.is_empty() {
@@ -3350,7 +3344,7 @@ mod tests {
             json!({"role": "assistant", "content": "world"}),
         ];
         state.final_text = "world".into();
-        state.session_turn = 3;
+        state.session_turn = 1;
         state.max_turns = 12;
         state.remaining_turns = 8;
         state
@@ -3387,7 +3381,7 @@ mod tests {
         assert_eq!(request.user_id, "user-1");
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.turn_count, 3);
+        assert_eq!(request.turn_count, 1);
     }
 
     #[test]
@@ -3422,7 +3416,74 @@ mod tests {
         state
             .messages
             .insert(1, json!({"role":"tool","content":"private tool payload"}));
-        assert!(build(&state).is_none());
+        let isolated = build(&state).unwrap();
+        assert!(isolated.standalone_guidance);
+        assert_eq!(
+            json!(isolated.messages),
+            json!([{"role":"user","content":"Yes."}])
+        );
+    }
+
+    #[test]
+    fn observer_isolates_current_input_when_previous_evidence_is_unusable() {
+        for input in ["I prefer Rust for new projects.", "Use that one."] {
+            let mut state = observer_test_state();
+            state.session_turn = 2;
+            for previous in [
+                vec![
+                    json!({"role":"assistant","tool_calls":[{"function":{"name":"tool_search"}}]}),
+                    json!({"role":"tool","content":"private result"}),
+                    json!({"role":"assistant","content":"Which one?"}),
+                ],
+                vec![json!({"role":"assistant","content":"界".repeat(2000)})],
+                vec![
+                    json!({"role":"assistant","content":"rewritten", "_astra_omitted_terminal_response":true}),
+                ],
+                vec![json!({"role":"assistant","content":"unverified",
+                            (astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD):{}})],
+                vec![],
+            ] {
+                state.messages = vec![json!({"role":"user","content":"Previous request."})];
+                state.messages.extend(previous);
+                state.messages.push(json!({"role":"user","content":input}));
+                state
+                    .messages
+                    .push(json!({"role":"assistant","content":state.final_text}));
+                let request = build_server_loop_observer_request("u", "s", input, &state).unwrap();
+                assert!(request.standalone_guidance);
+                assert_eq!(
+                    json!(request.messages),
+                    json!([{"role":"user","content":input}])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observer_gives_the_full_extraction_budget_to_required_evidence() {
+        let mut state = observer_test_state();
+        let input = "Yes.";
+        let available = OBSERVER_EXCHANGE_BYTES - "[user]: x\n[assistant]: \n[user]: Yes.\n".len();
+        for (length, fits) in [(available, true), (available + 1, false)] {
+            let reply = "x".repeat(length);
+            state.messages = vec![
+                json!({"role":"user","content":"x"}),
+                json!({"role":"assistant","content":reply}),
+                json!({"role":"user","content":input}),
+            ];
+            let request = build_server_loop_observer_request("u", "s", input, &state).unwrap();
+            assert_eq!(request.standalone_guidance, !fits);
+            if fits {
+                assert_eq!(request.messages.len(), 3);
+                assert_eq!(request.messages[1]["content"], reply);
+                assert_eq!(request.messages[2]["content"], input);
+            } else {
+                assert_eq!(
+                    json!(request.messages),
+                    json!([{"role":"user","content":input}])
+                );
+            }
+        }
     }
 
     #[test]
@@ -3467,9 +3528,11 @@ mod tests {
             build_server_loop_observer_request("user-1", "session-1", input, state)
         };
         let request = build(&state).unwrap();
-        assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.messages[0]["content"], input);
-        assert_eq!(request.messages[1]["content"], state.final_text);
+        assert!(request.standalone_guidance);
+        assert_eq!(
+            json!(request.messages),
+            json!([{"role":"user","content":input}])
+        );
         state.total_tool_calls = 1;
         assert!(build(&state).is_none(), "missing tool evidence");
         state
@@ -3485,6 +3548,7 @@ mod tests {
         );
         state.stall.tool_call_records[0].name = "tool_search".into();
         let limit = "界".repeat(500);
+        state.messages = vec![json!({"role":"user","content":limit})];
         state.final_text = limit.clone();
         let bounded =
             build_server_loop_observer_request("user-1", "session-1", &limit, &state).unwrap();

@@ -2087,6 +2087,21 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = response(
+        &app,
+        edge_request(
+            "DELETE",
+            "/memory/synthetic-record",
+            "",
+            "moi-contract-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "deletion requires write authority"
+    );
     write_only.store(true, Ordering::SeqCst);
     let (status, receipt) = response(
         &app,
