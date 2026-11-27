@@ -1286,7 +1286,6 @@ fn unavailable_scope_error(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PersistedInvocationAdmissionFact {
-    route_id: String,
     admission_token: String,
     owner_token: String,
     owner_generation: i64,
@@ -1302,7 +1301,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
     sqlx::query(
-        "SELECT route_id, admission_token, owner_token, owner_generation,
+        "SELECT admission_token, owner_token, owner_generation,
                 status, terminal_fingerprint
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? LIMIT 1",
@@ -1320,7 +1319,6 @@ where
     })?
     .map(|row| {
         Ok::<_, sqlx::Error>(PersistedInvocationAdmissionFact {
-            route_id: row.try_get("route_id")?,
             admission_token: row.try_get("admission_token")?,
             owner_token: row.try_get("owner_token")?,
             owner_generation: row.try_get("owner_generation")?,
@@ -1372,9 +1370,6 @@ fn validate_ambiguous_invocation_admission(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
     let mut mismatches = Vec::new();
-    if persisted.route_id != plan.route_id {
-        mismatches.push("route_id");
-    }
     if persisted.admission_token != plan.admission_token {
         mismatches.push("admission_token");
     }
@@ -1511,35 +1506,33 @@ async fn insert_inference_invocation_admission(
             session_id, run_id, ..
         } => sqlx::query(
             "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+                 (invocation_id, user_id, session_id, scope_kind, run_id,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
                   turn_index, round_index, operation_id, logical_attempt, purpose,
                   offering_id, resolved_model_name, upstream_model_name, provider,
                   execution_placement, access_kind, price_snapshot_json, status,
                   terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, ?, 'run', ?, ?, ?, ?,
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
                          ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id)
         .bind(run_id),
         InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
             "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, session_id, scope_kind,
+                 (invocation_id, user_id, session_id, scope_kind,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
                   turn_index, round_index, operation_id, logical_attempt, purpose,
                   offering_id, resolved_model_name, upstream_model_name, provider,
                   execution_placement, access_kind, price_snapshot_json, status,
                   terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, ?, 'session', ?, ?, ?,
+                 VALUES (?, ?, ?, 'session', ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
                          ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
     };
@@ -1636,7 +1629,7 @@ pub async fn settle_uncertain_inference_admission(
         }
     };
     let row = sqlx::query(
-        "SELECT route_id, admission_token, owner_token, owner_generation,
+        "SELECT admission_token, owner_token, owner_generation,
                 status, terminal_fingerprint,
                 IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
          FROM inference_invocations
@@ -1671,13 +1664,6 @@ pub async fn settle_uncertain_inference_admission(
                 )
             })? == 1;
             let persisted = PersistedInvocationAdmissionFact {
-                route_id: row.try_get("route_id").map_err(|error| {
-                    ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "decode resolved inference route",
-                        error,
-                    )
-                })?,
                 admission_token: row.try_get("admission_token").map_err(|error| {
                     ServiceError::with_source(
                         ServiceErrorKind::Persistence,
@@ -1714,8 +1700,7 @@ pub async fn settle_uncertain_inference_admission(
                     )
                 })?,
             };
-            if persisted.route_id != plan.route_id
-                || persisted.admission_token != plan.admission_token
+            if persisted.admission_token != plan.admission_token
                 || persisted.owner_token != plan.owner_token
                 || persisted.owner_generation
                     != i64::try_from(plan.owner_generation).unwrap_or(i64::MAX)
@@ -6597,9 +6582,9 @@ mod tests {
             (InferenceInvocationAdmissionResolution::Settled, None),
         );
         let retained: String = sqlx::query_scalar(
-            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_invocations WHERE user_id = ? AND route_id = ?",
+            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
         )
-        .bind(&user_id).bind(original.route_id()).fetch_one(pool.get()).await.unwrap();
+        .bind(&user_id).bind(original.invocation_id()).fetch_one(pool.get()).await.unwrap();
         assert_eq!(
             crate::models::InferencePriceSnapshot::from_stored(&retained),
             Some(snapshot(0.000001))
@@ -6902,7 +6887,6 @@ mod tests {
     fn ambiguous_invocation_admission_requires_the_plans_fencing_token() {
         let plan = plan_inference_invocation(input()).expect("invocation");
         let exact = PersistedInvocationAdmissionFact {
-            route_id: plan.route_id.clone(),
             admission_token: plan.admission_token.clone(),
             owner_token: plan.owner_token.clone(),
             owner_generation: i64::try_from(plan.owner_generation).expect("owner generation"),

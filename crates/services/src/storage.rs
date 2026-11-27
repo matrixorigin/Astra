@@ -2605,6 +2605,9 @@ fn inference_invocation_schema_mismatches(
     columns: &BTreeMap<String, ObservedColumnShape>,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    if columns.contains_key("route_id") {
+        reasons.push("obsolete column route_id".to_string());
+    }
     for (name, expected_type, expected_width) in [
         ("admission_token", "char", Some(32_i64)),
         ("owner_token", "char", Some(32_i64)),
@@ -2650,7 +2653,7 @@ async fn verify_inference_invocation_schema_contract(
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
            AND COLUMN_NAME IN ('admission_token', 'owner_token', 'owner_generation',
                                'owner_lease_expires_at', 'usage_status',
-                               'provider_delivery_state')",
+                               'provider_delivery_state', 'route_id')",
     )
     .bind(database)
     .bind(table)
@@ -4030,7 +4033,6 @@ async fn ensure_core_schema_while_leased(
     core_schema_create!(pool, "inference_invocations",
         "CREATE TABLE IF NOT EXISTS inference_invocations (
             invocation_id VARCHAR(64) NOT NULL,
-            route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             scope_kind VARCHAR(16) NOT NULL,
@@ -4076,7 +4078,6 @@ async fn ensure_core_schema_while_leased(
                 CHECK (usage_status IN ('provider_exact', 'provider_partial', 'unavailable')),
             CONSTRAINT chk_inference_invocations_delivery_state
                 CHECK (provider_delivery_state IN ('unknown', 'pre_delivery', 'delivery_authorized')),
-            UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_turn (user_id, session_id, turn_index, purpose, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),

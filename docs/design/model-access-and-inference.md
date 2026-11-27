@@ -991,6 +991,7 @@ The usage tree exposes the actual route and cost of background and delegated inf
 ## Resolved route
 
 Before provider execution, Server stores the immutable admitted route on the invocation row.
+The diagnostic route ID is derived from the invocation ID.
 
 ```rust
 struct ResolvedInferenceRoute {

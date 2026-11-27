@@ -815,6 +815,13 @@ async fn schema_rationalization_runtime_contract() {
         );
     }
 
+    assert!(
+        !column_names(&pool, &schema, "inference_invocations")
+            .await
+            .iter()
+            .any(|name| name == "route_id"),
+        "route identity is derived from invocation identity"
+    );
     assert_eq!(
         column_names(&pool, &schema, "model_request_context_events").await,
         [
