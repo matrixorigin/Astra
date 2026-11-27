@@ -4,7 +4,8 @@
 use super::*;
 use crate::runner_model_bindings::{self, ResolvedRunnerModelBinding};
 use astra_turn_types::runner_inference::{
-    RunnerInferenceProtocol, RunnerInferenceSource, RunnerNativeContext,
+    DeviceSourceAdmissionResponse, RunnerInferenceProtocol, RunnerInferenceSource,
+    RunnerNativeContext,
 };
 
 const ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
@@ -174,30 +175,16 @@ impl DatabaseModelService {
         if response.status() != StatusCode::OK {
             return Err(unavailable());
         }
-        #[derive(Deserialize)]
-        struct Envelope {
-            code: String,
-            data: Admission,
-        }
-        #[derive(Deserialize)]
-        struct Admission {
-            workspace_id: String,
-            source: String,
-            policy_revision: String,
-        }
-        let result: Envelope = crate::auth::uc::UcNativeProvider::json_bounded(response, 64 * 1024)
-            .await
-            .map_err(|_| unavailable())?;
-        if result.code != "OK"
-            || result.data.workspace_id != context.workspace_id.as_str()
-            || result.data.source != "chatgpt_device"
-            || !result.data.policy_revision.starts_with("sha256:")
-        {
-            return Err(unavailable());
-        }
+        let result: DeviceSourceAdmissionResponse =
+            crate::auth::uc::UcNativeProvider::json_bounded(response, 64 * 1024)
+                .await
+                .map_err(|_| unavailable())?;
+        let revision = result
+            .policy_revision_for(context.workspace_id.as_str())
+            .ok_or_else(unavailable)?;
         tracing::debug!(
-            workspace_id = %result.data.workspace_id,
-            policy_revision = %result.data.policy_revision,
+            workspace_id = %context.workspace_id.as_str(),
+            policy_revision = %revision,
             source = "chatgpt_device",
             "workspace device model source admission confirmed"
         );
@@ -422,29 +409,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_structured_owner_denials_hide_a_device_source() {
+    async fn device_policy_requires_valid_admission_and_only_hides_owner_denials() {
         use astra_core::config::UcNativeSettings;
         use axum::{Router, routing::get};
-        for (body, code) in [
+        const REVISION: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let allowed = serde_json::json!({"code":"OK","data":{
+            "workspace_id":"workspace","source":"chatgpt_device","policy_revision": REVISION
+        }})
+        .to_string();
+        let malformed = allowed.replace(REVISION, "sha256:");
+        for (status, body, expected) in [
+            (StatusCode::OK, allowed.as_str(), Ok(())),
+            (StatusCode::OK, malformed.as_str(), Err(None)),
             (
+                StatusCode::FORBIDDEN,
                 r#"{"code":"ErrDeviceModelSourceDenied","msg":"Source disabled by workspace policy"}"#,
-                Some("ErrDeviceModelSourceDenied"),
+                Err(Some("ErrDeviceModelSourceDenied")),
             ),
             (
+                StatusCode::FORBIDDEN,
                 r#"{"code":"ErrForbidden","msg":"Role denied"}"#,
-                Some("ErrForbidden"),
+                Err(Some("ErrForbidden")),
             ),
             (
+                StatusCode::FORBIDDEN,
                 r#"{"code":"ErrWorkspaceMembershipRevoked","msg":"Membership revoked"}"#,
-                Some("ErrWorkspaceMembershipRevoked"),
+                Err(Some("ErrWorkspaceMembershipRevoked")),
             ),
-            ("<html>Gateway denied</html>", None),
-            (r#"{"code":"WAFDenied","msg":"Gateway denied"}"#, None),
-            (r#"{"code":"ErrForbidden"}"#, None),
+            (
+                StatusCode::FORBIDDEN,
+                "<html>Gateway denied</html>",
+                Err(None),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"code":"WAFDenied","msg":"Gateway denied"}"#,
+                Err(None),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"code":"ErrForbidden"}"#,
+                Err(None),
+            ),
         ] {
+            let body = body.to_owned();
             let app = Router::new().route(
                 "/newmoi/workspaces/workspace/model-sources/chatgpt-device/admission",
-                get(move || async move { (StatusCode::FORBIDDEN, body) }),
+                get(move || async move { (status, body) }),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -469,10 +481,15 @@ mod tests {
             else {
                 unreachable!()
             };
-            let error = service
+            let result = service
                 .device_policy_with_pat("synthetic-pat", native_context)
-                .await
-                .unwrap_err();
+                .await;
+            let Err(code) = expected else {
+                result.unwrap();
+                task.abort();
+                continue;
+            };
+            let error = result.unwrap_err();
             assert_eq!(
                 error.0,
                 if code.is_some() {

@@ -543,6 +543,34 @@ pub struct RunnerNativeContext {
     pub role_candidate: Option<RunnerInferenceId>,
 }
 
+/// MOI's workspace device-source admission response, consumed by both the
+/// native setup client and the Server before dispatch.
+#[derive(Deserialize)]
+pub struct DeviceSourceAdmissionResponse {
+    code: String,
+    data: DeviceSourceAdmission,
+}
+
+#[derive(Deserialize)]
+struct DeviceSourceAdmission {
+    workspace_id: String,
+    source: String,
+    policy_revision: String,
+}
+
+impl DeviceSourceAdmissionResponse {
+    pub fn policy_revision_for(&self, workspace: &str) -> Option<&str> {
+        let revision = self.data.policy_revision.as_str();
+        (self.code == "OK"
+            && self.data.workspace_id == workspace
+            && self.data.source == "chatgpt_device"
+            && revision
+                .strip_prefix("sha256:")
+                .is_some_and(RunnerInferenceDigest::is_valid))
+        .then_some(revision)
+    }
+}
+
 /// Complete public definition for one revision. Principal/workspace/session
 /// ownership is derived by Server, never accepted from this payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -658,14 +686,17 @@ pub struct RunnerInferenceDigest(String);
 impl RunnerInferenceDigest {
     pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
         let value = value.into();
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !Self::is_valid(&value) {
             return Err("inference digest must be 64 lowercase hexadecimal characters");
         }
         Ok(Self(value))
+    }
+
+    fn is_valid(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
     pub fn as_str(&self) -> &str {
@@ -1027,6 +1058,33 @@ mod tests {
                 sha256: RunnerInferenceDigest::new("b".repeat(64)).unwrap(),
                 byte_len: NonZeroU64::new(1).unwrap(),
             },
+        }
+    }
+
+    #[test]
+    fn device_source_admission_requires_the_owner_envelope_and_full_revision() {
+        let valid = format!("sha256:{}", "af".repeat(32));
+        for (code, workspace, source, revision, accepted) in [
+            ("OK", "w", "chatgpt_device", valid.clone(), true),
+            ("Denied", "w", "chatgpt_device", valid.clone(), false),
+            ("OK", "other", "chatgpt_device", valid.clone(), false),
+            ("OK", "w", "other", valid.clone(), false),
+            ("OK", "w", "chatgpt_device", "sha256:".into(), false),
+            (
+                "OK",
+                "w",
+                "chatgpt_device",
+                format!("sha256:{}", "G".repeat(64)),
+                false,
+            ),
+        ] {
+            let response: DeviceSourceAdmissionResponse = serde_json::from_value(json!({
+                "code":code, "data":{"workspace_id":workspace, "source":source, "policy_revision":revision}
+            })).unwrap();
+            assert_eq!(
+                response.policy_revision_for("w"),
+                accepted.then_some(valid.as_str())
+            );
         }
     }
 

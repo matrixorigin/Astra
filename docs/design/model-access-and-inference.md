@@ -288,6 +288,9 @@ real-account compatibility. No real OpenAI login is required for offline CI.
 - MOI's workspace source-admission API uses the ordinary generated Core
   membership/Effective Role boundary. The deployment configuration
   `moi.knowledge.devicesources` defaults to `{"chatgpt_workspaces":[]}`.
+  Both the CLI and Server require a successful response for the requested
+  workspace and source, with a policy revision of `sha256:` followed by
+  64 lowercase hexadecimal digits. A malformed response cannot authorize use.
   Operators may explicitly enable canonical workspace UUIDs. This is a source
   policy observation, not a portable capability and not tool/data access.
 - Before minting each new physical grant, Astra asks UC's service-only

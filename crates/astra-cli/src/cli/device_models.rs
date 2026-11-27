@@ -7,6 +7,7 @@ use astra_credentials::{
     native_device::NativeDeviceAttachment,
 };
 use astra_edge::local_host::{Installation, ManagedClient};
+use astra_turn_types::runner_inference::DeviceSourceAdmissionResponse;
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -112,25 +113,19 @@ impl DeviceModels {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|_| "Invalid MOI model source response")?;
             if status != reqwest::StatusCode::OK {
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|_| "Invalid MOI model source response")?;
                 return Err(super::cli_config::cli_utils::read_api_error(
                     status.as_u16(),
                     &String::from_utf8_lossy(&bytes),
                 ));
             }
-            if value["code"] != "OK"
-                || value["data"]["workspace_id"] != workspace
-                || value["data"]["source"] != "chatgpt_device"
-                || !value["data"]["policy_revision"]
-                    .as_str()
-                    .is_some_and(|revision| revision.starts_with("sha256:"))
-            {
-                return Err(
-                    "MOI model source admission did not match this workspace and account".into(),
-                );
-            }
+            let result: DeviceSourceAdmissionResponse =
+                serde_json::from_slice(&bytes).map_err(|_| "Invalid MOI model source response")?;
+            result
+                .policy_revision_for(workspace)
+                .ok_or("Invalid MOI model source response for the selected workspace")?;
             Ok::<_, String>(())
         })
         .await
