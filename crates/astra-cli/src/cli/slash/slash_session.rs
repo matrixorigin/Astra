@@ -1018,7 +1018,9 @@ async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHist
             materialize_prepared_session_history(mgr, materialized, restored_journal, session_id)
         }
         Err(e) => {
-            return Err(format!("load CSL state for session {session_id}: {e}"));
+            return Err(format!(
+                "cannot restore session {session_id}: local conversation history is unreadable: {e}"
+            ));
         }
     };
 
@@ -1027,10 +1029,12 @@ async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHist
     if let Some(continuation) =
         session_continuation::load_session_continuation_for_recovery(session_id)
     {
-        let canonical_history =
-            session_continuation::history_pairs_from_messages(&continuation.messages);
-        if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
-            prepared.history = canonical_history;
+        // Counts cannot establish that a projection belongs to this generation:
+        // compaction or replacement can leave the same number of pairs.
+        // Preserve journal-only display history when no canonical turn exists.
+        if continuation.resume.cursor.conversation_seq > 0 || prepared.csl_manager.is_some() {
+            prepared.history =
+                session_continuation::history_pairs_from_messages(&continuation.messages);
         }
         prepared.deferred_tool_activations = continuation.deferred_tool_activations;
         prepared.active_conversation = Some(continuation.active_conversation);
@@ -2666,6 +2670,87 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn restore_uses_canonical_history_even_when_stale_csl_has_the_same_pair_count() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let session_id = format!("resume-same-length-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+        let current = vec![
+            serde_json::json!({"role":"user", "content":"current question"}),
+            serde_json::json!({"role":"assistant", "content":"current answer"}),
+        ];
+        let commit =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner, &session_id)
+                .unwrap()
+                .prepare_commit(2, None, current.clone())
+                .unwrap();
+        session_journal::JournalWriter::new(&session_id)
+            .unwrap()
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&session_id),
+                    2,
+                    Some("gpt-5"),
+                    "current question",
+                    "current answer",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(commit.commit),
+            )
+            .unwrap();
+
+        let stale = vec![
+            serde_json::json!({"role":"user", "content":"stale question"}),
+            serde_json::json!({"role":"assistant", "content":"stale answer"}),
+        ];
+        let stale_cursor =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner, &session_id)
+                .unwrap()
+                .prepare_commit(1, None, stale.clone())
+                .unwrap()
+                .next
+                .cursor()
+                .clone();
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &stale,
+            &astra_turn_core::conversation_log::SessionStateCompact {
+                source_cursor: Some(stale_cursor),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        apply_restored_session(
+            None,
+            &api,
+            &mut state,
+            RestoredSession {
+                session_id,
+                turn_count: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.history,
+            vec![("current question".into(), "current answer".into())]
+        );
+        assert_eq!(state.last_response.as_deref(), Some("current answer"));
+        assert_eq!(state.active_conversation.unwrap().messages(), current);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn restore_without_csl_restores_recent_tools_from_journal() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("no-csl-tools-{}", uuid::Uuid::new_v4());
@@ -2731,7 +2816,66 @@ mod resume_tests {
             .err()
             .expect("corrupt csl should fail");
 
-        assert!(error.contains("load CSL state"), "{error}");
+        assert!(
+            error.contains("local conversation history is unreadable"),
+            "{error}"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_with_torn_csl_tail_reports_the_error_without_rebinding() {
+        use std::io::Write;
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        for damaged in [
+            b"{\"type\":\"turn_delta\"".as_slice(),
+            b"{\"content\":\"\xe4\xb8",
+        ] {
+            let session_id = format!("corrupt-csl-tail-{}", uuid::Uuid::new_v4());
+            write_local_resumable_session(&session_id, 2);
+            crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+                &session_id,
+                1,
+                &[serde_json::json!({"role":"user", "content":"old"})],
+                &Default::default(),
+            )
+            .unwrap();
+            let path = crate::cli::session::session_recovery::io::csl_log_path_for(&session_id);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(damaged)
+                .unwrap();
+
+            let mut state = SessionState {
+                session_id: Some("existing-session".into()),
+                history: vec![("existing".into(), "answer".into())],
+                ..Default::default()
+            };
+            let error = apply_restored_session(
+                None,
+                &api,
+                &mut state,
+                RestoredSession {
+                    session_id,
+                    turn_count: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("damaged CSL must not be accepted as complete history");
+            assert!(
+                error.contains("local conversation history is unreadable"),
+                "{error}"
+            );
+            assert_eq!(state.session_id.as_deref(), Some("existing-session"));
+            assert_eq!(state.history, vec![("existing".into(), "answer".into())]);
+        }
     }
 
     // ── derive_history_pairs_from_messages tests ─────────────────────────

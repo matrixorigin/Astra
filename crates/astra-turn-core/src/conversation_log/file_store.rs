@@ -95,15 +95,11 @@ impl FileCslStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        read_snapshot_suffix(file, path)
+        read_snapshot_suffix(file)
     }
 
-    /// Read all entries. Read-only recovery can skip a damaged final row, but
-    /// callers rewriting the file must not silently discard those bytes.
-    fn read_all_entries(
-        path: &Path,
-        allow_damaged_tail: bool,
-    ) -> Result<Vec<CslEntry>, CslStoreError> {
+    /// Read all entries without treating a damaged suffix as complete history.
+    fn read_all_entries(path: &Path) -> Result<Vec<CslEntry>, CslStoreError> {
         let content = match std::fs::read(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -116,22 +112,13 @@ impl FileCslStore {
             );
         }
         let mut entries = Vec::new();
-        let mut lines = content
+        let lines = content
             .strip_suffix(b"\n")
             .unwrap_or(&content)
-            .split(|byte| *byte == b'\n')
-            .peekable();
-        while let Some(line) = lines.next() {
-            match decode_entry(line) {
-                Ok(Some(entry)) => entries.push(entry),
-                Ok(None) => {}
-                Err(e) if allow_damaged_tail && lines.peek().is_none() => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "skipping corrupted trailing JSONL line: {e}"
-                    );
-                }
-                Err(e) => return Err(e),
+            .split(|byte| *byte == b'\n');
+        for line in lines {
+            if let Some(entry) = decode_entry(line)? {
+                entries.push(entry);
             }
         }
         Ok(entries)
@@ -209,16 +196,12 @@ impl FileCslStore {
 /// Read backward from a fixed EOF, stopping at the latest snapshot. Replay
 /// only depends on that snapshot and its suffix. Full-history operations
 /// continue to check every row, including records superseded by the snapshot.
-fn read_snapshot_suffix(
-    mut file: impl Read + Seek,
-    path: &Path,
-) -> Result<Vec<CslEntry>, CslStoreError> {
+fn read_snapshot_suffix(mut file: impl Read + Seek) -> Result<Vec<CslEntry>, CslStoreError> {
     let end = file.seek(SeekFrom::End(0))?;
     let mut offset = end;
     let mut chunk = vec![0; end.min(TAIL_CHUNK_BYTES as u64) as usize];
     let mut reversed_line = Vec::new();
     let mut entries = Vec::new();
-    let mut last_line = true;
     let result = (|| {
         while offset > 0 {
             let size = offset.min(TAIL_CHUNK_BYTES as u64) as usize;
@@ -237,22 +220,14 @@ fn read_snapshot_suffix(
                 // A separator at EOF does not create another physical line.
                 if offset + start as u64 != end {
                     reversed_line.reverse();
-                    match decode_entry(&reversed_line) {
-                        Ok(Some(entry)) => {
-                            let is_snapshot = entry.is_snapshot();
-                            entries.push(entry);
-                            if is_snapshot {
-                                entries.reverse();
-                                return Ok(entries);
-                            }
+                    if let Some(entry) = decode_entry(&reversed_line)? {
+                        let is_snapshot = entry.is_snapshot();
+                        entries.push(entry);
+                        if is_snapshot {
+                            entries.reverse();
+                            return Ok(entries);
                         }
-                        Ok(None) => {}
-                        Err(error) if last_line => {
-                            tracing::warn!(path = %path.display(), "skipping corrupted trailing JSONL line: {error}");
-                        }
-                        Err(error) => return Err(error),
                     }
-                    last_line = false;
                 }
                 reversed_line.clear();
                 let Some(pos) = newline else { break };
@@ -272,8 +247,7 @@ fn read_snapshot_suffix(
 }
 
 /// Validate all existing records before appending, retaining only one row at
-/// a time. A damaged final row remains readable by recovery but must not be
-/// turned into an invalid interior row by a successful append.
+/// a time. Never append over a damaged final row.
 fn scan_append_boundary(path: &Path) -> Result<(Option<u64>, bool), CslStoreError> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -374,7 +348,7 @@ impl CslStore for FileCslStore {
     ) -> Result<Vec<CslEntry>, CslStoreError> {
         validate_session_id(session_id)?;
         let path = self.log_path(session_id);
-        let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path, true))
+        let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path))
             .await
             .map_err(|e| CslStoreError::Other(format!("join error: {e}")))??;
         Ok(entries
@@ -391,7 +365,7 @@ impl CslStore for FileCslStore {
         validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         tokio::task::spawn_blocking(move || {
-            let entries = Self::read_all_entries(&path, false)?;
+            let entries = Self::read_all_entries(&path)?;
             let kept: Vec<_> = entries
                 .iter()
                 .filter(|e| e.seq() >= before_seq)
@@ -419,7 +393,7 @@ impl CslStore for FileCslStore {
         let new_path = self.log_path(new_session_id);
 
         tokio::task::spawn_blocking(move || {
-            let entries = Self::read_all_entries(&parent_path, true)?;
+            let entries = Self::read_all_entries(&parent_path)?;
             if entries.is_empty() {
                 return Ok(0);
             }
@@ -554,12 +528,11 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             assert!(store.append(sid, &delta).await.is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
-            let recovered = store.load_materialized_blocking(sid).unwrap().unwrap();
-            assert_eq!(recovered.messages, vec![user_msg("first")]);
-            assert_eq!(
-                store.load_after(sid, 0).await.unwrap(),
-                vec![snapshot.clone()]
-            );
+            assert!(store.load_materialized_blocking(sid).is_err());
+            assert!(store.load_after(sid, 0).await.is_err());
+            let child = format!("fork-{sid}");
+            assert!(store.fork(sid, &child, 2).await.is_err());
+            assert!(!store.log_path(&child).exists());
             assert!(store.truncate_before(sid, 2).await.is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
@@ -1207,10 +1180,7 @@ mod tests {
                 file: File::open(&path).unwrap(),
                 bytes_read: 0,
             };
-            assert_eq!(
-                read_snapshot_suffix(&mut reader, &path).unwrap(),
-                vec![snapshot]
-            );
+            assert_eq!(read_snapshot_suffix(&mut reader).unwrap(), vec![snapshot]);
             assert_eq!(
                 reader.bytes_read, TAIL_CHUNK_BYTES,
                 "history length {count}"
@@ -1219,31 +1189,6 @@ mod tests {
     }
 
     // ── Corrupted trailing JSONL line ──────────────────────────────────
-
-    #[tokio::test]
-    async fn corrupted_trailing_line_is_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let store = FileCslStore::new(tmp.path());
-        let sid = "corrupt-trailing";
-
-        store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]))
-            .await
-            .unwrap();
-
-        // Manually append a corrupted line to the JSONL file.
-        let path = tmp.path().join(sid).join("conversation_log.jsonl");
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        writeln!(f, "{{truncated garbage").unwrap();
-
-        let entries = store.load_from_latest_snapshot(sid).await.unwrap();
-        assert_eq!(entries.len(), 1, "should skip corrupted trailing line");
-        assert!(entries[0].is_snapshot());
-    }
 
     #[tokio::test]
     async fn corrupted_middle_line_is_error() {

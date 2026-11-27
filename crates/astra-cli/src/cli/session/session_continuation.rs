@@ -257,6 +257,21 @@ pub(crate) fn try_load_session_continuation_for_recovery(
     };
     // Release the parsed journal before materializing its message vector and
     // loading the independent CSL/checkpoint recovery projections.
+    if let Err(error) = &canonical {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "failed to replay canonical journal conversation; using a recovery source"
+        );
+    }
+    if !matches!(&canonical, Ok(Some(_))) {
+        let csl = load_csl_continuation(session_id).map_err(|error| {
+            format!("cannot restore session {session_id}: local conversation history is unreadable: {error}")
+        })?;
+        if csl.is_some() {
+            return Ok(csl);
+        }
+    }
     Ok(restore_local_continuation(session_id, canonical))
 }
 
@@ -322,26 +337,7 @@ fn restore_local_continuation(
                 resume,
             });
         }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to replay canonical journal conversation; using an explicitly degraded recovery source"
-            );
-        }
-    }
-
-    match load_csl_continuation(session_id) {
-        Ok(Some(continuation)) => return Some(continuation),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to read CSL continuation projection; falling back to durable journal"
-            );
-        }
+        Ok(None) | Err(_) => {}
     }
 
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
@@ -568,11 +564,13 @@ pub(crate) fn load_csl_continuation(
     let Some(materialized) = materialized else {
         return Ok(None);
     };
-    let cursor = materialized
-        .session_state
-        .source_cursor
-        .as_ref()
-        .ok_or_else(|| format!("CSL continuation has no versioned cursor: {session_id}"))?;
+    let Some(cursor) = materialized.session_state.source_cursor.as_ref() else {
+        tracing::warn!(
+            session_id,
+            "ignoring CSL continuation without a versioned cursor"
+        );
+        return Ok(None);
+    };
     validate_flat_projection_cursor(session_id, cursor)?;
     let cursor = cursor.clone();
     record_session_restore_hydration(&materialized.messages);
@@ -1337,21 +1335,22 @@ mod tests {
     fn csl_continuation_reports_corrupt_typed_metadata() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": "canonical current",
+                (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             1,
-            &[
-                json!({
-                    "role": "user",
-                    "content": "canonical current",
-                    (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
-                        "schema_version": "invalid",
-                        "objective_relation": "replace"
-                    }
-                }),
-                json!({"role": "assistant", "content": "current answer"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            &messages,
+            &exact_csl_state(&session_id, 1, &messages),
         )
         .unwrap();
 
