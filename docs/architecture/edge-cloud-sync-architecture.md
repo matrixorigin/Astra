@@ -136,7 +136,9 @@ reports newly persisted permanent rejections and skipped journal records to
 their owner. Its bounded in-process notice snapshot coalesces unread warnings
 and retains permanent loss counts while the TUI is busy. Retryable delivery
 and local I/O warnings are shown only if the same incident is still active
-when displayed. A confirmed recovery re-arms the next incident.
+when displayed. A confirmed recovery re-arms the next incident. If another process
+settles the last outstanding record, the next successful outbox status read
+retires the stale settlement warning, including one already queued for display.
 A new observer starts at the current count. Subsequent startup checks and
 drains leave those historical records in `astra doctor`. Retryable delivery
 failures warn once while pending, including after login. A successful delivery

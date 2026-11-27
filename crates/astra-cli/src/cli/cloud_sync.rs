@@ -144,9 +144,15 @@ impl SyncNoticeState {
                 if report.retry_clear {
                     self.retrying = false;
                 }
+                // A different process may have persisted the last settlement.
+                // No claimable work alone can also mean an outstanding lease.
+                let outbox_confirmed_empty =
+                    report.retry_clear && report.remaining_unconfirmed == 0;
                 if report.acked > 0
                     || report.failed > 0
                     || report.terminal > 0
+                    || (self.blocker == Some(SyncOutboxDrainBlocker::LocalSettlementWrite)
+                        && outbox_confirmed_empty)
                     || matches!(
                         self.blocker,
                         Some(
@@ -5180,6 +5186,48 @@ mod notice_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn settlement_warning_expires_when_another_drainer_empties_the_outbox() {
+        let owner = astra_services::local_owner_scope();
+        let channel = SyncNoticeChannel::new();
+        let mut early = channel.subscribe();
+        let mut late = channel.subscribe();
+        let blocker = SyncOutboxDrainBlocker::LocalSettlementWrite;
+        channel.update(&owner, |state| state.blocked(blocker));
+        let notice = early.recv().await.unwrap().1[0];
+        let queued = early.queued_warning(notice).unwrap();
+        for report in [
+            SyncOutboxDrainReport::default(),
+            SyncOutboxDrainReport {
+                retry_clear: true,
+                remaining_unconfirmed: 1,
+                ..Default::default()
+            },
+        ] {
+            channel.update(&owner, |state| state.settled(&report));
+            assert!(queued.message_in(&channel).is_some());
+        }
+        channel.update(&owner, |state| {
+            state.settled(&SyncOutboxDrainReport {
+                retry_clear: true,
+                ..Default::default()
+            });
+            state.terminal += 1;
+        });
+        assert!(queued.message_in(&channel).is_none());
+        assert_eq!(
+            late.recv().await.unwrap().1,
+            [SyncOutboxNotice::NewlyTerminal(1)]
+        );
+        channel.update(&owner, |state| state.blocked(blocker));
+        assert_eq!(
+            late.recv().await.unwrap().1,
+            [SyncOutboxNotice::Blocked(blocker)]
+        );
+        assert!(queued.message_in(&channel).is_none());
     }
 
     #[serial_test::serial]
