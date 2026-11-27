@@ -136,8 +136,13 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       assert.equal(shortcuts.length, 1, 'missing shortcut footer: ' + context);
       assert(visible.indexOf(footers[0]) < visible.indexOf(shortcuts[0]),
         'shortcuts should follow the model and permission footer: ' + context);
-      const frame = visible.find(line => /^ +╭─+╮$/.test(line));
-      assert(frame?.startsWith('  ╭'), 'composer frame lost its shared inset: ' + context);
+      const edge = '─'.repeat(terminal.cols - 2);
+      const frameStart = visible.indexOf('╭' + edge + '╮');
+      const frameEnd = visible.indexOf('╰' + edge + '╯');
+      assert(frameStart >= 0 && frameEnd > frameStart + 1,
+        'composer frame does not reach both terminal edges: ' + context);
+      assert(visible.slice(frameStart + 1, frameEnd).every(line => line.startsWith('│') && line.endsWith('│')),
+        'composer side border was displaced: ' + context);
     }
     assert.equal(tips.length, visible.filter(line => line.includes('· Tip')).length,
       'a tip leaked into scrollback: ' + context);

@@ -51,7 +51,7 @@ use footer::Footer;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Widget,
 };

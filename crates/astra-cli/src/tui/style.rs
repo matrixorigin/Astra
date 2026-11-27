@@ -226,21 +226,17 @@ mod status_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{composer_surface_rgb, queue_panel_rgb, user_message_rgb};
+    use super::{composer_surface_rgb, user_message_rgb};
 
     #[test]
     fn dark_conversation_surfaces_are_slate_not_opaque_gray_cards() {
         let terminal = (17, 22, 28);
         let (ur, ug, ub) = user_message_rgb(terminal);
         let (cr, cg, cb) = composer_surface_rgb(terminal);
-        let (qr, qg, qb) = queue_panel_rgb(terminal);
 
         assert!(ub > ur && ub > ug, "user surface must keep a slate hue");
         assert!(ur < 50 && ug < 55 && ub < 65, "user surface is too bright");
-        assert!(
-            cr >= qr && cg >= qg && cb >= qb,
-            "composer should lead queue"
-        );
+        assert!(cb > cr && cb > cg, "composer must keep a slate hue");
         assert!(
             cr < 50 && cg < 55 && cb < 65,
             "composer must not become gray"
@@ -264,7 +260,7 @@ mod contrast_tests {
             Theme::dark_256(),
         ] {
             for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
-                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                for tint in [user_message_rgb, composer_surface_rgb] {
                     let style = surface_style(&theme, background, tint);
                     assert_eq!(style.fg, Some(theme.selected_fg));
                     assert_ne!(style.bg, Some(Color::Reset));
@@ -282,7 +278,7 @@ mod contrast_tests {
     fn plain_surfaces_ignore_background_hints() {
         for theme in [Theme::plain(), Theme::terminal_default()] {
             for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
-                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                for tint in [user_message_rgb, composer_surface_rgb] {
                     assert_eq!(surface_style(&theme, background, tint), Style::default());
                 }
             }
