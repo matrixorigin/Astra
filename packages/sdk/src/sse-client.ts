@@ -83,7 +83,8 @@ export async function readSseReplay(
     }
     return result;
   } finally {
-    await reader.cancel().catch(() => {});
+    // A tee may keep cancellation pending until its other consumer finishes.
+    void reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
@@ -378,7 +379,7 @@ export class SSEClient {
       if (this.sawStreamCompletion) {
         // DONE owns observation closure; release an otherwise open response body.
         // A trailing reset/cancel error cannot replace the selected closure.
-        await reader.cancel().catch(() => {});
+        void reader.cancel().catch(() => {});
       }
       reader.releaseLock();
     }
