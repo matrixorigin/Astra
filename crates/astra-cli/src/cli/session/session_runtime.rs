@@ -2011,6 +2011,40 @@ pub(crate) fn restored_journal_state(session_id: &str) -> Result<RestoredJournal
     restore_session_state_from_journal(session_id)
 }
 
+/// Recover terminal events after the selected canonical conversation head.
+pub(crate) fn restore_history_after_commit(
+    events: &[session_journal::JournalEvent],
+    cursor: &astra_turn_types::SessionCursorV1,
+) -> Result<Vec<(String, String)>, String> {
+    let retry = || {
+        format!(
+            "session {} changed during restore; retry",
+            cursor.session_id
+        )
+    };
+    let index = events
+        .iter()
+        .rposition(|event| {
+            event
+                .conversation_commit
+                .as_ref()
+                .is_some_and(|commit| commit.cursor == *cursor)
+        })
+        .ok_or_else(retry)?;
+    let trailing = &events[index + 1..];
+    if trailing
+        .iter()
+        .any(|event| event.conversation_commit.is_some())
+    {
+        return Err(retry());
+    }
+    Ok(
+        restored_journal_state_from_append_order_events(true, trailing, true)
+            .session
+            .history,
+    )
+}
+
 fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJournalState, String> {
     session_journal::validate_session_id(session_id)
         .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
@@ -2030,6 +2064,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
     Ok(restored_journal_state_from_append_order_events(
         journal_exists,
         &events,
+        true,
     ))
 }
 
@@ -2040,6 +2075,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
 pub(crate) fn restored_journal_state_from_append_order_events(
     journal_exists: bool,
     events: &[session_journal::JournalEvent],
+    include_display_history: bool,
 ) -> RestoredJournalState {
     let mut restored = RestoredSessionState::default();
     let mut last_turn_event = None;
@@ -2053,10 +2089,12 @@ pub(crate) fn restored_journal_state_from_append_order_events(
             continue;
         }
         last_turn_event = Some(event);
-        if event.event_type == session_journal::JournalEventType::Turn {
-            restored.history.extend(restored_turn_history_pairs(event));
-        } else {
-            restored.history.extend(turn_error_history_pairs(event));
+        if include_display_history {
+            if event.event_type == session_journal::JournalEventType::Turn {
+                restored.history.extend(restored_turn_history_pairs(event));
+            } else {
+                restored.history.extend(turn_error_history_pairs(event));
+            }
         }
         restored.turn = restored
             .turn
@@ -3852,14 +3890,14 @@ mod tests {
         ];
         let committed = ActiveConversation::empty("owner", sid)
             .unwrap()
-            .prepare_commit(5, None, messages.clone())
+            .prepare_commit(5, None, messages)
             .unwrap();
         let mut failed =
             JournalEvent::turn_error(Some(sid), 6, None, "retry", "request interrupted", 0);
         failed.tokens_in = Some(5);
         failed.tokens_out = Some(2);
         failed.tools_used = Some(vec!["shell".into()]);
-        let events = vec![
+        let mut events = vec![
             JournalEvent::session_start(Some(sid), None),
             JournalEvent::turn(Some(sid), 5, None, "question", "answer", 0, 10, 4, 0)
                 .with_cache_tokens(7, 2)
@@ -3872,7 +3910,28 @@ mod tests {
             JournalEvent::session_start(Some(sid), None),
         ];
 
-        let restored = super::restored_journal_state_from_append_order_events(true, &events);
+        let restored = super::restored_journal_state_from_append_order_events(true, &events, true);
+        let attached = super::restored_journal_state_from_append_order_events(true, &events, false);
+        assert!(attached.session.history.is_empty());
+        assert_eq!(attached.session.turn, restored.session.turn);
+        assert_eq!(
+            attached.session.total_prompt_tokens,
+            restored.session.total_prompt_tokens
+        );
+        assert_eq!(
+            attached.session.total_completion_tokens,
+            restored.session.total_completion_tokens
+        );
+        assert_eq!(
+            attached.session.total_cache_read_tokens,
+            restored.session.total_cache_read_tokens
+        );
+        assert_eq!(
+            attached.session.total_cache_creation_tokens,
+            restored.session.total_cache_creation_tokens
+        );
+        assert_eq!(attached.session.recent_tools, restored.session.recent_tools);
+        assert_eq!(attached.last_turn_event.as_ref().unwrap().turn, Some(6));
         assert!(restored.exists);
         assert_eq!(restored.session.turn, 6);
         assert_eq!(
@@ -3904,10 +3963,62 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(active.cursor().completed_turn, 5);
+        assert_eq!(
+            super::restore_history_after_commit(&events, active.cursor()).unwrap(),
+            vec![(
+                "retry".into(),
+                "[Previous turn failed: request interrupted]".into()
+            )]
+        );
         let next = active
-            .prepare_commit(restored.session.turn + 1, None, messages)
+            .prepare_commit(
+                restored.session.turn + 1,
+                None,
+                vec![
+                    serde_json::json!({"role":"user", "content":"after compaction"}),
+                    serde_json::json!({"role":"assistant", "content":"new answer"}),
+                ],
+            )
             .unwrap();
         assert_eq!(next.next.cursor().completed_turn, 7);
+        assert!(matches!(
+            next.commit.delta,
+            astra_turn_types::ConversationDeltaV1::Replace { .. }
+        ));
+        events.push(
+            JournalEvent::turn(
+                Some(sid),
+                7,
+                None,
+                "after compaction",
+                "new answer",
+                0,
+                0,
+                0,
+                0,
+            )
+            .with_conversation_commit(next.commit),
+        );
+        events.push(JournalEvent::turn_error(
+            Some(sid),
+            8,
+            None,
+            "retry again",
+            "unavailable",
+            0,
+        ));
+        assert!(
+            super::restore_history_after_commit(&events, active.cursor())
+                .unwrap_err()
+                .contains("changed during restore")
+        );
+        assert_eq!(
+            super::restore_history_after_commit(&events, next.next.cursor()).unwrap(),
+            vec![(
+                "retry again".into(),
+                "[Previous turn failed: unavailable]".into()
+            )]
+        );
     }
 
     #[test]

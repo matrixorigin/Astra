@@ -17,9 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
 use crate::cli::cli_config::cli_utils::{CliOwnerAuthSnapshot, get_profile_and_token};
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
-use crate::cli::session::session_continuation::{
-    SessionContinuation, load_session_continuation_for_recovery,
-};
+use crate::cli::session::session_continuation::try_load_session_continuation_for_recovery;
 use crate::cli::session::session_runtime;
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
@@ -607,6 +605,9 @@ async fn run_turn(
     // materialization before asking the Server to admit a turn, as one-shot
     // chat does.
     let (token, auth_owner) = prepare_turn_auth(&ctx, &cancel).await?;
+    // A damaged local continuation must not silently start a turn with an
+    // empty or older conversation.
+    let continuation = try_load_session_continuation_for_recovery(&thread_id)?;
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(params.get("model").and_then(Value::as_str));
     let model = params
@@ -715,7 +716,6 @@ async fn run_turn(
         .map(str::to_string)
         .or(developer_instructions)
         .or(ctx.system_prompt.clone());
-    let continuation = app_server_continuation(&thread_id);
     let deferred_tool_activations = continuation
         .as_ref()
         .map(|continuation| continuation.deferred_tool_activations.clone())
@@ -978,10 +978,6 @@ fn next_thread_id_after_turn(thread_id: &str, session_id: Option<&str>) -> Strin
         Some("") | None => thread_id.to_string(),
         Some(session_id) => session_id.to_string(),
     }
-}
-
-fn app_server_continuation(thread_id: &str) -> Option<SessionContinuation> {
-    load_session_continuation_for_recovery(thread_id)
 }
 
 fn persist_app_server_turn(
@@ -1480,15 +1476,15 @@ mod tests {
     use super::{
         AppServerFailure, AppState, JsonWriter, SESSION_COMMIT_UNKNOWN_CODE,
         SESSION_PERSISTENCE_FAILED_CODE, SESSION_PROJECTION_FAILED_CODE, ServerContext,
-        TURN_CONFLICT_CODE, TurnRequest, app_server_continuation, approval_response_from_params,
-        begin_turn, execute_turn_task, explain_mode_from_params, extract_turn_message,
-        interrupt_matching_turn, join_or_abort_app_server_task, next_thread_id_after_turn,
-        permission_mode_from_params, persist_app_server_turn, publish_committed_session_authority,
-        register_edge_before_chat, register_pending_approval, requested_thread_id,
-        response_failure_value, resume_server_thread, run_app_server_lines, set_thread_if_idle,
+        TURN_CONFLICT_CODE, TurnRequest, approval_response_from_params, begin_turn,
+        execute_turn_task, explain_mode_from_params, extract_turn_message, interrupt_matching_turn,
+        join_or_abort_app_server_task, next_thread_id_after_turn, permission_mode_from_params,
+        persist_app_server_turn, publish_committed_session_authority, register_edge_before_chat,
+        register_pending_approval, requested_thread_id, response_failure_value,
+        resume_server_thread, run_app_server_lines, run_turn, set_thread_if_idle,
         start_server_thread, stream_event_notification, thread_started_params,
-        turn_completed_params, turn_failed_params, turn_failure_params,
-        with_thread_binding_deadline,
+        try_load_session_continuation_for_recovery, turn_completed_params, turn_failed_params,
+        turn_failure_params, with_thread_binding_deadline,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
@@ -1730,8 +1726,9 @@ mod tests {
             .expect("exact CSL projection must exist");
         assert!(csl.deferred_tool_activations.is_empty());
 
-        let continuation =
-            app_server_continuation(&session_id).expect("next app-server turn continuation");
+        let continuation = try_load_session_continuation_for_recovery(&session_id)
+            .expect("next app-server turn must be readable")
+            .expect("next app-server turn continuation");
         assert!(continuation.deferred_tool_activations.is_empty());
         assert_eq!(
             continuation
@@ -1740,6 +1737,78 @@ mod tests {
                 .expect("persisted user-visible messages"),
             result.final_messages.as_slice(),
             "runtime-owned projections may follow, but must not replace or reorder the turn"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn app_server_rejects_damaged_continuation_before_admitting_a_turn() {
+        use std::io::Write;
+
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let _token_guard = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_EDGE_REGISTRY", "0") };
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("test-account".into()),
+                access_token: Some("test-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).unwrap();
+        let session_id = format!("app-server-torn-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[serde_json::json!({"role":"user", "content":"older"})],
+            &Default::default(),
+        )
+        .unwrap();
+        let path = crate::cli::session::session_recovery::io::csl_log_path_for(&session_id);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"{\"content\":\"\xe4\xb8")
+            .unwrap();
+
+        let error = run_turn(
+            ServerContext {
+                api: astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap(),
+                auth_profile: None,
+                default_model: None,
+                system_prompt: None,
+                auto_approve: false,
+            },
+            JsonWriter::start(|_| Ok(())),
+            TurnRequest {
+                state: Arc::new(Mutex::new(AppState::default())),
+                thread_id: session_id.clone(),
+                turn_id: "turn".into(),
+                message: "continue".into(),
+                params: serde_json::json!({}),
+                developer_instructions: None,
+                permission_mode: PermissionMode::Auto,
+                cancel: Arc::new(CancellationToken::new()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("local conversation history is unreadable"),
+            "{error:?}"
+        );
+        assert!(!error.committed);
+        assert!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .is_ok(),
+            "a rejected turn must release the session lease"
         );
     }
 

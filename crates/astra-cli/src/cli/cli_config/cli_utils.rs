@@ -1372,10 +1372,10 @@ mod tests {
         let outbox_b = astra_services::SyncOutboxStore::for_owner(&owner_b).expect("outbox B");
         assert_ne!(outbox_a.path(), outbox_b.path());
         outbox_a
-            .enqueue_journal_event(&events_a[0])
+            .enqueue_journal_event(events_a[0].clone())
             .expect("enqueue A");
         outbox_b
-            .enqueue_journal_event(&events_b[0])
+            .enqueue_journal_event(events_b[0].clone())
             .expect("enqueue B");
         assert_eq!(outbox_a.status().expect("status A").pending, 1);
         assert_eq!(outbox_b.status().expect("status B").pending, 1);

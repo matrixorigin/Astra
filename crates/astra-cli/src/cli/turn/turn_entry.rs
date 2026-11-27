@@ -993,8 +993,11 @@ pub(super) fn acquire_interactive_turn_admission(
             &session_id,
             &events,
         )?;
-        let restored =
-            session_runtime::restored_journal_state_from_append_order_events(true, &events);
+        let restored = session_runtime::restored_journal_state_from_append_order_events(
+            true,
+            &events,
+            server_turn.is_none(),
+        );
         if server_turn.is_none() {
             state.history = restored.session.history;
         }

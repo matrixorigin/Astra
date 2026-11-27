@@ -1647,45 +1647,28 @@ async fn refresh_failure_cleanup_respects_its_budget() {
         tokio::time::advance(Duration::from_secs(120)).await;
         tokio::task::yield_now().await;
         tokio::time::resume();
-        let completed_before_release = waiting.is_finished();
-        let healthy_before_release = tokio::time::timeout(
-            Duration::from_millis(200),
-            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(worker.get()),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok());
-        assert!(
-            healthy_before_release,
-            "pool must be healthy before releasing the failed settlement reply"
-        );
-        proxy.gate.release.notify_one();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), waiting)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
-        tokio::time::timeout(
+        // The operation and a fresh checkout must finish with the old
+        // response still held. Let the executor drive the real socket I/O.
+        let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("refresh failure cleanup must finish with the old reply held")
+            .unwrap();
+        assert!(result.is_err());
+        let value = tokio::time::timeout(
             Duration::from_secs(5),
             sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(worker.get()),
         )
         .await
-        .unwrap()
+        .expect("pool capacity must recover with the old reply held")
         .unwrap();
-        println!(
-            "after 120s virtual time: refresh_complete={completed_before_release}, pool_healthy={healthy_before_release}; both recovered after releasing SQL"
-        );
+        assert_eq!(value, 1);
+        proxy.gate.release.notify_one();
         if claim {
             assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 0);
             let retained: (String, Option<String>, String) = sqlx::query_as("SELECT credentials_encrypted,refresh_owner,status FROM user_llm_connections WHERE user_id=? AND connection_id=?").bind(&owner).bind(id).fetch_one(shared.get()).await.unwrap();
             assert_eq!(retained, (saved, None, "connected".into()));
         }
         worker.get().close().await;
-        assert!(
-            completed_before_release,
-            "refresh failure cleanup exceeded the operation and lease budgets"
-        );
     }
 }
 

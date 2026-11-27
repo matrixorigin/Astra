@@ -4,13 +4,15 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
 };
 
-use crate::explain_analyze_format::decision_detail_line;
+use crate::explain_analyze_format::{
+    compact_usage, decision_detail_line, format_ms, format_tokens_u128, provider_usage_summary,
+};
 use astra_turn_types::ExplainAnalyzeGraphV1;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::HistoryCell;
+use super::{HistoryCell, truncate_by_width as truncate};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExplainAnalyzeCell {
@@ -142,8 +144,8 @@ fn render_graph(
     let clock_labels = clock_labels(graph);
     let coverage_gaps = graph.coverage_gaps();
     let observation_incomplete = delivery_degraded || !coverage_gaps.is_empty();
-    let peak = graph
-        .max_concurrency()
+    let concurrency = graph.max_concurrency();
+    let peak = concurrency
         .map(|count| {
             if !observation_incomplete {
                 count.to_string()
@@ -169,16 +171,52 @@ fn render_graph(
         "Explain Analyze · {integrity} · {} stages",
         graph.nodes().len()
     );
-    if verbose || graph.max_concurrency().is_some_and(|count| count > 1) {
+    if verbose || concurrency.is_some_and(|count| count > 1) {
         header.push_str(&format!(" · {parallel_label} {peak}"));
     }
     if verbose || clock_labels.len() > 1 {
         header.push_str(&format!(" · {clock_count}"));
     }
+    if !live {
+        let mut turns = graph
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn);
+        if let Some(turn) = turns.next()
+            && turns.next().is_none()
+            && !turn.conflicted
+            && let Some(wall) = turn.duration_ms
+        {
+            header.push_str(&format!(" · {} wall", format_ms(wall)));
+        }
+    }
     let mut lines = vec![Line::from(Span::styled(
         truncate(&header, width),
         Style::default().fg(theme.accent).bold(),
     ))];
+    if !live && let Some((_, step)) = graph.longest_measured_step() {
+        let text = format!(
+            "Longest measured step · {} · {}",
+            step.label,
+            step.duration_ms.map(format_ms).unwrap_or_default()
+        );
+        lines.push(Line::from(Span::styled(
+            truncate(&text, width),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    if !live && width >= 60 {
+        let columns = wide_metrics(
+            "Start",
+            "Duration",
+            (width >= 96).then_some("Provider tokens"),
+        );
+        let stage = width.saturating_sub(columns.width() + 19);
+        lines.push(Line::styled(
+            format!("{:<stage$}{columns}  Status", "Stage"),
+            Style::default().fg(theme.dim),
+        ));
+    }
 
     let content_limit = node_limit.map(|limit| limit.saturating_sub(1));
     let mut truncated = false;
@@ -214,7 +252,17 @@ fn render_graph(
         roots.sort_unstable();
     }
     let mut root_cursor = 0;
+    let mut orphans = 0..graph.nodes().len();
     let mut orphan_heading = false;
+    let unresolved_nodes = graph
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code
+                == astra_turn_types::ExplainAnalyzeProjectionDiagnosticCodeV1::UnresolvedTerminalNode
+        })
+        .filter_map(|diagnostic| diagnostic.node_id.as_deref())
+        .collect::<HashSet<_>>();
 
     'tree: loop {
         if stack.is_empty() {
@@ -226,9 +274,7 @@ fn render_graph(
                 let last = root_cursor + 1 == roots.len();
                 root_cursor += 1;
                 stack.push((root, Vec::new(), last));
-            } else if let Some(orphan) =
-                (0..graph.nodes().len()).find(|index| !seen.contains(index))
-            {
+            } else if let Some(orphan) = orphans.find(|index| !seen.contains(index)) {
                 if !orphan_heading {
                     if !has_room(&lines, content_limit) {
                         truncated = true;
@@ -267,11 +313,7 @@ fn render_graph(
                     "…".to_string()
                 }
             });
-            let unresolved_terminal = graph.diagnostics().iter().any(|diagnostic| {
-                diagnostic.code
-                    == astra_turn_types::ExplainAnalyzeProjectionDiagnosticCodeV1::UnresolvedTerminalNode
-                    && diagnostic.node_id.as_deref() == Some(node.node_id.as_str())
-            });
+            let unresolved_terminal = unresolved_nodes.contains(node.node_id.as_str());
             let (state, state_color, state_short) =
                 node_state(node, unresolved_terminal, live, theme);
             let offset = if clock_labels.len() > 1 {
@@ -283,24 +325,17 @@ fn render_graph(
             } else {
                 format!("+{}", format_ms(node.start_elapsed_ms))
             };
-            let (row, compact_row) =
-                node_row(node, &prefix, &offset, &duration, state, state_short, width);
-            let node_style = match node.kind {
-                astra_turn_types::ExplainAnalyzeNodeKindV1::Wait => Style::default().fg(theme.warn),
-                astra_turn_types::ExplainAnalyzeNodeKindV1::Admission => {
-                    Style::default().fg(Color::DarkGray)
-                }
-                _ => Style::default().fg(theme.accent),
-            };
+            let (row, compact_row) = node_row(
+                node,
+                &prefix,
+                &offset,
+                &duration,
+                (state, state_color, state_short),
+                width,
+                theme,
+            );
             let detail_ancestors = detail_ancestors(&ancestors_with_following_sibling, last);
-            if compact_row {
-                lines.push(Line::from(Span::styled(row, node_style)));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled(row, node_style),
-                    Span::styled(format!("  {state}"), Style::default().fg(state_color)),
-                ]));
-            }
+            lines.push(row);
             if compact_row && !live {
                 // The frozen cell has room for a full state row after the
                 // compact tree row. The live viewport keeps one row per stage
@@ -798,14 +833,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
     }
 }
 
-fn format_ms(ms: u64) -> String {
-    if ms >= 1_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
 fn has_room(lines: &[Line<'static>], content_limit: Option<usize>) -> bool {
     content_limit.is_none_or(|limit| lines.len() < limit)
 }
@@ -839,7 +866,10 @@ fn push_wrapped_detail(
         } else {
             continuation_prefix.as_str()
         };
-        lines.push(Line::from(Span::styled(format!("{prefix}{part}"), style)));
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", truncate(&part, content_width)),
+            style,
+        )));
     }
     true
 }
@@ -857,9 +887,10 @@ fn push_wrapped_node_detail(
     content_limit: Option<usize>,
     ancestors_with_following_sibling: &[bool],
 ) -> bool {
-    let prefix = detail_prefix(ancestors_with_following_sibling);
+    let prefix = fit_tree_prefix(&detail_prefix(ancestors_with_following_sibling), width / 3);
     let prefix_width = prefix.width();
-    let wrapped = wrap_words(detail, width.saturating_sub(prefix_width).max(1));
+    let available = width.saturating_sub(prefix_width).max(1);
+    let wrapped = wrap_words(detail, available);
     for (index, part) in wrapped.into_iter().enumerate() {
         if !has_room(lines, content_limit) {
             return false;
@@ -867,7 +898,7 @@ fn push_wrapped_node_detail(
         let continuation = " ".repeat(prefix_width);
         let row_prefix = if index == 0 { &prefix } else { &continuation };
         lines.push(Line::from(Span::styled(
-            format!("{row_prefix}{part}"),
+            format!("{row_prefix}{}", truncate(&part, available)),
             style,
         )));
     }
@@ -960,14 +991,47 @@ fn node_row(
     prefix: &str,
     offset: &str,
     duration: &str,
-    state: &str,
-    state_short: &str,
+    (state, state_color, state_short): (&str, Color, &str),
     width: usize,
-) -> (String, bool) {
-    if width >= 54 {
-        let fixed = prefix.width() + offset.width() + duration.width().max(7) + state.width() + 6;
-        let label = truncate(&node.label, width.saturating_sub(fixed).max(1));
-        return (format!("{prefix}{label}  {offset}  {duration:>7}"), false);
+    theme: &crate::tui::theme::Theme,
+) -> (Line<'static>, bool) {
+    let muted = Style::default().fg(theme.dim);
+    let label_style = if matches!(
+        node.kind,
+        astra_turn_types::ExplainAnalyzeNodeKindV1::Run
+            | astra_turn_types::ExplainAnalyzeNodeKindV1::Turn
+    ) {
+        Style::default().fg(theme.fg).bold()
+    } else {
+        Style::default().fg(theme.fg)
+    };
+    let state_style = Style::default().fg(state_color);
+    if width >= 60 {
+        let offset = truncate(offset, 13);
+        let duration = truncate(duration, 9);
+        let tokens = (width >= 96).then(|| {
+            let tokens = node
+                .usage
+                .as_ref()
+                .map(compact_usage)
+                .unwrap_or_else(|| "—".into());
+            truncate(&tokens, 23)
+        });
+        let metrics = wide_metrics(&offset, &duration, tokens.as_deref());
+        let state_cell = format!("  {state:<17}");
+        let label_room = width.saturating_sub(metrics.width() + state_cell.width());
+        let prefix = fit_tree_prefix(prefix, label_room / 2);
+        let label = truncate(&node.label, label_room.saturating_sub(prefix.width()));
+        let padding = " ".repeat(label_room.saturating_sub(prefix.width() + label.width()));
+        return (
+            Line::from(vec![
+                Span::styled(prefix, muted),
+                Span::styled(label, label_style),
+                Span::styled(format!("{padding}{metrics}"), muted),
+                Span::styled(state_cell, state_style),
+            ]),
+            false,
+        );
     }
 
     let compact_prefix = prefix
@@ -975,20 +1039,50 @@ fn node_row(
         .replace("  ", " ")
         .replace("├─ ", "├")
         .replace("└─ ", "└");
-    let time = if width >= 36 {
-        format!("{offset} {duration}")
-    } else {
-        duration.to_owned()
-    };
-    let fixed = compact_prefix.width() + time.width() + state_short.width() + 2;
-    let label = truncate(&node.label, width.saturating_sub(fixed).max(1));
+    let time = truncate(duration, 9);
+    let suffix = format!(" {time} {state_short}");
+    if width <= suffix.width() + 2 {
+        return (
+            Line::styled(truncate(&node.label, width), label_style),
+            true,
+        );
+    }
+    let label_room = width - suffix.width();
+    let prefix = fit_tree_prefix(&compact_prefix, label_room / 2);
     (
-        truncate(
-            &format!("{compact_prefix}{label} {time} {state_short}"),
-            width,
-        ),
+        Line::from(vec![
+            Span::styled(
+                truncate(&format!("{prefix}{}", node.label), label_room),
+                label_style,
+            ),
+            Span::styled(format!(" {time} "), muted),
+            Span::styled(state_short.to_owned(), state_style),
+        ]),
         true,
     )
+}
+
+fn wide_metrics(offset: &str, duration: &str, tokens: Option<&str>) -> String {
+    let mut cells = format!("  {offset:>13}  {duration:>9}");
+    if let Some(tokens) = tokens {
+        cells.push_str(&format!("  {tokens:>23}"));
+    }
+    cells
+}
+
+fn fit_tree_prefix(prefix: &str, max: usize) -> String {
+    if prefix.width() <= max {
+        return prefix.to_owned();
+    }
+    if max < 2 {
+        return String::new();
+    }
+    let start = prefix
+        .char_indices()
+        .rev()
+        .nth(max - 2)
+        .map_or(0, |(i, _)| i);
+    format!("…{}", &prefix[start..])
 }
 
 fn node_state(
@@ -1061,93 +1155,8 @@ fn diagnostic_label(
     }
 }
 
-fn provider_usage_summary(graph: &ExplainAnalyzeGraphV1) -> Option<String> {
-    use astra_turn_types::{ExplainAnalyzeNodeKindV1::ProviderAttempt, ExplainAnalyzeUsageBasisV1};
-
-    let attempts = graph
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == ProviderAttempt)
-        .collect::<Vec<_>>();
-    if attempts.is_empty() {
-        return None;
-    }
-
-    let mut lanes: [(&str, u128, usize); 4] = [
-        ("in", 0, 0),
-        ("cache read", 0, 0),
-        ("cache write", 0, 0),
-        ("out", 0, 0),
-    ];
-    for node in &attempts {
-        if !node.terminal_observed || node.conflicted {
-            continue;
-        }
-        let Some(usage) = &node.usage else {
-            continue;
-        };
-        if usage.basis == ExplainAnalyzeUsageBasisV1::RuntimeEstimated {
-            continue;
-        }
-        for (lane, value) in lanes.iter_mut().zip([
-            usage.fresh_input_tokens,
-            usage.cache_read_tokens,
-            usage.cache_creation_tokens,
-            usage.output_tokens,
-        ]) {
-            if let Some(value) = value {
-                lane.1 += u128::from(value);
-                lane.2 += 1;
-            }
-        }
-    }
-    let values = lanes
-        .into_iter()
-        .filter(|(_, _, count)| *count > 0)
-        .map(|(label, total, count)| {
-            let coverage = if count == attempts.len() {
-                String::new()
-            } else {
-                format!(" {count}/{}", attempts.len())
-            };
-            format!("{label} {}{coverage}", format_tokens_u128(total))
-        })
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return Some("Provider tokens · usage not reported yet".to_string());
-    }
-    Some(format!("Provider tokens · {}", values.join(" · ")))
-}
-
 fn format_tokens(value: u64) -> String {
     format_tokens_u128(u128::from(value))
-}
-
-fn format_tokens_u128(value: u128) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.width() <= max {
-        return value.to_owned();
-    }
-    let mut out = String::new();
-    for ch in value.chars() {
-        if out.width() + UnicodeWidthChar::width(ch).unwrap_or(0) + 1 > max {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -1383,7 +1392,7 @@ mod tests {
                 })),
             }),
         ));
-        graph.apply(finished(
+        let mut provider = finished(
             "provider-finish",
             "provider",
             Some("turn"),
@@ -1400,7 +1409,12 @@ mod tests {
                 output_tokens: Some(40),
             }),
             None,
-        ));
+        );
+        provider.decision_detail = astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(
+            astra_core::ErrorKind::RateLimit,
+            ExplainAnalyzeOutcomeV1::Failed,
+        );
+        graph.apply(provider);
         graph
     }
 
@@ -1455,6 +1469,7 @@ mod tests {
         assert!(rendered.contains("+1.2s"), "{rendered}");
         assert!(rendered.contains("420ms"), "{rendered}");
         assert!(rendered.contains("Failed"), "{rendered}");
+        assert!(rendered.contains("Error · rate limit"), "{rendered}");
         assert!(
             rendered.contains("Provider tokens · in 1,200"),
             "{rendered}"
@@ -1553,6 +1568,39 @@ mod tests {
                 .sum::<usize>()
                 <= 48
         }));
+    }
+
+    #[test]
+    fn deep_tree_keeps_longest_step_duration_and_status_inside_narrow_view() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for i in 0..16 {
+            let id = format!("stage-{i}");
+            let parent = (i > 0).then(|| format!("stage-{}", i - 1));
+            graph.apply(finished(
+                &format!("{id}-finish"),
+                &id,
+                parent.as_deref(),
+                ExplainAnalyzeNodeKindV1::ToolCall,
+                "clock",
+                0,
+                if i == 15 { 420 } else { 12 },
+                if i == 15 {
+                    ExplainAnalyzeOutcomeV1::Failed
+                } else {
+                    ExplainAnalyzeOutcomeV1::Succeeded
+                },
+                None,
+                None,
+            ));
+        }
+        graph.finish_ingest();
+        let cell = ExplainAnalyzeCell::new(graph, false, false);
+        let narrow = cell.display_lines(22);
+        assert!(narrow.iter().all(|line| line.width() <= 22));
+        assert!(text(&narrow).contains("420ms fail"));
+        assert!(
+            text(&cell.display_lines(120)).contains("Longest measured step · stage 15 · 420ms")
+        );
     }
 
     #[test]

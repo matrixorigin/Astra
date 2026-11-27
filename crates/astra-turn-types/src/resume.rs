@@ -338,12 +338,21 @@ impl ResumeBundleV1 {
     }
 
     pub fn validates_root(&self) -> bool {
-        validates_materialized_root(
+        self.validated_materialized_root_hash().is_some()
+    }
+
+    /// Return the canonical root of the materialized messages when they match
+    /// this bundle's declared root. Callers that need the value after
+    /// validation can reuse it instead of hashing a large history again.
+    pub fn validated_materialized_root_hash(&self) -> Option<String> {
+        let root = canonical_conversation_root(&self.conversation_messages);
+        validates_materialized_root_hash(
             self.source,
             &self.cursor,
-            &self.conversation_messages,
+            &root,
             self.materialized_conversation_root_hash.as_deref(),
         )
+        .then_some(root)
     }
 
     pub fn descriptor(&self) -> ResumeDescriptorV1 {
@@ -548,10 +557,19 @@ fn validates_materialized_root(
     materialized_root: Option<&str>,
 ) -> bool {
     let root = canonical_conversation_root(messages);
+    validates_materialized_root_hash(source, cursor, &root, materialized_root)
+}
+
+fn validates_materialized_root_hash(
+    source: ResumeSourceV1,
+    cursor: &SessionCursorV1,
+    root: &str,
+    materialized_root: Option<&str>,
+) -> bool {
     match cursor.projection_schema {
         CONVERSATION_PROJECTION_SCHEMA_VERSION => root == cursor.canonical_root_hash,
         SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION => {
-            source == ResumeSourceV1::CanonicalJournal && materialized_root == Some(root.as_str())
+            source == ResumeSourceV1::CanonicalJournal && materialized_root == Some(root)
         }
         _ => false,
     }
@@ -613,7 +631,7 @@ mod tests {
             source: ResumeSourceV1::CanonicalJournal,
             cursor: manifest_cursor.clone(),
             conversation_messages: messages.clone(),
-            materialized_conversation_root_hash: Some(content_root),
+            materialized_conversation_root_hash: Some(content_root.clone()),
             degraded_reasons: Vec::new(),
             repair_actions: Vec::new(),
             projections: ResumeProjectionSetV1::default(),
@@ -621,6 +639,20 @@ mod tests {
 
         let selected = select_resume_bundle(Some(&manifest_cursor), [candidate.clone()]).unwrap();
         assert!(selected.validates_root());
+        let bundle = ResumeBundleV1 {
+            schema_version: RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor: manifest_cursor.clone(),
+            source: ResumeSourceV1::CanonicalJournal,
+            conversation_messages: messages.clone(),
+            materialized_conversation_root_hash: Some(content_root.clone()),
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: ResumeProjectionSetV1::default(),
+        };
+        assert_eq!(
+            bundle.validated_materialized_root_hash().as_deref(),
+            Some(content_root.as_str())
+        );
 
         let mut missing_proof = candidate;
         missing_proof.materialized_conversation_root_hash = None;

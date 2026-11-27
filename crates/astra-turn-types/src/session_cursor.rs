@@ -73,22 +73,87 @@ pub fn canonical_conversation_root(messages: &[Value]) -> String {
     canonical_conversation_identity(messages).0
 }
 
+/// Compare JSON values using the same representation as the canonical root.
+/// Object insertion order is immaterial, but distinct serialized numbers must
+/// remain distinct so that a delta can always reproduce its advertised root.
+pub fn canonical_json_eq(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(a, b)| canonical_json_eq(a, b))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| canonical_json_eq(value, other))
+                })
+        }
+        (Value::Number(left), Value::Number(right)) => {
+            left == right
+                && match (left.as_f64(), right.as_f64()) {
+                    (Some(a), Some(b)) if a == 0.0 && b == 0.0 => {
+                        a.is_sign_negative() == b.is_sign_negative()
+                    }
+                    _ => true,
+                }
+        }
+        _ => left == right,
+    }
+}
+
+/// Length of the common canonical JSON prefix of two message lists.
+pub fn canonical_json_prefix_len(left: &[Value], right: &[Value]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(a, b)| canonical_json_eq(a, b))
+        .count()
+}
+
 /// Compute the canonical root and serialized byte count together.
 ///
 /// Root construction already needs one counting pass before hashing because
 /// the byte length is domain-separated ahead of the payload. Returning that
 /// count avoids a third full-history traversal in segmented storage.
 pub fn canonical_conversation_identity(messages: &[Value]) -> (String, u64) {
-    let mut counter = CountingWriter::default();
-    write_canonical_messages(messages, &mut counter)
-        .expect("counting canonical JSON bytes cannot fail");
+    let bytes = canonical_conversation_serialized_len(messages);
+    (hash_canonical_messages(messages, bytes), bytes)
+}
 
+/// Compute a V1 identity after appending messages to a verified prefix.
+///
+/// `prefix_bytes` is the canonical array length (including both brackets)
+/// of the first `prefix_messages` messages. Only the suffix needs counting;
+/// the hash still covers the whole conversation.
+pub fn canonical_conversation_append_identity(
+    messages: &[Value],
+    prefix_messages: usize,
+    prefix_bytes: u64,
+) -> (String, u64) {
+    let mut counter = CountingWriter {
+        bytes: prefix_bytes,
+        ..Default::default()
+    };
+    write_canonical_elements(
+        &messages[prefix_messages..],
+        prefix_messages != 0,
+        &mut counter,
+    )
+    .expect("counting appended canonical JSON bytes cannot fail");
+    (
+        hash_canonical_messages(messages, counter.bytes),
+        counter.bytes,
+    )
+}
+
+fn hash_canonical_messages(messages: &[Value], bytes: u64) -> String {
     let mut digest = Sha256::new();
     digest.update(ROOT_HASH_DOMAIN);
-    digest.update(counter.bytes.to_be_bytes());
+    digest.update(bytes.to_be_bytes());
     write_canonical_messages(messages, &mut DigestWriter(&mut digest))
         .expect("hashing canonical JSON bytes cannot fail");
-    (format!("{:x}", digest.finalize()), counter.bytes)
+    format!("{:x}", digest.finalize())
 }
 
 /// Number of bytes in the canonical JSON representation used by
@@ -169,13 +234,23 @@ impl Write for DigestWriter<'_> {
 
 fn write_canonical_messages(messages: &[Value], out: &mut impl Write) -> io::Result<()> {
     out.write_all(b"[")?;
-    for (index, message) in messages.iter().enumerate() {
-        if index > 0 {
+    write_canonical_elements(messages, false, out)?;
+    out.write_all(b"]")
+}
+
+fn write_canonical_elements(
+    messages: &[Value],
+    mut needs_separator: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    for message in messages {
+        if needs_separator {
             out.write_all(b",")?;
         }
         write_canonical_json(message, out)?;
+        needs_separator = true;
     }
-    out.write_all(b"]")
+    Ok(())
 }
 
 fn write_canonical_json(value: &Value, out: &mut impl Write) -> io::Result<()> {
@@ -243,6 +318,28 @@ mod tests {
         let (root, bytes) = canonical_conversation_identity(&messages);
         assert_eq!(root, canonical_conversation_root(&messages));
         assert_eq!(bytes, canonical_conversation_serialized_len(&messages));
+    }
+
+    #[test]
+    fn canonical_equality_matches_root_representation() {
+        let cases = [
+            (
+                json!({"b":[1, {"x":true}], "a":"v"}),
+                json!({"a":"v", "b":[1, {"x":true}]}),
+            ),
+            (json!({"number":[0.0]}), json!({"number":[-0.0]})),
+            (json!([1]), json!([1.0])),
+            (json!([1, 2]), json!([2, 1])),
+            (json!({"x":null}), json!({})),
+        ];
+        for (left, right) in cases {
+            assert_eq!(
+                super::canonical_json_eq(&left, &right),
+                canonical_conversation_root(std::slice::from_ref(&left))
+                    == canonical_conversation_root(std::slice::from_ref(&right)),
+                "left={left}, right={right}"
+            );
+        }
     }
 
     #[test]
