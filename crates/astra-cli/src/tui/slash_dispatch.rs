@@ -3136,8 +3136,7 @@ fn context_dump_argument(args: &str) -> Option<&str> {
 
 // ── /model subcommand helpers ───────────────────────────────────
 
-pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
-    "↑↓ select · Enter choose · Esc close · Type to filter · Supported models ask for thinking mode";
+pub(crate) const MODEL_PICKER_FOOTER_HINT: &str = "↑↓ select · Enter choose · Esc close · Type to filter · Supported models ask for thinking mode";
 pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
     "↑↓ select · Enter finish model selection · Esc back · Type to filter";
 

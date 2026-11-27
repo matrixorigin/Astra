@@ -110,9 +110,7 @@ impl BottomPaneView for FormView {
             .border_style(Style::default().fg(theme.dim))
             .title(Line::from(Span::styled(
                 self.title,
-                Style::default()
-                    .fg(theme.fg)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
             )));
         let inner = outer.inner(area);
         outer.render(area, buf);

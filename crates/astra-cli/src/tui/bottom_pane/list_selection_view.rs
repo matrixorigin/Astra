@@ -112,7 +112,10 @@ impl BottomPaneView for ListSelectionView {
             }
             if !self.filter.is_empty() {
                 let separator = if self.header.is_some() { " · " } else { "" };
-                heading.push(Span::styled(format!("{separator}Filter · {}", self.filter), dim));
+                heading.push(Span::styled(
+                    format!("{separator}Filter · {}", self.filter),
+                    dim,
+                ));
             }
             buf.set_line(area.x, y, &Line::from(heading), area.width);
             y += 1;
@@ -136,7 +139,11 @@ impl BottomPaneView for ListSelectionView {
             let marker = if selected { "› " } else { "  " };
             let current = if item.is_current { " (current)" } else { "" };
             let label = format!("  {marker}{}{current}", item.name);
-            let label_style = if selected { selected_style } else { Style::default() };
+            let label_style = if selected {
+                selected_style
+            } else {
+                Style::default()
+            };
             let description_style = if selected { selected_style } else { dim };
             let remaining = usize::from(area.width).saturating_sub(label.width() + 2);
             let mut spans = vec![Span::styled(label, label_style)];
