@@ -146,10 +146,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM work_branch_control_operations WHERE session_id = ? AND owner_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_attachment_quarantines",
-        sql: "DELETE FROM session_attachment_quarantines WHERE session_id = ? AND owner_user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "session_handoff_events",
         sql: "DELETE FROM session_handoff_events WHERE session_id = ? AND owner_user_id = ?",
     },
@@ -345,7 +341,6 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("session_handoffs", "owner_user_id"),
     ("session_attachments", "owner_user_id"),
     ("session_handoff_slots", "owner_user_id"),
-    ("session_attachment_quarantines", "owner_user_id"),
     ("session_artifact_content_refs", "user_id"),
     ("session_artifact_content_upload_leases", "user_id"),
     ("session_artifact_content_reservations", "user_id"),

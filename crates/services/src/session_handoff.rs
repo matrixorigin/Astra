@@ -67,14 +67,8 @@ pub enum SessionHandoffError {
     ActiveRunsRemain { run_id: String },
     #[error("forced takeover effect evidence exceeds the bounded safety capacity")]
     EffectEvidenceCapacityExceeded,
-    #[error(
-        "local manifest {observed_manifest_root} diverges from Server head; fork is required (quarantine {quarantine_id})"
-    )]
-    ForkRequired {
-        quarantine_id: String,
-        observed_manifest_root: String,
-        current_manifest_root: Option<String>,
-    },
+    #[error("local manifest {observed_manifest_root} diverges from Server head; fork is required")]
+    ForkRequired { observed_manifest_root: String },
     #[error("handoff state requires repair: {0}")]
     NeedsRepair(String),
     #[error(transparent)]
@@ -298,8 +292,6 @@ impl DatabaseSessionHandoffService {
     ) -> Result<AttachSessionOutcomeV1, SessionHandoffError> {
         validate_attach_request(request)?;
         validate_duration(ttl, MAX_ATTACHMENT_TTL, "attachment TTL")?;
-        let request_hash = attach_request_hash(request)?;
-        let idempotency_hash = identity_hash("attach", &request.idempotency_key);
         let delta = match self
             .coordinator
             .load_manifest_delta(&request.key, request.after_manifest_root.as_deref())
@@ -311,24 +303,14 @@ impl DatabaseSessionHandoffService {
                     .after_manifest_root
                     .as_deref()
                     .expect("divergence requires an observed manifest root");
-                let current_head = self.coordinator.load_head(&request.key).await?;
-                let quarantine_id = quarantine_divergent_attachment(
-                    self.pool.get(),
-                    &request.key,
-                    observed_manifest_root,
-                    current_head.as_ref(),
-                    &idempotency_hash,
-                    &request_hash,
-                )
-                .await?;
                 return Err(SessionHandoffError::ForkRequired {
-                    quarantine_id,
                     observed_manifest_root: observed_manifest_root.to_owned(),
-                    current_manifest_root: current_head.map(|head| head.latest_manifest_root),
                 });
             }
             Err(error) => return Err(error.into()),
         };
+        let request_hash = attach_request_hash(request)?;
+        let idempotency_hash = identity_hash("attach", &request.idempotency_key);
         let mut tx = self.begin("begin_attach").await?;
 
         // All attachment mutations use the branch slot before touching an
@@ -1675,62 +1657,6 @@ async fn seal_forced_takeover_effects(
     Ok(())
 }
 
-async fn quarantine_divergent_attachment(
-    pool: &sqlx::Pool<MySql>,
-    key: &SessionKeyV1,
-    observed_manifest_root: &str,
-    current_head: Option<&SessionContextHeadV1>,
-    idempotency_hash: &str,
-    request_hash: &str,
-) -> Result<String, SessionHandoffError> {
-    let candidate_id = Uuid::new_v4().to_string();
-    let mut tx = CancellationSafeTransaction::begin(pool)
-        .await
-        .map_err(|source| database_error("begin_attachment_quarantine", source))?;
-    sqlx::query(
-        "INSERT IGNORE INTO session_attachment_quarantines
-         (isolation_domain, owner_user_id, session_id, branch_id, quarantine_id,
-          idempotency_hash, request_hash, observed_manifest_root,
-          current_manifest_root, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'divergent_manifest')",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .bind(&candidate_id)
-    .bind(idempotency_hash)
-    .bind(request_hash)
-    .bind(observed_manifest_root)
-    .bind(current_head.map(|head| head.latest_manifest_root.as_str()))
-    .execute(&mut *tx)
-    .await
-    .map_err(|source| database_error("insert_attachment_quarantine", source))?;
-    let row = sqlx::query(
-        "SELECT quarantine_id, request_hash
-         FROM session_attachment_quarantines
-         WHERE isolation_domain = ? AND owner_user_id = ?
-           AND session_id = ? AND branch_id = ? AND idempotency_hash = ?
-         FOR UPDATE",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .bind(idempotency_hash)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|source| database_error("load_attachment_quarantine", source))?;
-    verify_request_hash(&row, request_hash)?;
-    let quarantine_id = row
-        .try_get("quarantine_id")
-        .map_err(|source| database_error("decode_attachment_quarantine", source))?;
-    tx.commit()
-        .await
-        .map_err(|source| database_error("commit_attachment_quarantine", source))?;
-    Ok(quarantine_id)
-}
-
 /// Share the execution admission fence before acquiring handoff/attachment
 /// locks. The same order applies to forced effect sealing and activation.
 async fn lock_handoff_execution_scope(
@@ -2661,7 +2587,6 @@ mod tests {
             .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
         }
         for table in [
-            "session_attachment_quarantines",
             "session_handoff_events",
             "session_handoffs",
             "session_attachments",
@@ -3201,7 +3126,7 @@ mod tests {
             CoordinatorMutationV1::Applied { cursor } => cursor,
             other => panic!("unexpected commit outcome {other:?}"),
         };
-        let quarantine_id = match service
+        let error = service
             .attach_read_only(
                 &AttachSessionRequestV1 {
                     idempotency_key: "divergent-attachment".into(),
@@ -3214,29 +3139,29 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await
-            .expect_err("divergent local root must not attach")
-        {
-            SessionHandoffError::ForkRequired { quarantine_id, .. } => quarantine_id,
-            other => panic!("unexpected divergent attach error {other:?}"),
-        };
-        let quarantine_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_attachment_quarantines
+            .expect_err("divergent local root must not attach");
+        assert!(matches!(
+            error,
+            SessionHandoffError::ForkRequired { observed_manifest_root }
+                if observed_manifest_root == "0".repeat(64)
+        ));
+        let attachments: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_attachments
              WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ? AND quarantine_id = ?",
+               AND session_id = ? AND branch_id = ?",
         )
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
         .bind(&key.branch_id)
-        .bind(quarantine_id)
         .fetch_one(pool.get())
         .await
-        .expect("count quarantine");
-        assert_eq!(quarantine_count, 1);
+        .expect("count attachments after divergent request");
+        assert_eq!(attachments, 0);
         let source_attachment = service
             .attach_read_only(
                 &AttachSessionRequestV1 {
-                    idempotency_key: "source-attachment".into(),
+                    idempotency_key: "divergent-attachment".into(),
                     key: key.clone(),
                     actor: source_actor,
                     placement: SessionPlacementV1::Cli,

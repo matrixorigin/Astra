@@ -799,6 +799,7 @@ async fn schema_rationalization_runtime_contract() {
         "observation_identity_collisions",
         "inference_routes",
         "work_attention_receipts",
+        "session_attachment_quarantines",
         "prompt_chunks",
         "harness_sources",
         "harness_decisions",
@@ -1787,17 +1788,6 @@ async fn phase1_run_durability_schema_contract() {
             "branch_id"
         ],
         "one active handoff slot must be serialized by the complete SessionKey"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_attachment_quarantines").await,
-        [
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "quarantine_id"
-        ],
-        "divergent local roots must be quarantined inside the complete SessionKey"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_attachments").await,

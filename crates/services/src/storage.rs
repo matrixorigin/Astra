@@ -3586,31 +3586,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "session_attachment_quarantines",
-        "CREATE TABLE IF NOT EXISTS session_attachment_quarantines (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            quarantine_id CHAR(36) NOT NULL,
-            idempotency_hash CHAR(64) NOT NULL,
-            request_hash CHAR(64) NOT NULL,
-            observed_manifest_root CHAR(64) NOT NULL,
-            current_manifest_root CHAR(64) NULL,
-            reason VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, quarantine_id),
-            UNIQUE KEY uq_session_attachment_quarantine_idempotency
-                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
-            INDEX idx_session_attachment_quarantine_created
-                (isolation_domain, owner_user_id, session_id, branch_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "session_handoff_slots",
         "CREATE TABLE IF NOT EXISTS session_handoff_slots (
             isolation_domain VARCHAR(128) NOT NULL,
