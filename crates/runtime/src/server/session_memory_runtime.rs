@@ -16,19 +16,26 @@ pub(crate) fn spawn_session_memory_recovery(
     state.auth_service.memoria_credentials()?;
     let store = SessionMemoryLifecycleStore::new(pool);
     Some(tokio::spawn(async move {
-        loop {
+        while !cancel.is_cancelled() {
             let scan_started = tokio::time::Instant::now();
-            if cancel.is_cancelled() {
-                break;
-            }
-            let due = match store.list_due(16).await {
-                Ok(due) => due,
+            let earliest_scan = scan_started + ACTIVE_RECOVERY_INTERVAL;
+            let idle_deadline = scan_started + IDLE_RECOVERY_INTERVAL;
+            let (due, next_scan) = match store
+                .scan_recovery(16, IDLE_RECOVERY_INTERVAL.as_secs())
+                .await
+            {
+                Ok(scan) if scan.due.is_empty() => {
+                    let next_scan = scan.retry_after.map_or(idle_deadline, |delay| {
+                        (tokio::time::Instant::now() + delay).min(idle_deadline)
+                    });
+                    (scan.due, next_scan)
+                }
+                Ok(scan) => (scan.due, earliest_scan),
                 Err(error) => {
                     tracing::warn!(%error, "session memory recovery scan failed");
-                    Vec::new()
+                    (Vec::new(), earliest_scan)
                 }
             };
-            let had_work = !due.is_empty();
             use futures_util::{StreamExt, stream};
             let state = &state;
             let store = &store;
@@ -45,8 +52,13 @@ pub(crate) fn spawn_session_memory_recovery(
                     }
                 })
                 .await;
-            if !wait_for_recovery_scan(&state.session_memory_wakeup, cancel, scan_started, had_work)
-                .await
+            if !wait_for_recovery_scan(
+                &state.session_memory_wakeup,
+                cancel,
+                earliest_scan,
+                next_scan,
+            )
+            .await
             {
                 break;
             }
@@ -57,21 +69,20 @@ pub(crate) fn spawn_session_memory_recovery(
 async fn wait_for_recovery_scan(
     wakeup: &tokio::sync::Notify,
     cancel: &CancellationToken,
-    scan_started: tokio::time::Instant,
-    had_work: bool,
+    earliest_scan: tokio::time::Instant,
+    next_scan: tokio::time::Instant,
 ) -> bool {
-    let delay = if had_work {
-        ACTIVE_RECOVERY_INTERVAL
-    } else {
-        IDLE_RECOVERY_INTERVAL
-    };
-    // Committed local finalizations wake an idle worker. The durable scan
-    // still discovers work from another pod, a restart or a missed hint.
+    // A local commit may advance the deadline to the existing scan floor.
     tokio::select! {
         biased;
         _ = cancel.cancelled() => false,
-        _ = wakeup.notified(), if !had_work => true,
-        _ = tokio::time::sleep_until(scan_started + delay) => true,
+        _ = async {
+            tokio::select! {
+                _ = wakeup.notified() => {},
+                _ = tokio::time::sleep_until(next_scan) => {},
+            }
+            tokio::time::sleep_until(earliest_scan).await;
+        } => true,
     }
 }
 
@@ -200,25 +211,56 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn memory_recovery_uses_local_commit_hints_and_keeps_a_bounded_fallback() {
+    async fn memory_recovery_bounds_local_hints_and_keeps_retry_deadlines() {
+        use tokio::time::Instant;
+
         let wakeup = tokio::sync::Notify::new();
         let cancel = CancellationToken::new();
 
-        let start = tokio::time::Instant::now();
-        wakeup.notify_one();
-        assert!(wait_for_recovery_scan(&wakeup, &cancel, start, false).await);
-        assert_eq!(start.elapsed(), Duration::ZERO);
+        let start = Instant::now();
+        for _ in 0..3 {
+            let scan = Instant::now();
+            wakeup.notify_one();
+            assert!(
+                wait_for_recovery_scan(
+                    &wakeup,
+                    &cancel,
+                    scan + ACTIVE_RECOVERY_INTERVAL,
+                    scan + IDLE_RECOVERY_INTERVAL,
+                )
+                .await
+            );
+        }
+        assert_eq!(start.elapsed(), ACTIVE_RECOVERY_INTERVAL * 3);
 
-        let start = tokio::time::Instant::now();
-        assert!(wait_for_recovery_scan(&wakeup, &cancel, start, false).await);
-        assert_eq!(start.elapsed(), IDLE_RECOVERY_INTERVAL);
-
-        let start = tokio::time::Instant::now();
-        wakeup.notify_one();
-        assert!(wait_for_recovery_scan(&wakeup, &cancel, start, true).await);
-        assert_eq!(start.elapsed(), ACTIVE_RECOVERY_INTERVAL);
+        for delay in [
+            ACTIVE_RECOVERY_INTERVAL,
+            Duration::from_secs(5),
+            IDLE_RECOVERY_INTERVAL,
+        ] {
+            let scan = Instant::now();
+            assert!(
+                wait_for_recovery_scan(
+                    &wakeup,
+                    &cancel,
+                    scan + ACTIVE_RECOVERY_INTERVAL,
+                    scan + delay
+                )
+                .await
+            );
+            assert_eq!(scan.elapsed(), delay);
+        }
 
         cancel.cancel();
-        assert!(!wait_for_recovery_scan(&wakeup, &cancel, start, false).await);
+        let scan = Instant::now();
+        assert!(
+            !wait_for_recovery_scan(
+                &wakeup,
+                &cancel,
+                scan + ACTIVE_RECOVERY_INTERVAL,
+                scan + IDLE_RECOVERY_INTERVAL,
+            )
+            .await
+        );
     }
 }

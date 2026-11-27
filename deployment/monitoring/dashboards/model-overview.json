@@ -15,9 +15,20 @@
       ]
     },
     {
-      "title": "Provider-Reported Tokens (Admission Calibration)",
+      "title": "Standalone Completion Outcome Rate",
       "type": "graph",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(astra_llm_standalone_completions_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "title": "Provider-Reported Tokens (Admission Calibration)",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
       "targets": [
         {
           "expr": "sum(rate(astra_llm_provider_admission_calibration_actual_tokens_total{outcome!=\"missing_usage\"}[5m]))",

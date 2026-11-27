@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Connection, MySql, Row, Transaction, mysql::MySqlRow, types::Json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,6 +81,11 @@ pub struct SessionMemoryWorkClaim {
     pub session_id: String,
     pub token: String,
     pub work: SessionMemoryWork,
+}
+
+pub struct SessionMemoryRecoveryScan {
+    pub due: Vec<(String, String)>,
+    pub retry_after: Option<Duration>,
 }
 
 enum Persistence {
@@ -266,18 +272,39 @@ impl SessionMemoryLifecycleStore {
         )
     }
 
-    pub async fn list_due(&self, limit: u16) -> Result<Vec<(String, String)>, String> {
-        let rows = sqlx::query("SELECT w.user_id, w.session_id FROM agent_session_memory_work w JOIN agent_sessions s ON s.user_id = w.user_id AND s.session_id = w.session_id WHERE s.delete_requested_at IS NULL AND w.complete = 0 AND w.next_attempt_at <= NOW(6) AND (w.lease_token IS NULL OR w.lease_expires_at <= NOW(6)) ORDER BY w.next_attempt_at, w.user_id, w.session_id LIMIT ?")
-            .bind(limit).fetch_all(self.pool.get()).await.map_err(|error| error.to_string())?;
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("user_id").map_err(|error| error.to_string())?,
-                    row.try_get("session_id")
-                        .map_err(|error| error.to_string())?,
-                ))
-            })
-            .collect()
+    /// The same bounded index range supplies ready rows and the next retry time.
+    pub async fn scan_recovery(
+        &self,
+        limit: u16,
+        lookahead_secs: u64,
+    ) -> Result<SessionMemoryRecoveryScan, String> {
+        let rows = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT w.user_id, w.session_id,
+                    CAST(TIMESTAMPDIFF(MICROSECOND, NOW(6), w.next_attempt_at) AS SIGNED)
+             FROM agent_session_memory_work w
+             JOIN agent_sessions s ON s.user_id = w.user_id AND s.session_id = w.session_id
+             WHERE s.delete_requested_at IS NULL AND w.complete = 0
+               AND w.next_attempt_at <= TIMESTAMPADD(SECOND, ?, NOW(6))
+               AND (w.lease_token IS NULL OR w.lease_expires_at <= NOW(6))
+             ORDER BY w.next_attempt_at, w.user_id, w.session_id LIMIT ?",
+        )
+        .bind(lookahead_secs)
+        .bind(limit)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut scan = SessionMemoryRecoveryScan {
+            due: Vec::with_capacity(rows.len()),
+            retry_after: None,
+        };
+        for (user_id, session_id, wait_micros) in rows {
+            if wait_micros > 0 {
+                scan.retry_after = Some(Duration::from_micros(wait_micros.unsigned_abs()));
+                break;
+            }
+            scan.due.push((user_id, session_id));
+        }
+        Ok(scan)
     }
 
     pub async fn claim(

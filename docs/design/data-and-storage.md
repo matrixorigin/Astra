@@ -226,10 +226,12 @@ its queued inputs through the existing deletion catalog.
 Ordinary turns create no memory-journal row or input snapshot. Explicit Session
 close/finalize enqueues maintenance; its worker materializes the latest canonical
 Context through the existing coordinator before freezing extraction input.
-A committed HTTP close or finalize wakes that pod's existing worker. Without
-due work the recovery scan runs every 30 seconds to cover other pods, missed
-hints, and timed retries. When it finds due work it keeps the two-second cadence
-and the existing scan and execution limits.
+A committed HTTP close or finalize can advance that pod's next scan. Scans
+start at least two seconds apart, even with repeated close requests. The same
+bounded query finds due work and the next eligible retry within 30 seconds.
+The worker scans in two seconds after a scan error or when it finds due work.
+An otherwise idle worker scans every 30 seconds to cover other pods and missed
+hints.
 
 Completed extraction drops its input transcript; publication coordinates and
 facts survive independently. Only fully successful governance retires replay
