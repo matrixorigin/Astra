@@ -4382,6 +4382,8 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
     let missing = format!("parent-missing-{nonce}");
     let orphan = format!("parent-orphan-{nonce}");
     let session = format!("parent-session-{nonce}");
+    // These fixtures exercise control reads. Keep the deliberately corrupt
+    // run out of recovery scans even if an assertion interrupts cleanup.
     for (user, run, parent, path) in [
         (&owner, &root, None, format!("/{root}")),
         (&owner, &child, Some(&root), format!("/{root}/{child}")),
@@ -4399,7 +4401,7 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
             format!("/{missing}/{orphan}"),
         ),
     ] {
-        sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,status) VALUES (?,?,?,?,?,?,'running')")
+        sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,status) VALUES (?,?,?,?,?,?,'paused')")
             .bind(user).bind(&session).bind(run).bind(parent.unwrap_or(run)).bind(parent).bind(path)
             .execute(pool.get()).await.unwrap();
     }
@@ -4435,21 +4437,6 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
         .unwrap()
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let fallback = store
-        .load_run_control_batch_after_parent_failure(&keys)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    // Restore the deliberate corruption before assertions so a failing test
-    // cannot poison later global recovery scans in the same CI database.
-    sqlx::query("UPDATE agent_runs SET last_guidance_event_idx=-1 WHERE user_id=? AND run_id=?")
-        .bind(&other)
-        .bind(&bad_root)
-        .execute(pool.get())
-        .await
         .unwrap();
     assert_eq!(
         capture
@@ -4519,14 +4506,19 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
         result.parent.is_none() && result.own == expected_child
     }));
     {
-        let sparse_sql = sparse_sql.0.lock().unwrap();
-        let run_queries: Vec<_> = sparse_sql
+        let statements = sparse_sql.0.lock().unwrap();
+        // A fresh SQLx checkout can initialize its session inside this span.
+        let reads: Vec<_> = statements
             .iter()
-            .filter(|sql| sql.contains("agent_runs"))
+            .filter(|sql| !sql.starts_with("SET sql_mode="))
             .collect();
-        assert_eq!(run_queries.len(), 1, "captured statements: {sparse_sql:?}");
+        assert_eq!(
+            reads.len(),
+            1,
+            "unexpected sparse batch SQL: {statements:?}"
+        );
         assert!(
-            !run_queries[0].contains("JOIN agent_runs parent"),
+            !reads[0].contains("JOIN agent_runs parent"),
             "sparse batches must avoid the parent join"
         );
     }
@@ -4565,6 +4557,13 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
 
     // Recovery uses one unjoined query with at most 256 physical positions.
     // Keep the same per-position ownership and parent errors as the join.
+    let fallback = store
+        .load_run_control_batch_after_parent_failure(&keys)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     for (actual, expected) in fallback.iter().zip(&results) {
         assert_eq!(actual.own, expected.own);
         assert_eq!(actual.parent, expected.parent);
