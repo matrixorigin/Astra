@@ -813,6 +813,15 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
+Fresh schema contract `2026-11-27-v127` keeps a fork's prepare reason and
+terminal status in its owner-scoped `session_forks` manifest. Creation and
+terminal transition times remain on that row. Forks have at most one terminal
+transition, so the separate full-manifest transition copies and their writes
+are retired. This retains the fork facts needed for recovery and inspection,
+but not an independent historical copy for diagnosing later row corruption.
+The previous schema is rejected without rewriting it; deploy against a fresh
+schema.
+
 Fresh schema contract `2026-11-20-v126` records the validated Run owner, tool
 name and exact request digest in the Edge dispatch row. A new admission
 commits with one insert. Only duplicate admission locks and reads the existing

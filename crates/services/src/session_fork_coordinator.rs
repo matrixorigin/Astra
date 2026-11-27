@@ -10,8 +10,9 @@ use std::{sync::Arc, time::Duration};
 use astra_core::SharedPool;
 use astra_turn_types::{
     ActorContextV1, ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
-    ForkExcludedAuthorityV1, SESSION_FORK_MANIFEST_SCHEMA_VERSION, SessionCursorV1,
-    SessionForkActivationV1, SessionForkManifestV1, SessionForkStateV1, SessionKeyV1,
+    ForkExcludedAuthorityV1, SESSION_FORK_MANIFEST_SCHEMA_VERSION, SESSION_FORK_REASON_MAX_BYTES,
+    SessionCursorV1, SessionForkActivationV1, SessionForkManifestV1, SessionForkStateV1,
+    SessionKeyV1,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -25,7 +26,6 @@ use crate::{
 };
 
 const MAX_IDEMPOTENCY_BYTES: usize = 512;
-const MAX_REASON_BYTES: usize = 1_024;
 const MAX_LIST_LIMIT: u32 = 200;
 const MAX_WRITER_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_ABORT_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -444,10 +444,11 @@ impl DatabaseSessionForkCoordinator {
                 ForkExcludedAuthorityV1::Mailbox,
                 ForkExcludedAuthorityV1::Invocation,
             ],
+            prepare_reason: request.reason.clone(),
             state: SessionForkStateV1::Prepared,
             created_at_unix_ms: now,
             activated_at_unix_ms: None,
-            status_detail: Some(request.reason.clone()),
+            status_detail: None,
         };
         manifest
             .validate()
@@ -490,7 +491,6 @@ impl DatabaseSessionForkCoordinator {
         .execute(&mut *tx)
         .await
         .map_err(|source| database_error("pin_prepared_fork", source))?;
-        insert_fork_event(&mut tx, &manifest, 0, None, "prepared").await?;
         tx.commit()
             .await
             .map_err(|source| database_error("commit_prepare_fork", source))?;
@@ -561,7 +561,7 @@ impl DatabaseSessionForkCoordinator {
     ) -> Result<SessionForkManifestV1, SessionForkCoordinatorError> {
         validate_key_and_id(parent_key, fork_id)?;
         validate_duration(grace, MAX_ABORT_GRACE, "retention grace")?;
-        validate_text("abort detail", detail, MAX_REASON_BYTES)?;
+        validate_text("abort detail", detail, SESSION_FORK_REASON_MAX_BYTES)?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_abort_fork", source))?;
@@ -683,7 +683,6 @@ impl DatabaseSessionForkCoordinator {
         .execute(&mut *tx)
         .await
         .map_err(|source| database_error("grace_aborted_fork_pin", source))?;
-        insert_fork_event(&mut tx, &manifest, 1, Some("prepared"), "aborted").await?;
         tx.commit()
             .await
             .map_err(|source| database_error("commit_abort_fork", source))?;
@@ -973,11 +972,6 @@ impl DatabaseSessionForkCoordinator {
                      WHERE isolation_domain = ? AND owner_user_id = ? AND pin_id = ?",
                 ),
                 (
-                    "delete_orphan_fork_events",
-                    "DELETE FROM session_fork_events
-                     WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
-                ),
-                (
                     "delete_orphan_fork",
                     "DELETE FROM session_forks
                      WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
@@ -1017,7 +1011,7 @@ fn validate_prepare_request(
         &request.idempotency_key,
         MAX_IDEMPOTENCY_BYTES,
     )?;
-    validate_text("reason", &request.reason, MAX_REASON_BYTES)?;
+    validate_text("reason", &request.reason, SESSION_FORK_REASON_MAX_BYTES)?;
     if request.parent_key.isolation_domain != request.child_key.isolation_domain
         || request.parent_key.owner_user_id != request.child_key.owner_user_id
         || request.parent_key == request.child_key
@@ -1386,36 +1380,6 @@ async fn lock_fork(
     .ok_or(SessionForkCoordinatorError::NotFound)
 }
 
-async fn insert_fork_event(
-    tx: &mut Transaction<'_, MySql>,
-    manifest: &SessionForkManifestV1,
-    transition_seq: u64,
-    from_state: Option<&str>,
-    to_state: &str,
-) -> Result<(), SessionForkCoordinatorError> {
-    sqlx::query(
-        "INSERT IGNORE INTO session_fork_events
-         (isolation_domain, owner_user_id, fork_id, transition_seq,
-          parent_session_id, child_session_id, from_state, to_state, event_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&manifest.parent_key.isolation_domain)
-    .bind(&manifest.parent_key.owner_user_id)
-    .bind(&manifest.fork_id)
-    .bind(i64::try_from(transition_seq).map_err(|_| {
-        SessionForkCoordinatorError::Invalid("fork transition sequence exceeds BIGINT".into())
-    })?)
-    .bind(&manifest.parent_key.session_id)
-    .bind(&manifest.child_key.session_id)
-    .bind(from_state)
-    .bind(to_state)
-    .bind(to_json("fork_event", manifest)?)
-    .execute(&mut **tx)
-    .await
-    .map_err(|source| database_error("insert_fork_event", source))?;
-    Ok(())
-}
-
 fn validate_key_and_id(
     key: &SessionKeyV1,
     fork_id: &str,
@@ -1728,7 +1692,58 @@ mod tests {
             dimensions: dimensions(&fork_cursor),
             reason: "integration fork".into(),
         };
+        let mut cancelled_request = request.clone();
+        cancelled_request.idempotency_key = "prepare-then-abort".into();
+        cancelled_request.child_key = SessionKeyV1::owner_session(
+            "fork-it",
+            &owner,
+            format!("aborted-child-{suffix}"),
+            "main",
+        );
+        cancelled_request.reason = "inspect the original history".into();
+        let cancelled = service
+            .prepare(&cancelled_request)
+            .await
+            .expect("prepare cancellable fork");
+        let aborted = service
+            .abort(
+                &parent_key,
+                &cancelled.fork_id,
+                Duration::from_secs(60),
+                "user cancelled",
+            )
+            .await
+            .expect("abort fork");
+        assert_eq!(aborted.prepare_reason, cancelled_request.reason);
+        assert_eq!(aborted.status_detail.as_deref(), Some("user cancelled"));
+        assert_eq!(
+            service.load(&parent_key, &cancelled.fork_id).await.unwrap(),
+            aborted
+        );
+        assert_eq!(
+            service
+                .abort(
+                    &parent_key,
+                    &cancelled.fork_id,
+                    Duration::from_secs(60),
+                    "ignored retry"
+                )
+                .await
+                .unwrap(),
+            aborted
+        );
+        crate::session_lifecycle::hard_delete_session(
+            pool.get(),
+            &cancelled_request.child_key.session_id,
+            &owner,
+            None,
+        )
+        .await
+        .expect("delete aborted child");
+
         let prepared = service.prepare(&request).await.expect("prepare fork");
+        assert_eq!(prepared.prepare_reason, request.reason);
+        assert!(prepared.status_detail.is_none());
         assert_eq!(
             service.prepare(&request).await.expect("retry prepare"),
             prepared
@@ -1765,6 +1780,8 @@ mod tests {
             .await
             .expect("activate fork");
         assert_eq!(activation.manifest.state, SessionForkStateV1::Active);
+        assert_eq!(activation.manifest.prepare_reason, request.reason);
+        assert!(activation.manifest.status_detail.is_none());
         let copied_transcript: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
         )

@@ -340,7 +340,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("session_transcript_items", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),
-        ("session_fork_events", "owner_user_id"),
         ("session_forks", "owner_user_id"),
         ("conversation_manifest_pins", "owner_user_id"),
         ("conversation_manifest_nodes", "owner_user_id"),

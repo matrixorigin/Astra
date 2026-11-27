@@ -31,6 +31,19 @@ async fn old_schema_rejects_server_startup_without_touching_pinned_artifacts() {
     ensure_core_schema(&db, &catalog).await.unwrap();
     let pool = SharedPool::new(&db).await.unwrap();
     let contracts = load_core_schema_table_contracts(pool.get()).await.unwrap();
+    // A v126 database can contain the retired fork facts. Reject it without
+    // removing or rewriting the data; schema cutover is never a migration.
+    sqlx::query("CREATE TABLE session_fork_events (fork_id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL)")
+        .execute(pool.get()).await.unwrap();
+    sqlx::query("INSERT INTO session_fork_events VALUES ('existing-fork', 'original reason')")
+        .execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-11-20-v126' WHERE component = 'astra-core'")
+        .execute(pool.get()).await.unwrap();
+    let error = ensure_core_schema(&db, &catalog).await.unwrap_err().to_string();
+    assert!(error.contains("unsupported core schema contract 2026-11-20-v126"), "{error}");
+    let payload: String = sqlx::query_scalar("SELECT payload FROM session_fork_events WHERE fork_id = 'existing-fork'")
+        .fetch_one(pool.get()).await.unwrap();
+    assert_eq!(payload, "original reason");
     // Simulated v116 marker/pin on a fresh v117 fixture, never a migration.
     sqlx::query(
         "ALTER TABLE session_artifacts ADD referenced_by_state_items_count INT NOT NULL DEFAULT 0",

@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-20-v126";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-27-v127";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -3465,30 +3465,6 @@ async fn ensure_core_schema_while_leased(
                 (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, state),
             INDEX idx_session_forks_child_state
                 (isolation_domain, owner_user_id, child_session_id, child_branch_id, state)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "session_fork_events",
-        "CREATE TABLE IF NOT EXISTS session_fork_events (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            fork_id VARCHAR(128) NOT NULL,
-            transition_seq BIGINT NOT NULL,
-            parent_session_id VARCHAR(128) NOT NULL,
-            child_session_id VARCHAR(128) NOT NULL,
-            from_state VARCHAR(32) NULL,
-            to_state VARCHAR(32) NOT NULL,
-            event_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, fork_id, transition_seq),
-            INDEX idx_session_fork_events_parent
-                (isolation_domain, owner_user_id, parent_session_id, created_at),
-            INDEX idx_session_fork_events_child
-                (isolation_domain, owner_user_id, child_session_id, created_at)
         )",
     )
     .execute(&pool)

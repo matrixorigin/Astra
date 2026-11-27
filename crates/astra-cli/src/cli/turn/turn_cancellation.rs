@@ -90,12 +90,8 @@ where
     }
 }
 
-// Settlement owns several independent commit sinks; keeping them explicit
-// makes partial-failure handling auditable at this transaction boundary.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_user_cancelled_turn(
     state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     result: Result<StreamResult, crate::TurnFailure>,
@@ -113,7 +109,6 @@ pub(crate) async fn apply_user_cancelled_turn(
             }
             let turn_persisted = apply_turn_success_async(
                 state,
-                api,
                 profile,
                 line,
                 stream_result,
@@ -198,7 +193,6 @@ mod tests {
             session_id: Some(sid.clone()),
             ..Default::default()
         };
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut ui = crate::tests::TestUi::default();
         let failure = crate::TurnFailure {
             error: "unconfirmed tool-result callback request=req-a".into(),
@@ -211,7 +205,6 @@ mod tests {
         };
         apply_user_cancelled_turn(
             &mut state,
-            &api,
             None,
             "synthetic request",
             Err(failure),
@@ -234,7 +227,6 @@ mod tests {
     #[serial_test::serial]
     async fn cancelled_turn_reports_context_loss_or_uncertainty_to_user() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         for (observation, expected) in [
             (Some(true), Some("history could not be saved")),
             (Some(false), None),
@@ -252,7 +244,6 @@ mod tests {
             };
             apply_user_cancelled_turn(
                 &mut state,
-                &api,
                 None,
                 "request",
                 Err(failure),
@@ -274,14 +265,12 @@ mod tests {
     #[serial_test::serial]
     async fn cancelled_turn_with_success_still_reports_unknown_context() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
         let mut ui = crate::tests::TestUi::default();
         let mut result = crate::tests::stub_stream_result("completed");
         result.cancel_context_not_saved = Some(None);
         apply_user_cancelled_turn(
             &mut state,
-            &api,
             None,
             "request",
             Ok(result),
@@ -317,10 +306,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         apply_user_cancelled_turn(
             &mut state,
-            &api,
             None,
             "explain LoopDispatcher",
             Err(failure),
@@ -375,10 +362,8 @@ mod tests {
         }));
 
         let initial_turn = state.turn;
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         apply_user_cancelled_turn(
             &mut state,
-            &api,
             None,
             "explain LoopDispatcher",
             Ok(stream_result),
@@ -411,10 +396,8 @@ mod tests {
             error: "stream cancelled before first token".into(),
             partial: crate::PartialTurnData::default(),
         };
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         apply_user_cancelled_turn(
             &mut state,
-            &api,
             None,
             "what's in run_lifecycle.rs",
             Err(failure),

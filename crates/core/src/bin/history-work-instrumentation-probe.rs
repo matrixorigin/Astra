@@ -435,7 +435,7 @@ fn measure_anchor(
     let history_hash_ns = elapsed_ns(hash_started);
     let recording_started = Instant::now();
     record_bytes(
-        HistoryWorkSite::CslMessageHash,
+        HistoryWorkSite::LlmWireTraceHash,
         fixture.serialized.len() as u64,
     );
     counter_recording_ns = counter_recording_ns.saturating_add(elapsed_ns(recording_started));

@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub const SESSION_FORK_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_FORK_REASON_MAX_BYTES: usize = 1_024;
 
 /// Provider and workspace authenticated by the server, never a client claim.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,11 +112,13 @@ pub struct SessionForkManifestV1 {
     pub child_key: SessionKeyV1,
     pub parent_head: SessionContextHeadV1,
     /// Immutable scope proof for this exact retained prefix and child identity.
-    /// Older manifests remain readable but cannot establish provider ownership.
+    /// A manifest without this proof cannot establish provider ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_owner: Option<ProviderRunOwner>,
     pub dimensions: Vec<ForkDimensionEvidenceV1>,
     pub excluded_authority: Vec<ForkExcludedAuthorityV1>,
+    /// Original user-supplied reason, retained if the fork is later aborted.
+    pub prepare_reason: String,
     pub state: SessionForkStateV1,
     pub created_at_unix_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,6 +141,12 @@ impl SessionForkManifestV1 {
     pub fn validate(&self) -> Result<(), SessionForkValidationError> {
         if self.schema_version != SESSION_FORK_MANIFEST_SCHEMA_VERSION {
             return Err(SessionForkValidationError::UnsupportedSchema);
+        }
+        if self.prepare_reason.trim().is_empty()
+            || self.prepare_reason.len() > SESSION_FORK_REASON_MAX_BYTES
+            || self.prepare_reason.chars().any(char::is_control)
+        {
+            return Err(SessionForkValidationError::InvalidCoordinate);
         }
         validate_identity(&self.fork_id)?;
         if let Some(owner) = &self.provider_owner {
@@ -364,6 +373,7 @@ mod tests {
                 ForkExcludedAuthorityV1::Mailbox,
                 ForkExcludedAuthorityV1::Invocation,
             ],
+            prepare_reason: "review the captured context".into(),
             state: SessionForkStateV1::Prepared,
             created_at_unix_ms: 1,
             activated_at_unix_ms: None,

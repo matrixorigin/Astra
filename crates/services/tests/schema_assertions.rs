@@ -42,6 +42,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         "user_skill_sources",
         "user_skill_versions",
         "session_state_items",
+        "session_fork_events",
         "model_router_deployments",
         "mcp_tools",
         "skill_user_credentials",
@@ -1740,7 +1741,11 @@ async fn phase1_run_durability_schema_contract() {
         "immutable manifest identity must support a unique hash point lookup",
     );
 
-    for removed in ["conversation_segments", "conversation_manifest_segments"] {
+    for removed in [
+        "conversation_segments",
+        "conversation_manifest_segments",
+        "session_fork_events",
+    ] {
         assert!(
             !table_exists(&pool, &schema, removed).await,
             "retired Context table {removed} must not be created"
@@ -1763,16 +1768,6 @@ async fn phase1_run_durability_schema_contract() {
         primary_key_columns(&pool, &schema, "session_forks").await,
         ["isolation_domain", "owner_user_id", "fork_id"],
         "fork lifecycle identity must remain inside the owner isolation domain"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_fork_events").await,
-        [
-            "isolation_domain",
-            "owner_user_id",
-            "fork_id",
-            "transition_seq"
-        ],
-        "fork transitions must be owner-scoped and monotonically ordered"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "conversation_manifest_pins").await,
