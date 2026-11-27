@@ -161,6 +161,15 @@ pub fn render_provider_failures(snapshot: &IntrospectSnapshot) -> String {
     text
 }
 
+fn provider_failure_summary(snapshot: &IntrospectSnapshot) -> Option<String> {
+    let latest = snapshot.provider_failures.first()?;
+    Some(format!(
+        "Recent model failures in this run: {} (latest: {})",
+        snapshot.provider_failures.len(),
+        latest.error_kind,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JudgmentUsageCoverage {
@@ -870,7 +879,11 @@ pub fn render_introspect_request(
                     IntrospectTextDepth::Full
                 }
             };
-            render_introspect(snapshot, depth)
+            let body = render_introspect(snapshot, depth);
+            match provider_failure_summary(snapshot) {
+                Some(failures) => format!("{failures}\n\n{body}"),
+                None => body,
+            }
         }
         ObservationFacet::Recent | ObservationFacet::Trace => render_recent_rounds(snapshot),
         ObservationFacet::Volatile => render_volatile_pending(snapshot),

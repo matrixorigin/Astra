@@ -14560,6 +14560,16 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let snapshot = build_introspect_snapshot(&state, String::new(), None);
         assert_eq!(snapshot.provider_failures.len(), 2);
         assert!(snapshot.tool_errors.is_empty());
+        for args in [serde_json::json!({}), serde_json::json!({"format":"json"})] {
+            let default_report = astra_turn_core::introspect::render_introspect_request(
+                &snapshot,
+                &astra_turn_core::introspect::IntrospectRequest::from_args(&args),
+            );
+            assert!(
+                default_report
+                    .contains("Recent model failures in this run: 2 (latest: stream_transport)")
+            );
+        }
         let report = astra_turn_core::introspect::render_introspect_request(
             &snapshot,
             &astra_turn_core::introspect::IntrospectRequest::from_args(

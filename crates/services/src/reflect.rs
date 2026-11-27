@@ -48,17 +48,27 @@ const REFLECT_ERROR_PATTERNS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, '')
      GROUP BY COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown'), event_type \
      ORDER BY fail_count DESC LIMIT 10";
 
-const REFLECT_RAW_ERRORS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, event_type, \
-       CASE WHEN event_type = 'turn_error' THEN '' \
+// A verified outbox row stores a serialized JournalEvent. For other turn
+// projections content can be the prompt, so never interpret it as an error.
+// Feed JSON_EXTRACT valid JSON even when a stored payload is malformed.
+const REFLECT_RAW_ERRORS_SQL: &str = "SELECT skill_name, event_type, \
+       CASE WHEN event_type = 'turn_error' THEN SUBSTRING(COALESCE(JSON_UNQUOTE(JSON_EXTRACT( \
+            CASE WHEN JSON_VALID(journal) = 1 THEN journal ELSE '{}' END, '$.error')), ''), 1, 128) \
             ELSE SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) END AS content, \
        CASE WHEN JSON_EXTRACT(metadata, '$.error_kind') IS NULL THEN NULL \
             WHEN JSON_TYPE(JSON_EXTRACT(metadata, '$.error_kind')) = 'STRING' \
              AND OCTET_LENGTH(CAST(JSON_EXTRACT(metadata, '$.error_kind') AS CHAR)) <= 128 \
             THEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.error_kind')) ELSE '' END AS reported_error_kind \
-     FROM agent_events \
-     WHERE session_id = ? AND user_id = ? \
-       AND event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
-     ORDER BY created_at DESC LIMIT 30";
+     FROM (SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, \
+                  event_type, content, metadata, created_at, \
+                  CASE WHEN event_type = 'turn_error' \
+                            AND JSON_EXTRACT(metadata, '$.error_kind') IS NULL \
+                            AND JSON_TYPE(JSON_EXTRACT(metadata, '$.sync_outbox.payload_hash')) = 'STRING' \
+                            AND OCTET_LENGTH(content) <= 65536 THEN content ELSE '{}' END AS journal \
+           FROM agent_events WHERE session_id = ? AND user_id = ? \
+             AND event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
+           ORDER BY created_at DESC LIMIT 30) AS recent_errors \
+     ORDER BY created_at DESC";
 
 const REFLECT_LLM_ROUND_LATENCY_SQL: &str = "SELECT \
        COUNT(*) AS round_count, \
@@ -1790,11 +1800,26 @@ fn error_pattern_from_row(row: &impl ReflectRow) -> ServiceResult<ErrorPattern> 
 
 fn raw_error_from_row(row: &impl ReflectRow) -> ServiceResult<RawError> {
     let context = "raw_error_row";
+    let event_type = reflect_row_required_non_empty_string(row, context, "event_type")?;
+    let mut content = reflect_row_string(row, context, "content")?;
+    let mut reported_error_kind = reflect_row_optional_string(row, context, "reported_error_kind")?;
+    if event_type == "turn_error" {
+        // Only the canonical display tag of a synced journal error is useful
+        // here. The error text itself may contain provider or user content.
+        if reported_error_kind.is_none() {
+            reported_error_kind = content
+                .strip_prefix('[')
+                .and_then(|value| value.split_once(']'))
+                .and_then(|(tag, _)| astra_core::ErrorKind::parse_tag(tag))
+                .map(|kind| kind.as_str().to_owned());
+        }
+        content.clear();
+    }
     Ok(RawError {
         skill_name: reflect_row_required_non_empty_string(row, context, "skill_name")?,
-        event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
-        content: reflect_row_string(row, context, "content")?,
-        reported_error_kind: reflect_row_optional_string(row, context, "reported_error_kind")?,
+        event_type,
+        content,
+        reported_error_kind,
     })
 }
 

@@ -145,8 +145,9 @@ Good diagnostics include cause, scope, affected capability, resumability, and ne
 
 ### Investigating model failures and service activity
 
-Live `introspect` and the local `reflect` fallback expose failed model rounds
-from the current Run's last 512 recorded step events, with at most ten failures.
+The default `introspect` summary shows the recent model failure count and latest
+kind. The errors view and local `reflect` fallback expose at most ten failures
+from the current Run's last 512 recorded step events.
 These are observed attempts, not a complete Session history. A missing provider
 request ID or stream reason is unknown. The provider header request ID is
 distinct from Astra's incoming HTTP request ID, physical attempt ID and model
@@ -161,10 +162,11 @@ selecting `JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.error_kind'))` for failure
 events and a bounded time/order window. `reflect` prefers recognized reported
 error kinds across model and tool failures; an invalid reported kind remains
 unknown instead of being guessed from text. When a tool event lacks a kind,
-its bounded output may still support a heuristic classification. `content` on
-`turn_error` events may be the original user request rather than an error; it
-is not error evidence. Existing retention, sync lag, redaction and source
-coverage still apply.
+its bounded output may still support a heuristic classification. For a verified
+synced Journal event of at most 64 KiB with no reported kind, `reflect` can recover
+the typed prefix of its `error` field. The response omits error prose and never
+classifies ordinary `turn_error` content as an error. Existing retention, sync
+lag, redaction and source coverage still apply.
 
 Service access logs use matched route templates, not raw request paths. Fast
 successful health checks, Session Run polls and Edge heartbeats are DEBUG;

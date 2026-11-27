@@ -6880,6 +6880,78 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         Some(other_drift_assessment_event_id.as_str())
     );
 
+    // Exercise the actual write and read paths for both turn error projections.
+    let events = DatabaseEventService::new(settings).with_pool(shared.clone());
+    let journal_error = astra_services::session_journal::JournalEvent::turn_error(
+        Some(&session_id),
+        2,
+        Some("model"),
+        "[auth] private prompt",
+        "[stream_transport] private provider detail",
+        7,
+    );
+    let payload = serde_json::to_value(&journal_error).unwrap();
+    let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+    let sync_id = astra_services::sync_outbox_stable_event_id(&journal_error, &hash).unwrap();
+    use astra_services::events::EventIngestionSource;
+    let mut failure_ids = Vec::new();
+    for (ingestion_source, event_id, content, metadata) in [
+        (
+            EventIngestionSource::SyncOutbox,
+            Some(sync_id),
+            payload.to_string(),
+            Some(serde_json::json!({"sync_outbox":{"payload_hash":hash}})),
+        ),
+        (
+            EventIngestionSource::Client,
+            None,
+            r#"{"error":"[auth] private prompt"}"#.into(),
+            None,
+        ),
+    ] {
+        let event = events
+            .create_event(
+                owner_user_id.clone(),
+                EventCreateRequestData {
+                    ingestion_source,
+                    event_id,
+                    content,
+                    metadata,
+                    session_id: session_id.clone(),
+                    event_type: "turn_error".into(),
+                    agent_id: None,
+                    agent_version: None,
+                    parent_event_id: None,
+                    parent_event_ids: None,
+                    causal_chain_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        failure_ids.push(event.record.event_id);
+    }
+    let failures = reflect
+        .build_evidence(
+            &owner_user_id,
+            &session_id,
+            astra_services::reflect::ReflectRequest::from_observation_params(
+                Some("execution"),
+                Some("errors"),
+                None,
+                None,
+                10,
+                "",
+            ),
+        )
+        .await
+        .unwrap();
+    let has_diagnosis = |kind| failures.observations.iter().any(|o| o.kind == kind);
+    assert!(has_diagnosis("diagnosis:stream_transport"));
+    assert!(has_diagnosis("diagnosis:unknown"));
+    assert!(!has_diagnosis("diagnosis:auth"));
+    let rendered = serde_json::to_string(&failures).unwrap();
+    assert!(!rendered.contains("private prompt") && !rendered.contains("private provider detail"));
+
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &owner_user_id,
@@ -6891,7 +6963,10 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_legacy_drift_event_id,
             owner_tool_event_id,
             owner_boundary_event_id,
-        ],
+        ]
+        .into_iter()
+        .chain(failure_ids)
+        .collect::<Vec<_>>(),
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(

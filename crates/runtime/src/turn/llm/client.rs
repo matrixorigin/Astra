@@ -14599,89 +14599,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_failure_preserves_boundary_and_upstream_request_identity() {
-        for (body, expected, header, expected_id) in [
-            (
-                "data: {\"text\":\"private marker\n\n",
-                "invalid_sse_frame_json_eof",
-                "req_0123456789abcdef",
-                Some("req_0123456789abcdef"),
-            ),
-            (
-                "data: {\"text\":\"private marker",
-                "invalid_sse_tail_json_eof",
-                "sk-private-credential",
-                None,
-            ),
-        ] {
-            let app = Router::new().route(
-                "/chat/completions",
-                post(move || async move {
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "text/event-stream")
-                        .header("x-request-id", header)
-                        .body(Body::from(body))
-                        .unwrap()
-                }),
-            );
-            let base = spawn_local_http_server(app).await;
-            let messages = [json!({"role":"user", "content":"fixture"})];
-            let call = trace_fixture_call(&messages, &base, "openai");
-            let error = call_trace_fixture(call, true, None).await.unwrap_err();
-            assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
-            let details: Value =
-                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
-            assert_eq!(details["stream_failure_reason"], expected);
-            assert_eq!(
-                details.get("request_id").and_then(Value::as_str),
-                expected_id
-            );
-            assert!(!error.message.contains("private marker"));
-            assert!(!format!("{error:?}").contains("sk-private-credential"));
-        }
-    }
-
-    #[tokio::test]
-    async fn responses_stream_failure_preserves_boundary_and_request_identity() {
-        for (body, expected) in [
-            (
-                "data: {\"text\":\"private marker\n\n",
-                "invalid_sse_frame_json_eof",
-            ),
-            (
-                "data: {\"text\":\"private marker",
-                "invalid_sse_tail_json_eof",
-            ),
-        ] {
-            let app = Router::new().route(
-                "/responses",
-                post(move || async move {
-                    Response::builder()
-                        .status(200)
-                        .header("content-type", "text/event-stream")
-                        .header("x-request-id", "req_0123456789abcdef")
-                        .body(Body::from(body))
-                        .unwrap()
-                }),
-            );
-            let base = spawn_local_http_server(app).await;
-            let messages = [json!({"role":"user", "content":"fixture"})];
-            let mut call = trace_fixture_call(&messages, &base, "openai");
-            call.route.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
-            call.route.response_scope = Some("scope");
-            call.thinking = &ThinkingConfig::ModelDefault;
-            let error = call_trace_fixture(call, true, None).await.unwrap_err();
-            assert_eq!(
-                error.kind,
-                astra_core::ErrorKind::StreamTransport,
-                "{error:?}"
-            );
-            let details: Value =
-                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
-            assert_eq!(details["stream_failure_reason"], expected);
-            assert_eq!(details["request_id"], "req_0123456789abcdef");
-            assert!(!format!("{error:?}").contains("private marker"));
+    async fn provider_stream_failure_preserves_boundary_and_request_identity() {
+        for (path, responses) in [("/chat/completions", false), ("/responses", true)] {
+            for (body, expected, header, expected_id) in [
+                (
+                    "data: {\"text\":\"private marker\n\n",
+                    "invalid_sse_frame_json_eof",
+                    "req_0123456789abcdef",
+                    Some("req_0123456789abcdef"),
+                ),
+                (
+                    "data: {\"text\":\"private marker",
+                    "invalid_sse_tail_json_eof",
+                    "sk-private-credential",
+                    None,
+                ),
+            ] {
+                let app = Router::new().route(
+                    path,
+                    post(move || async move {
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .header("x-request-id", header)
+                            .body(Body::from(body))
+                            .unwrap()
+                    }),
+                );
+                let base = spawn_local_http_server(app).await;
+                let messages = [json!({"role":"user", "content":"fixture"})];
+                let mut call = trace_fixture_call(&messages, &base, "openai");
+                if responses {
+                    call.route.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
+                    call.route.response_scope = Some("scope");
+                    call.thinking = &ThinkingConfig::ModelDefault;
+                }
+                let error = call_trace_fixture(call, true, None).await.unwrap_err();
+                assert_eq!(
+                    error.kind,
+                    astra_core::ErrorKind::StreamTransport,
+                    "{path}: {error:?}"
+                );
+                let details: Value =
+                    serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+                assert_eq!(details["stream_failure_reason"], expected);
+                assert_eq!(
+                    details.get("request_id").and_then(Value::as_str),
+                    expected_id
+                );
+                let diagnostic = format!("{error:?}");
+                assert!(!diagnostic.contains("private marker"));
+                assert!(!diagnostic.contains("sk-private-credential"));
+            }
         }
     }
 

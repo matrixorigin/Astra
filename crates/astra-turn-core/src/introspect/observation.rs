@@ -766,7 +766,7 @@ fn introspect_data_coverage(
 }
 
 fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {
-    let summary = match request.facet {
+    let mut summary = match request.facet {
         ObservationFacet::Errors => {
             if snapshot.tool_errors.is_empty() {
                 "No recent tool errors recorded".to_string()
@@ -798,7 +798,7 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
                     |value| format!("{value:.0}%"),
                 );
                 format!(
-                    "Runtime snapshot healthy - pressure {}, prompt_cache_read_share {} (scope=current_runtime_snapshot), turns {}",
+                    "Runtime snapshot - pressure {}, prompt_cache_read_share {} (scope=current_runtime_snapshot), turns {}",
                     pressure,
                     cache_share,
                     turn_budget_label(snapshot),
@@ -806,6 +806,13 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
             },
         ),
     };
+    if matches!(
+        request.facet,
+        ObservationFacet::Errors | ObservationFacet::Session | ObservationFacet::Overview
+    ) && let Some(failures) = super::provider_failure_summary(snapshot)
+    {
+        summary = format!("{failures}. {summary}");
+    }
     if matches!(
         request.facet,
         ObservationFacet::Session | ObservationFacet::Overview
@@ -850,7 +857,7 @@ fn composite_diagnostic_summary(snapshot: &IntrospectSnapshot) -> String {
     }
 
     if snapshot.tool_errors.is_empty() {
-        summary.push_str(" errors_live=none");
+        summary.push_str(" tool_errors_live=none");
     } else {
         let samples = snapshot
             .tool_errors
