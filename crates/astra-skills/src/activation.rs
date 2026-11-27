@@ -53,17 +53,38 @@ fn glob_match_parts(pattern: &[&str], path: &[&str]) -> bool {
 /// Match one path segment against a pattern where `*` matches any run of
 /// characters within the segment and `?` matches exactly one character.
 fn segment_matches(pattern: &str, segment: &str) -> bool {
+    let is_wild = |c: char| c == '*' || c == '?';
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains(is_wild) {
+        return pattern == segment;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && !suffix.contains(is_wild)
+    {
+        return segment.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && !prefix.contains(is_wild)
+    {
+        return segment.starts_with(prefix);
+    }
+    wildcard_segment_matches(pattern, segment)
+}
+
+fn wildcard_segment_matches(pattern: &str, segment: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = segment.chars().collect();
     let (mut pi, mut ti) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while ti < txt.len() {
-        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pat.len() && pat[pi] == '*' {
+        if pi < pat.len() && pat[pi] == '*' {
             star = Some((pi, ti));
             pi += 1;
+        } else if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
         } else if let Some((star_pi, star_ti)) = star {
             pi = star_pi + 1;
             ti = star_ti + 1;
@@ -183,6 +204,14 @@ mod tests {
         assert!(!glob_match("**/*.test.*", "src/app/button.tsx"));
         assert!(!glob_match("src/*.rs", "src/sub/main.rs"));
         assert!(!glob_match("src/mod?.rs", "src/mod12.rs"));
+    }
+
+    #[test]
+    fn glob_match_star_before_literal_star_in_path() {
+        assert!(glob_match("*.rs", "*foo.rs"));
+        assert!(glob_match("src/**/*.rs", "src/a/*foo.rs"));
+        assert!(glob_match("**/*.test.*", "src/*x.test.ts"));
+        assert!(glob_match("*_*.sql", "*_init.sql"));
     }
 
     #[test]
