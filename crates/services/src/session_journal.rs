@@ -3694,33 +3694,50 @@ pub fn read_journal_append_order(session_id: &str) -> std::io::Result<Vec<Journa
 /// writer may have opened or partially written its final line; leaving that
 /// suffix for the next pass prevents a derived projection from recording a
 /// malformed or half-written event and then advancing past it.
-#[derive(Debug, Clone)]
-pub struct JournalAppendDelta {
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct JournalAppendDelta {
     pub events: Vec<JournalEvent>,
     pub next_offset: u64,
 }
 
-pub fn read_durable_journal_append_delta(
+#[cfg(test)]
+pub(crate) fn read_durable_journal_append_delta(
     session_id: &str,
     offset: u64,
 ) -> std::io::Result<JournalAppendDelta> {
-    read_durable_journal_append_delta_for_owner(&OwnerScope::local_user(), session_id, offset)
+    let mut events = Vec::new();
+    let next_offset = visit_durable_journal_append_delta_for_owner(
+        &OwnerScope::local_user(),
+        session_id,
+        offset,
+        |event| {
+            events.push(event);
+            Ok(())
+        },
+    )?;
+    Ok(JournalAppendDelta {
+        events,
+        next_offset,
+    })
 }
 
-pub fn read_durable_journal_append_delta_for_owner(
+/// Visit complete records from one durable snapshot in physical append order.
+/// The callback's results are provisional until this function succeeds. A
+/// partial final line is left at the returned cursor.
+pub(crate) fn visit_durable_journal_append_delta_for_owner(
     owner_scope: &OwnerScope,
     session_id: &str,
     offset: u64,
-) -> std::io::Result<JournalAppendDelta> {
+    mut visit: impl FnMut(JournalEvent) -> std::io::Result<()>,
+) -> std::io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
 
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_file_path_for_owner(owner_scope, session_id)?;
-    // Hold the same exclusive file lock used by appenders while establishing
-    // the durability barrier and reading the suffix. Without this, an appender
-    // could add no-sync bytes after sync_data but before read_to_end, allowing
-    // a derived outbox cursor to advance beyond the crash-durable journal.
+    // Copy a crash-durable snapshot under the appender's lock. Maintenance
+    // cannot retire its source before the snapshot is owned by this reader.
     let mut file = match lock_current_journal_file(&path, |path| {
         std::fs::OpenOptions::new()
             .read(true)
@@ -3729,14 +3746,10 @@ pub fn read_durable_journal_append_delta_for_owner(
     }) {
         Ok(file) => file,
         Err(error) if offset == 0 && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(JournalAppendDelta {
-                events: Vec::new(),
-                next_offset: 0,
-            });
+            return Ok(0);
         }
         Err(error) => return Err(error),
     };
-    file.sync_data()?;
     let len = file.metadata()?.len();
     if offset > len {
         return Err(std::io::Error::new(
@@ -3746,34 +3759,57 @@ pub fn read_durable_journal_append_delta_for_owner(
             ),
         ));
     }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut suffix = Vec::new();
-    file.read_to_end(&mut suffix)?;
-    let complete_len = suffix
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    if complete_len == 0 {
-        record_journal_read(
-            astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
-            suffix.len(),
-            0,
-        );
-        return Ok(JournalAppendDelta {
-            events: Vec::new(),
-            next_offset: offset,
-        });
+    // There is no new source data to certify when the durable cursor is at
+    // EOF. This is the common case during a recovery scan of idle sessions.
+    if offset == len {
+        return Ok(offset);
     }
-    let complete = std::str::from_utf8(&suffix[..complete_len]).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("journal {session_id} contains non-UTF-8 JSONL: {error}"),
-        )
-    })?;
-    let mut events = Vec::new();
-    for (line_index, line) in complete.lines().enumerate() {
-        let line = line.trim();
+    file.sync_data()?;
+
+    // Locate the last complete record with a fixed buffer. A torn, enormous
+    // tail is never allocated merely to learn that it has no terminating LF.
+    let mut end = len;
+    let mut buf = [0_u8; 32 * 1024];
+    let mut scanned_bytes = 0_u64;
+    let complete_end = loop {
+        if end == offset {
+            break offset;
+        }
+        let bytes = usize::try_from((end - offset).min(buf.len() as u64)).unwrap();
+        let start = end - bytes as u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..bytes])?;
+        scanned_bytes += bytes as u64;
+        if let Some(index) = buf[..bytes].iter().rposition(|byte| *byte == b'\n') {
+            break start + index as u64 + 1;
+        }
+        end = start;
+    };
+
+    let snapshot_len = usize::try_from(complete_end - offset)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve_exact(snapshot_len)
+        .map_err(std::io::Error::other)?;
+    snapshot.resize(snapshot_len, 0);
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut snapshot)?;
+    drop(file);
+
+    let mut event_count = 0_usize;
+    for (line_index, line) in snapshot.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line = std::str::from_utf8(line)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "journal {session_id} contains non-UTF-8 JSONL at append line {}: {error}",
+                        line_index + 1
+                    ),
+                )
+            })?
+            .trim();
         if line.is_empty() {
             continue;
         }
@@ -3786,17 +3822,15 @@ pub fn read_durable_journal_append_delta_for_owner(
                 ),
             )
         })?;
-        events.push(event);
+        visit(event)?;
+        event_count += 1;
     }
     record_journal_read(
         astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
-        suffix.len(),
-        events.len(),
+        usize::try_from(scanned_bytes.saturating_add(snapshot_len as u64)).unwrap_or(usize::MAX),
+        event_count,
     );
-    Ok(JournalAppendDelta {
-        events,
-        next_offset: offset.saturating_add(complete_len as u64),
-    })
+    Ok(complete_end)
 }
 
 /// Rotation-aware cursor used by approval waiters.
@@ -8262,6 +8296,152 @@ fn compress_journal(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn durable_projection_keeps_partial_tail_until_completed() {
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let session = "projection-partial-tail";
+        let path = journal_file_path(session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first =
+            serde_json::to_vec(&JournalEvent::config_change(Some(session), "model", "a")).unwrap();
+        let large_value = "b".repeat(128 * 1024);
+        let second = serde_json::to_vec(&JournalEvent::config_change(
+            Some(session),
+            "model",
+            &large_value,
+        ))
+        .unwrap();
+        let split = second.len() / 2;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&first).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.write_all(&second[..split]).unwrap();
+        file.sync_data().unwrap();
+
+        let mut seen = Vec::new();
+        let cursor = visit_durable_journal_append_delta_for_owner(
+            &OwnerScope::local_user(),
+            session,
+            0,
+            |event| {
+                seen.push(event.config_value.unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, ["a"]);
+        assert_eq!(cursor, first.len() as u64 + 1);
+
+        file.write_all(&second[split..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        let next = read_durable_journal_append_delta(session, cursor).unwrap();
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(
+            next.events[0].config_value.as_deref(),
+            Some(large_value.as_str())
+        );
+        assert_eq!(next.next_offset, std::fs::metadata(path).unwrap().len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_projection_allows_appends_and_keeps_its_snapshot_fence() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let session = "projection-concurrent-append";
+        let path = journal_file_path(session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first = JournalEvent::config_change(Some(session), "model", "first");
+        let second = JournalEvent::config_change(Some(session), "model", "second");
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+        let initial_len = std::fs::metadata(&path).unwrap().len();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .unwrap();
+            fs2::FileExt::lock_exclusive(&file).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&second).unwrap()).unwrap();
+            drop(file);
+            done_tx.send(()).unwrap();
+        });
+        let mut values = Vec::new();
+        let cursor = visit_durable_journal_append_delta_for_owner(
+            &OwnerScope::local_user(),
+            session,
+            0,
+            |event| {
+                start_tx.send(()).unwrap();
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                values.push(event.config_value.unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+        writer.join().unwrap();
+        assert_eq!(values, ["first"]);
+        assert_eq!(cursor, initial_len);
+        let later = read_durable_journal_append_delta(session, cursor).unwrap();
+        assert_eq!(later.events[0].config_value.as_deref(), Some("second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_projection_retains_snapshot_after_real_journal_archival() {
+        let dir = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let session = "projection-replaced";
+        let path = journal_file_path(session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let event = JournalEvent::config_change(Some(session), "model", "first");
+        let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+        std::fs::write(&path, &line).unwrap();
+        let expected_offset = line.len() as u64;
+        let mut seen = Vec::new();
+        let cursor = visit_durable_journal_append_delta_for_owner(
+            &OwnerScope::local_user(),
+            session,
+            0,
+            |event| {
+                let threshold = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+                assert!(compress_journal(
+                    path.parent().unwrap(),
+                    session,
+                    threshold
+                )?);
+                seen.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(cursor, expected_offset);
+        assert_eq!(seen[0].config_value.as_deref(), Some("first"));
+        assert!(!path.exists());
+        assert!(path.with_extension("jsonl.gz").exists());
+        let store = crate::sync_outbox::SyncOutboxStore::local();
+        store
+            .append_journal_delta(session, 0, cursor, &seen)
+            .unwrap();
+        assert_eq!(store.journal_source_offset(session).unwrap(), cursor);
+        assert_eq!(store.ready_records(10).unwrap().len(), 1);
+    }
 
     #[test]
     fn observation_window_distinguishes_missing_empty_and_clipped_records() {
