@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-27-v127";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-27-v128";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -3813,44 +3813,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "semantic_read_observation_budgets",
-        "CREATE TABLE IF NOT EXISTS semantic_read_observation_budgets (
-            user_id             VARCHAR(128) NOT NULL,
-            session_id          VARCHAR(128) NOT NULL,
-            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "semantic_read_observations",
-        "CREATE TABLE IF NOT EXISTS semantic_read_observations (
-            user_id             VARCHAR(128) NOT NULL,
-            session_id          VARCHAR(128) NOT NULL,
-            key_id              VARCHAR(71) NOT NULL,
-            key_json            JSON NOT NULL,
-            state               VARCHAR(16) NOT NULL,
-            fill_owner          VARCHAR(64) NULL,
-            fill_lease_expires_at DATETIME(6) NULL,
-            observation_json    JSON NULL,
-            observation_bytes   BIGINT UNSIGNED NULL,
-            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            last_accessed_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, key_id),
-            INDEX idx_semantic_read_observations_session_state_access
-                (user_id, session_id, state, last_accessed_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──
     core_schema_create!(
         pool,
@@ -4255,45 +4217,7 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_model_request_context_owner_session_created
                 (user_id, session_id, created_at, event_id),
             INDEX idx_model_request_context_created_event
-                (created_at, event_id),
-            INDEX idx_model_request_context_metrics
-                (topology, provider, model_family, purpose, created_at),
-            INDEX idx_model_request_context_terminal_status
-                (terminal_status, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Terminal request metrics are accumulated transactionally with their
-    // append-only event. Scrapers read this bounded low-cardinality
-    // projection instead of repeatedly scanning every historical request.
-    core_schema_create!(
-        pool,
-        "model_request_metric_shards",
-        "CREATE TABLE IF NOT EXISTS model_request_metric_shards (
-            metric_shard SMALLINT NOT NULL,
-            topology VARCHAR(32) NOT NULL,
-            provider VARCHAR(64) NOT NULL,
-            model_family VARCHAR(128) NOT NULL,
-            purpose VARCHAR(64) NOT NULL,
-            terminal_status VARCHAR(32) NOT NULL,
-            requests BIGINT NOT NULL DEFAULT 0,
-            input_tokens BIGINT NOT NULL DEFAULT 0,
-            output_tokens BIGINT NOT NULL DEFAULT 0,
-            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
-            cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY
-                (metric_shard, topology, provider, model_family, purpose, terminal_status),
-            CONSTRAINT chk_model_request_metric_shard
-                CHECK (metric_shard >= 0 AND metric_shard < 64),
-            CONSTRAINT chk_model_request_metric_terminal
-                CHECK (terminal_status IN
-                    ('succeeded', 'failed', 'cancelled', 'delivery_unknown')),
-            CONSTRAINT chk_model_request_metric_nonnegative
-                CHECK (requests >= 0 AND input_tokens >= 0 AND output_tokens >= 0
-                    AND cache_read_tokens >= 0 AND cache_creation_tokens >= 0)
+                (created_at, event_id)
         )",
     )
     .execute(&pool)

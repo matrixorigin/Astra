@@ -199,6 +199,21 @@ The standalone Agent configuration catalog and its CRUD service are retired.
 Edge registration, heartbeat, AgentBindings and Run execution retain their
 canonical owners; no replacement Agent metadata projection is stored.
 
+## Optional database projections
+
+Fresh schema contract `2026-11-27-v128` removes the model request metric
+shards, two unused request-context indexes, and the semantic read observation
+and budget tables. Inference settlement and recovery write canonical evidence
+without an aggregate upsert. The dashboard reads existing process-local
+counters. Exact historical usage queries retain their Run and inference
+ledger sources.
+
+The existing executor-local cache owns optional MCP pure-read reuse. A hit
+does no cache SQL and can still complete the exact invocation in the existing
+tool ledger. Ending the executor releases its cache. Session deletion has no
+cache-table cleanup. A v127 database requires replacement under the existing
+fresh-schema contract.
+
 ## Session-memory recovery journal
 
 Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed
@@ -211,6 +226,10 @@ its queued inputs through the existing deletion catalog.
 Ordinary turns create no memory-journal row or input snapshot. Explicit Session
 close/finalize enqueues maintenance; its worker materializes the latest canonical
 Context through the existing coordinator before freezing extraction input.
+A committed HTTP close or finalize wakes that pod's existing worker. Without
+due work the recovery scan runs every 30 seconds to cover other pods, missed
+hints, and timed retries. When it finds due work it keeps the two-second cadence
+and the existing scan and execution limits.
 
 Completed extraction drops its input transcript; publication coordinates and
 facts survive independently. Only fully successful governance retires replay

@@ -395,7 +395,6 @@ fn char_literal() { let slash = '/'; }
             "run_checkpoints",
             "session_transcript_items",
             "tool_invocation_ledger",
-            "semantic_read_observations",
         }
         for table in first_batch:
             with self.subTest(table=table):

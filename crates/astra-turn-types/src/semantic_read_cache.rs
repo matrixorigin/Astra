@@ -460,7 +460,7 @@ pub struct SemanticReadObservation {
 pub enum SemanticReadCacheLookup {
     Hit(Box<SemanticReadObservation>),
     FillClaimed,
-    FillInProgress { lease_expires_at_epoch_ms: u64 },
+    FillInProgress { lease_expires_at_ms: u64 },
     FillCapacityExceeded,
 }
 

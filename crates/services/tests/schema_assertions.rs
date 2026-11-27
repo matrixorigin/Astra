@@ -793,6 +793,9 @@ async fn schema_rationalization_runtime_contract() {
         "harness_snapshots",
         "session_state_item_events",
         "user_skill_evaluations",
+        "model_request_metric_shards",
+        "semantic_read_observations",
+        "semantic_read_observation_budgets",
         "prompt_chunks",
         "harness_sources",
         "harness_decisions",
@@ -832,39 +835,6 @@ async fn schema_rationalization_runtime_contract() {
         primary_key_columns(&pool, &schema, "model_request_context_events").await,
         ["user_id", "event_id"],
         "model request context events must remain owner scoped"
-    );
-    let request_metric_totals = column_names(&pool, &schema, "model_request_metric_shards").await;
-    for expected in [
-        "metric_shard",
-        "topology",
-        "provider",
-        "model_family",
-        "purpose",
-        "terminal_status",
-        "requests",
-        "input_tokens",
-        "output_tokens",
-        "cache_read_tokens",
-        "cache_creation_tokens",
-    ] {
-        assert!(
-            request_metric_totals
-                .iter()
-                .any(|column| column == expected),
-            "model_request_metric_shards missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "model_request_metric_shards").await,
-        [
-            "metric_shard",
-            "topology",
-            "provider",
-            "model_family",
-            "purpose",
-            "terminal_status"
-        ],
-        "model request metric totals must remain bounded to explicit low-cardinality dimensions"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "agent_sessions").await,
@@ -2209,27 +2179,6 @@ async fn phase2_web_hydration_schema_contract() {
             "last_identity_key"
         ],
         "archived invocation replay must resolve one bounded identity-key range"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "semantic_read_observations").await,
-        ["user_id", "session_id", "key_id"],
-        "semantic observations must be owner/session scoped and content addressed"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "semantic_read_observation_budgets").await,
-        ["user_id", "session_id"],
-        "semantic cache aggregate accounting must use its own owner/session lock instead of the session authority row"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "semantic_read_observations",
-            "idx_semantic_read_observations_session_state_access"
-        )
-        .await,
-        ["user_id", "session_id", "state", "last_accessed_at"],
-        "capacity and deterministic LRU operations require one session/state/access index"
     );
 }
 

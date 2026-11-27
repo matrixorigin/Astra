@@ -1153,7 +1153,6 @@ impl RuntimeToolExecutor {
             );
         }
         let store = crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore::new(
-            self.service_pool.clone(),
             limits,
         )
         .map_err(|error| error.to_string())?;
@@ -1228,7 +1227,6 @@ impl RuntimeToolExecutor {
         }
         self.semantic_read_observation_store = Some(
             crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore::new(
-                self.service_pool.clone(),
                 limits,
             )
             .map_err(|error| error.to_string())?,

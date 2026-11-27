@@ -194,6 +194,7 @@ pub struct AppState {
     pub(crate) memoria_self_hosted_fallback_enabled: bool,
     memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
     memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) session_memory_wakeup: Arc<tokio::sync::Notify>,
     pub shared_pool: Option<SharedPool>,
     /// Auxiliary database pools owned by the application lifecycle, such as
     /// the bounded control-plane reservation used by auth and health checks.
@@ -301,6 +302,7 @@ impl AppState {
                 MemoriaHealth::Disabled,
             ))),
             memoria_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            session_memory_wakeup: Arc::new(tokio::sync::Notify::new()),
             shared_pool: None,
             auxiliary_pools: Vec::new(),
             matrix_cloud_runtime: None,

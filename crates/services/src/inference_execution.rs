@@ -646,10 +646,6 @@ fn checked_optional_i64(value: Option<u64>, label: &str) -> ServiceResult<Option
     value.map(|value| checked_i64(value, label)).transpose()
 }
 
-fn model_request_metric_shard(attempt_id: &str) -> i16 {
-    i16::from(Sha256::digest(attempt_id.as_bytes())[0] % 64)
-}
-
 fn model_request_accepted_event(
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<(String, String, ModelRequestContextEvent)> {
@@ -856,57 +852,6 @@ async fn insert_model_request_context_event(
     if stage == ModelRequestEventStage::Terminal {
         compact_model_request_context_scope(connection, &attempt.user_id, session_id).await?;
     }
-    // Count every terminal request, including failures with unavailable
-    // usage. Token sums contain observed usage only; coverage remains in the
-    // per-request usage_status and must be checked before estimating cost.
-    if let Some(status) = terminal_status {
-        sqlx::query(
-            "INSERT INTO model_request_metric_shards
-             (metric_shard, topology, provider, model_family, purpose, terminal_status,
-              requests, input_tokens, output_tokens, cache_read_tokens,
-              cache_creation_tokens, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NOW(6))
-             ON DUPLICATE KEY UPDATE
-              requests = requests + 1,
-              input_tokens = input_tokens + VALUES(input_tokens),
-              output_tokens = output_tokens + VALUES(output_tokens),
-              cache_read_tokens = cache_read_tokens + VALUES(cache_read_tokens),
-              cache_creation_tokens =
-                  cache_creation_tokens + VALUES(cache_creation_tokens),
-              updated_at = NOW(6)",
-        )
-        .bind(model_request_metric_shard(&attempt.attempt_id))
-        .bind(attempt.request_context.topology.as_str())
-        .bind(&attempt.invocation_input.provider)
-        .bind(model_family)
-        .bind(attempt.invocation_input.purpose.as_str())
-        .bind(status)
-        .bind(checked_i64(
-            usage.map_or(0, ModelRequestUsage::total_input_tokens),
-            "model request metric input_tokens",
-        )?)
-        .bind(checked_i64(
-            usage.map_or(0, |usage| usage.output_tokens),
-            "model request metric output_tokens",
-        )?)
-        .bind(checked_i64(
-            usage.map_or(0, |usage| usage.input.cache_read_tokens),
-            "model request metric cache_read_tokens",
-        )?)
-        .bind(checked_i64(
-            usage.map_or(0, |usage| usage.input.cache_creation_tokens),
-            "model request metric cache_creation_tokens",
-        )?)
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "accumulate model request metrics",
-                error,
-            )
-        })?;
-    }
     Ok(())
 }
 
@@ -1096,32 +1041,6 @@ async fn insert_recovered_model_request_terminal_tx(
         .bind(event_json)
         .execute(&mut *connection)
         .await?;
-    sqlx::query(
-        "INSERT INTO model_request_metric_shards
-         (metric_shard, topology, provider, model_family, purpose, terminal_status,
-          requests, input_tokens, output_tokens, cache_read_tokens,
-          cache_creation_tokens, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NOW(6))
-         ON DUPLICATE KEY UPDATE
-          requests = requests + 1,
-          input_tokens = input_tokens + VALUES(input_tokens),
-          output_tokens = output_tokens + VALUES(output_tokens),
-          cache_read_tokens = cache_read_tokens + VALUES(cache_read_tokens),
-          cache_creation_tokens = cache_creation_tokens + VALUES(cache_creation_tokens),
-          updated_at = NOW(6)",
-    )
-    .bind(model_request_metric_shard(attempt_id))
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(model_family)
-    .bind(&event.identity.inference_purpose)
-    .bind(&terminal.status)
-    .bind(total_input_tokens.unwrap_or(0))
-    .bind(output_tokens.unwrap_or(0))
-    .bind(cache_read_tokens.unwrap_or(0))
-    .bind(cache_creation_tokens.unwrap_or(0))
-    .execute(&mut *connection)
-    .await?;
     Ok(())
 }
 
@@ -6834,7 +6753,6 @@ mod tests {
             .bind(&session).bind(&user).execute(pool.get()).await.unwrap();
         let mut request = input();
         request.user_id = user.clone();
-        request.provider = format!("delayed-{user}");
         request.run_authority = None;
         request.scope = InferenceInvocationScope::Session {
             session_id: session.clone(),
@@ -6905,12 +6823,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let requests: i64 = sqlx::query_scalar("SELECT CAST(SUM(requests) AS SIGNED) FROM model_request_metric_shards WHERE provider=?")
-            .bind(&request.provider).fetch_one(pool.get()).await.unwrap();
-        assert_eq!(
-            requests, 1,
-            "a delayed reconciler cannot recreate accounting"
-        );
         for table in [
             "model_request_context_events",
             "inference_provider_attempts",
@@ -6927,11 +6839,6 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
-            .bind(&request.provider)
-            .execute(pool.get())
-            .await
-            .unwrap();
         pool.close().await;
     }
 
