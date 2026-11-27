@@ -103,7 +103,6 @@ impl DurableInferenceRunAuthority {
         }
     }
 
-    #[cfg(any(test, feature = "e2e-hooks"))]
     pub(crate) fn observed_authority(&self) -> &astra_services::InferenceRunAdmissionAuthority {
         &self.durable
     }
@@ -2742,7 +2741,21 @@ fn plan_provider_attempt(
     wire: &ProviderWireRequestIdentity,
     request_context: astra_services::ModelRequestContextSeed,
 ) -> Result<astra_services::InferenceProviderAttemptPlan, astra_core::ClassifiedError> {
-    let service_wire = astra_services::InferenceProviderWireIdentity::new(
+    let service_wire = service_wire_identity(wire)?;
+    Ok(
+        astra_services::plan_inference_provider_attempt_with_context(
+            invocation,
+            attempt_index,
+            service_wire,
+            request_context,
+        ),
+    )
+}
+
+pub(crate) fn service_wire_identity(
+    wire: &ProviderWireRequestIdentity,
+) -> Result<astra_services::InferenceProviderWireIdentity, astra_core::ClassifiedError> {
+    Ok(astra_services::InferenceProviderWireIdentity::new(
         wire.protocol.as_str(),
         wire.provider_wire_hash.clone(),
         wire.provider_wire_bytes,
@@ -2756,15 +2769,7 @@ fn plan_provider_attempt(
         system_items: wire.composition.system_items,
         conversation_items: wire.composition.conversation_items,
         tool_schema_items: wire.composition.tool_schema_items,
-    });
-    Ok(
-        astra_services::plan_inference_provider_attempt_with_context(
-            invocation,
-            attempt_index,
-            service_wire,
-            request_context,
-        ),
-    )
+    }))
 }
 
 #[derive(Clone)]
@@ -4751,6 +4756,7 @@ mod tests {
     ) -> DurableInferenceLedger {
         let execution = astra_services::AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -5025,6 +5031,7 @@ mod tests {
             cache_capability: None,
             route: crate::turn::llm::client::LlmExecutionRoute {
                 usage_attestation: None,
+                device_binding: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,

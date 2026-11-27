@@ -228,7 +228,7 @@ impl UcNativeProvider {
     }
 
     pub(crate) async fn json_bounded<T: DeserializeOwned>(
-        mut response: reqwest::Response,
+        response: reqwest::Response,
         limit: usize,
     ) -> Result<T, AuthHttpError> {
         if response.status() == StatusCode::UNAUTHORIZED {
@@ -237,6 +237,15 @@ impl UcNativeProvider {
         if !response.status().is_success() {
             return Err(unavailable());
         }
+        Self::json_body_bounded(response, limit).await
+    }
+
+    /// Decode only after the caller has classified the HTTP status. This also
+    /// bounds structured dependency error envelopes without exposing raw bodies.
+    pub(crate) async fn json_body_bounded<T: DeserializeOwned>(
+        mut response: reqwest::Response,
+        limit: usize,
+    ) -> Result<T, AuthHttpError> {
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
             if body.len() + chunk.len() > limit {
@@ -278,6 +287,62 @@ impl UcNativeProvider {
             return Err(invalid());
         }
         Ok(identity)
+    }
+
+    /// Reauthorize the original native login without retaining a client token
+    /// in Run/binding storage. UC remains the only session-liveness authority.
+    pub(crate) async fn verify_session(
+        &self,
+        subject: &str,
+        session_id: &str,
+    ) -> Result<(), AuthHttpError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            code: String,
+            data: Session,
+        }
+        #[derive(Deserialize)]
+        struct Session {
+            issuer: String,
+            subject: String,
+            session_id: String,
+            client_id: String,
+            audience: String,
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v1/uc/internal/native-sessions/validate",
+                self.settings.adapter_url
+            ))
+            .bearer_auth(self.service_bearer().await?)
+            .json(&serde_json::json!({"subject": subject, "session_id": session_id}))
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            #[derive(Deserialize)]
+            struct Failure {
+                code: String,
+            }
+            let error: Failure = Self::json_body_bounded(response, 4096).await?;
+            return Err(if error.code == "ErrNativeSessionInvalid" {
+                invalid()
+            } else {
+                unavailable()
+            });
+        }
+        let result: Envelope = Self::json(response).await?;
+        if result.code != "OK"
+            || result.data.issuer != self.settings.issuer
+            || result.data.subject != subject
+            || result.data.session_id != session_id
+            || result.data.client_id != "astra-cli"
+            || result.data.audience != "astra-api"
+        {
+            return Err(unavailable());
+        }
+        Ok(())
     }
 }
 
@@ -329,6 +394,87 @@ impl DatabaseAuthService {
 mod memory_tests {
     use super::*;
     use astra_core::{JwtSettings, MatrixOneSettings, MemoriaSettings};
+
+    #[tokio::test]
+    async fn original_session_is_verified_online_and_never_replaced_by_service_identity() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{Arc, Mutex};
+        let response = Arc::new(Mutex::new((StatusCode::OK, serde_json::json!({}))));
+        let app = Router::new()
+            .route("/realms/moi/protocol/openid-connect/token", post(|| async {
+                Json(serde_json::json!({"access_token":"synthetic-service", "token_type":"Bearer", "expires_in":300}))
+            }))
+            .route("/api/v1/uc/internal/native-sessions/validate", post(|State(state): State<Arc<Mutex<(StatusCode, serde_json::Value)>>>, headers: HeaderMap, Json(input): Json<serde_json::Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer synthetic-service");
+                assert_eq!(input, serde_json::json!({"subject":"owner", "session_id":"original-session"}));
+                let (status, value) = state.lock().unwrap().clone();
+                (status, Json(value))
+            })).with_state(response.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let issuer = format!("{origin}/realms/moi");
+        let provider = UcNativeProvider::new(UcNativeSettings {
+            genesis_usage_signing_key: None,
+            issuer: issuer.clone(),
+            adapter_url: origin.clone(),
+            client_secret: "synthetic-secret".into(),
+            moi_api_url: origin.clone(),
+            genesis_url: origin,
+            builtin_memory: false,
+        })
+        .unwrap();
+        let verified = serde_json::json!({"code":"OK", "data":{"issuer":issuer, "subject":"owner", "session_id":"original-session", "client_id":"astra-cli", "audience":"astra-api"}});
+        *response.lock().unwrap() = (StatusCode::OK, verified.clone());
+        provider
+            .verify_session("owner", "original-session")
+            .await
+            .unwrap();
+        // The already cached service bearer must not cache human-session
+        // authority. The very next check observes remote logout.
+        *response.lock().unwrap() = (
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"code":"ErrNativeSessionInvalid"}),
+        );
+        let failure = provider
+            .verify_session("owner", "original-session")
+            .await
+            .unwrap_err();
+        assert_eq!(failure.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(failure.1.error_code.as_deref(), Some("uc_session_invalid"));
+        for key in ["issuer", "subject", "session_id", "client_id", "audience"] {
+            let mut mismatch = verified.clone();
+            mismatch["data"][key] = "another-identity".into();
+            *response.lock().unwrap() = (StatusCode::OK, mismatch);
+            assert_eq!(
+                provider
+                    .verify_session("owner", "original-session")
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        for (status, value) in [
+            (StatusCode::NOT_FOUND, serde_json::json!({})),
+            (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({})),
+            (
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({"code":"gateway_failure"}),
+            ),
+        ] {
+            *response.lock().unwrap() = (status, value);
+            assert_eq!(
+                provider
+                    .verify_session("owner", "original-session")
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        task.abort();
+    }
 
     fn provider(issuer: &str) -> UcNativeProvider {
         UcNativeProvider::new(UcNativeSettings {

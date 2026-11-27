@@ -35,6 +35,7 @@ pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
 mod edge;
 pub(crate) use edge::edge_capacity_handler::validate_relay_origin;
+pub(crate) use edge::runner_preview;
 pub(crate) mod explain_analyze_artifact;
 pub(crate) mod header_utils;
 mod http_helpers;
@@ -306,6 +307,11 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             bg_cancel.clone(),
         ));
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
+        bg_handles.push(edge::runner_inference::spawn_recovery(
+            pool.clone(),
+            state.edge_connection_pool.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(spawn_edge_dispatch_cleanup(
             state.execution.edge_dispatch_service.clone(),
             bg_cancel.clone(),

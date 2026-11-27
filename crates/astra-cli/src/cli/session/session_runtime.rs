@@ -353,16 +353,25 @@ pub(crate) async fn fetch_model_catalog(
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    let (models, _) = fetch_server_model_catalog(
+    Ok(active_catalog(chat_catalog(api, token).await?))
+}
+
+fn active_catalog(mut models: Vec<ModelListItemResponse>) -> Vec<ModelListItemResponse> {
+    models.retain(model_list_entry_is_active);
+    models
+}
+
+async fn chat_catalog(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    fetch_server_model_catalog(
         api,
         token,
         astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
     )
-    .await?;
-    Ok(models
-        .into_iter()
-        .filter(|entry| model_list_entry_is_active(entry))
-        .collect())
+    .await
+    .map(|(rows, _)| rows)
 }
 
 /// Load a catalog for the captured credential owner, including one 401 retry.
@@ -371,6 +380,16 @@ pub(crate) async fn fetch_model_catalog(
 pub(crate) async fn fetch_owner_model_catalog(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    fetch_owner_chat_catalog(api, owner, None)
+        .await
+        .map(active_catalog)
+}
+
+async fn fetch_owner_chat_catalog(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    exact_device: Option<&str>,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
     let api = api.clone().without_bearer_provider();
     tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
@@ -385,6 +404,7 @@ pub(crate) async fn fetch_owner_model_catalog(
             &token,
             owner_access_token(&api, owner, Some(&token)),
             true,
+            exact_device,
         )
         .await
     })
@@ -406,8 +426,10 @@ pub(crate) async fn fetch_admitted_model_catalog(
         &token,
         auth.access_token(&api, Some(&token)),
         matches!(auth, AdmittedAuth::Owner(_)),
+        None,
     )
     .await
+    .map(active_catalog)
 }
 
 async fn fetch_model_catalog_with_retry(
@@ -415,8 +437,9 @@ async fn fetch_model_catalog_with_retry(
     token: &str,
     refresh: impl std::future::Future<Output = Option<String>>,
     owner_bound: bool,
+    exact_device: Option<&str>,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    match fetch_model_catalog(api, Some(token)).await {
+    match chat_catalog_for_selection(api, token, exact_device).await {
         Err(
             error @ ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::UNAUTHORIZED,
@@ -430,10 +453,128 @@ async fn fetch_model_catalog_with_retry(
                     error
                 });
             };
-            fetch_model_catalog(api, Some(&refreshed)).await
+            chat_catalog_for_selection(api, &refreshed, exact_device).await
         }
         result => result,
     }
+}
+
+fn is_device_catalog_entry(row: &ModelListItemResponse) -> bool {
+    row.access_kind == astra_services::ModelAccessKind::ThisDevice
+        && row.execution_placement == astra_services::ModelExecutionPlacement::Edge
+}
+
+async fn chat_catalog_for_selection(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    exact_device: Option<&str>,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    let mut catalog = chat_catalog(api, Some(token)).await?;
+    if let Some(id) = exact_device.filter(|id| !catalog.iter().any(|row| row.offering_id == *id)) {
+        let path = format!("/model-access/device-offerings/{id}");
+        match api
+            .get_authed_json_bounded::<ModelListItemResponse>(token, &path, 64 * 1024)
+            .await
+        {
+            Ok(row) if row.offering_id == id && row.is_active && is_device_catalog_entry(&row) => {
+                catalog.push(row)
+            }
+            Ok(_) => {
+                return Err(ModelCatalogError::Protocol(
+                    "unexpected exact device Offering".into(),
+                ));
+            }
+            // Publication may still be in progress. Reobserve under the existing deadline.
+            Err(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                ..
+            }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(catalog)
+}
+
+#[cfg(unix)]
+pub(crate) async fn wait_for_device_catalog(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    offering: &str,
+) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
+    let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
+    let exact_device =
+        astra_services::runner_model_bindings::is_runner_offering_id(selector).then_some(selector);
+    poll_device_catalog(offering, move || async move {
+        if !owner.is_current() {
+            return Err("MOI account changed; reopen /model".into());
+        }
+        let catalog = fetch_owner_chat_catalog(api, owner, exact_device)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !owner.is_current() {
+            return Err("MOI account changed; reopen /model".into());
+        }
+        Ok(catalog)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn poll_device_catalog<F, Fut>(
+    offering: &str,
+    mut fetch: F,
+) -> Result<Vec<ModelListItemResponse>, String>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Vec<ModelListItemResponse>, String>> + Send,
+{
+    const UNAVAILABLE: &str = "Device model is unavailable in the Server catalog. Check the device connection and workspace model-source policy, then retry";
+    use tokio::time::{Duration, Instant, sleep_until, timeout_at};
+
+    const PUBLICATION_WINDOW_SECS: u64 = 20;
+    let started = Instant::now();
+    let publication_deadline = started + Duration::from_secs(PUBLICATION_WINDOW_SECS);
+    let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
+    for offset in [0, 1, 4, 10, PUBLICATION_WINDOW_SECS] {
+        let final_read = offset == PUBLICATION_WINDOW_SECS;
+        let scheduled = started + Duration::from_secs(offset);
+        if offset != 0 && !final_read && Instant::now() >= scheduled {
+            continue; // A slow catalog read already used this polling slot.
+        }
+        sleep_until(scheduled).await;
+        let deadline = if final_read {
+            // The last observation may paginate and request exact device admission.
+            // Give it the same end-to-end budget as the catalog operation it wraps.
+            publication_deadline + astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+        } else {
+            publication_deadline
+        };
+        let catalog = match timeout_at(deadline, fetch()).await {
+            Ok(result) => result?,
+            Err(_) if !final_read => continue,
+            Err(_) => break,
+        };
+        if find_model_entry_by_name(&catalog, selector).is_some_and(|row| {
+            is_device_catalog_entry(row)
+                && row.is_active
+                && model_selection_from_list_entry(row).is_some()
+        }) {
+            return Ok(active_catalog(catalog));
+        }
+        if final_read
+            && let Some(reason) = catalog
+                .iter()
+                .find(|row| {
+                    is_device_catalog_entry(row)
+                        && !row.is_active
+                        && (row.offering_id == selector || row.name.eq_ignore_ascii_case(selector))
+                })
+                .and_then(|row| row.description.as_deref())
+        {
+            return Err(reason.to_owned());
+        }
+    }
+    Err(UNAVAILABLE.into())
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -443,6 +584,9 @@ pub(crate) fn find_model_entry_by_name<'a>(
 ) -> Option<&'a ModelListItemResponse> {
     if let Some(entry) = models.iter().find(|entry| entry.offering_id == name) {
         return Some(entry);
+    }
+    if astra_services::runner_model_bindings::is_runner_offering_id(name) {
+        return None;
     }
     let mut matches = models.iter().filter(|entry| {
         model_list_entry_is_active(entry)
@@ -901,9 +1045,17 @@ pub(crate) async fn resolve_server_model_selection(
     model: &str,
     purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<ServerModelSelection, astra_core::ClassifiedError> {
-    let (catalog, _) = fetch_server_model_catalog(api, Some(token), purpose)
-        .await
-        .map_err(ModelCatalogError::into_classified)?;
+    let selector = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
+    let catalog = if purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::Chat
+        && astra_services::runner_model_bindings::is_runner_offering_id(selector)
+    {
+        chat_catalog_for_selection(api, token, Some(selector)).await
+    } else {
+        fetch_server_model_catalog(api, Some(token), purpose)
+            .await
+            .map(|(rows, _)| rows)
+    }
+    .map_err(ModelCatalogError::into_classified)?;
     resolve_server_model_selection_from_catalog(model, &catalog).map_err(|error| {
         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
     })
@@ -2788,6 +2940,240 @@ mod tests {
         .expect("active Offering");
         assert_eq!(selection.offering_id, "offer-deepseek-pro");
         assert_eq!(selection.context_window, Some(1_000_000));
+    }
+
+    #[cfg(unix)]
+    fn device_entry(id: &str, name: &str, active: bool) -> ModelListItemResponse {
+        let mut row = catalog_entry(id, name, active, 8192);
+        row.access_kind = ModelAccessKind::ThisDevice;
+        row.execution_placement = ModelExecutionPlacement::Edge;
+        row
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn device_catalog_waits_for_delayed_publication_and_accepts_aliases() {
+        use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile, save_credentials};
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("synthetic-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).unwrap();
+        let mock = MockServer::start().await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let delay_final_observation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let delayed = delay_final_observation.clone();
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publication = published.clone();
+        let id = format!("runner-{}", "d".repeat(48));
+        let published_id = id.clone();
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let active = publication.load(std::sync::atomic::Ordering::SeqCst);
+                let mut offline = device_entry("runner-offline", "offline", false);
+                offline.description = Some("Reconnect the chosen device".into());
+                let response = ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                    device_entry(&published_id, "my-chatgpt", active),
+                    catalog_entry("org", "org", true, 8192),
+                    offline,
+                ]));
+                if active && delayed.load(std::sync::atomic::Ordering::SeqCst) {
+                    response.set_delay(std::time::Duration::from_secs(6))
+                } else {
+                    response
+                }
+            })
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let owner = cli_utils::cli_owner_auth_snapshot();
+        use crate::cli::turn::turn_entry::ensure_default_turn_model;
+        let mut state = SessionState {
+            model: Some("org".into()),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ensure_default_turn_model(&mut state, &api, "synthetic-token", Some(&owner)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.model.as_ref().unwrap().offering_id(), Some("org"));
+        state.model = Some(id.clone().into());
+        // Advance the gaps after both HTTP requests are observed. Keep time
+        // running during real socket I/O and the final catalog observation.
+        let drive = async {
+            for (expected, step) in [(4, 1000), (6, 3000), (8, 6000), (10, 7000)] {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while calls.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("both catalog readers reached the observation");
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_millis(step)).await;
+                tokio::time::resume();
+            }
+            published.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let (restored, inactive, ()) = tokio::join!(
+            ensure_default_turn_model(&mut state, &api, "synthetic-token", Some(&owner)),
+            super::wait_for_device_catalog(&api, &owner, "runner-offline"),
+            drive
+        );
+        restored.unwrap();
+        assert_eq!(
+            state.model.as_ref().unwrap().offering_id(),
+            Some(id.as_str())
+        );
+        assert_eq!(inactive.unwrap_err(), "Reconnect the chosen device");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
+        // The final HTTP responses above exercise the readiness deadline. The
+        // subsequent lookup only verifies selection of the published alias.
+        delay_final_observation.store(false, std::sync::atomic::Ordering::SeqCst);
+        super::wait_for_device_catalog(&api, &owner, "my-chatgpt(thinking:high)")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_device_selection_loads_an_offering_outside_the_display_window() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let mock = MockServer::start().await;
+        let id = format!("runner-{}", "a".repeat(48));
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(catalog_page(vec![catalog_entry("org", "org", true, 8192)])),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let mut device = catalog_entry(&id, "my-chatgpt", true, 8192);
+        device.access_kind = ModelAccessKind::ThisDevice;
+        device.execution_placement = ModelExecutionPlacement::Edge;
+        Mock::given(method("GET"))
+            .and(path(format!("/model-access/device-offerings/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(device))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let selected = super::resolve_server_model_selection(
+            &api,
+            "synthetic",
+            &id,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.offering_id, id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn device_catalog_accepts_late_publication_with_a_delayed_response() {
+        use tokio::time::{Duration, Instant, sleep};
+
+        for latency in [
+            Duration::from_millis(300),
+            Duration::from_secs(6),
+            astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT - Duration::from_secs(1),
+        ] {
+            let started = Instant::now();
+            let mut reads = 0;
+            let catalog = super::poll_device_catalog("runner-device", || {
+                reads += 1;
+                // The server observes publication when it receives the request.
+                let active = started.elapsed() >= Duration::from_secs(17);
+                async move {
+                    sleep(latency).await;
+                    Ok(vec![device_entry("runner-device", "device", active)])
+                }
+            })
+            .await
+            .expect("the final catalog response should reach the caller");
+            assert_eq!(catalog[0].offering_id, "runner-device");
+            assert!(reads <= 5);
+            assert!(started.elapsed() >= Duration::from_secs(20) + latency);
+            assert!(
+                started.elapsed()
+                    <= Duration::from_secs(20) + astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn device_catalog_bounds_a_stalled_response_and_does_not_select_an_organization_alias() {
+        use tokio::time::{Duration, Instant};
+        let started = Instant::now();
+        let mut reads = 0;
+        let error = super::poll_device_catalog("shared-name", || {
+            reads += 1;
+            let final_read = reads == 5;
+            async move {
+                if final_read {
+                    std::future::pending::<()>().await;
+                }
+                Ok(vec![catalog_entry("org", "shared-name", true, 8192)])
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("unavailable"));
+        assert_eq!(reads, 5);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(20) + astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn device_catalog_bounds_reads_for_offline_and_policy_denied_models() {
+        for offline in [true, false] {
+            let mut reads = 0;
+            let error = super::poll_device_catalog("runner-device", || {
+                reads += 1;
+                async move {
+                    if offline {
+                        let mut entry = device_entry("runner-device", "my-chatgpt", false);
+                        entry.description = Some("Runner offline".into());
+                        Ok(vec![entry])
+                    } else {
+                        // MOI policy denial hides the Offering from inventory.
+                        Ok(vec![catalog_entry("org", "org-model", true, 8192)])
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(reads, 5);
+            if offline {
+                assert_eq!(error, "Runner offline");
+            } else {
+                assert!(error.contains("workspace model-source policy"));
+            }
+        }
     }
 
     #[tokio::test]

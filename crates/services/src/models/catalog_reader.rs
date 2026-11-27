@@ -82,6 +82,7 @@ pub async fn read_authorized_model_catalog(
                 .collect(),
             default_offering_id: catalog.default_model_id,
             allows_deployment: false,
+            device_inventory_unavailable: false,
         })
     } else {
         models

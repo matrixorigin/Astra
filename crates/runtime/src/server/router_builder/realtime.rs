@@ -176,6 +176,11 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(edge::edge_service_status_handler::edge_service_status_handler),
         )
         .route(
+            "/service/edges/inference/preview",
+            post(edge::runner_preview::serve)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/service/edges/capacity",
             get(edge::edge_capacity_handler::describe_capacity)
                 .post(edge::edge_capacity_handler::call_capacity)

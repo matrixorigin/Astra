@@ -18,6 +18,8 @@ use crate::auth::FernetTokenEncryptor;
 use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
 use astra_turn_types::ModelSelector;
 mod catalog_reader;
+mod device;
+pub use device::device_admission_error;
 mod genesis;
 mod genesis_usage;
 pub use genesis_usage::GenesisUsageAttestation;
@@ -1031,12 +1033,25 @@ pub fn server_model_access_declarations(
 /// response schemas remain unchanged for existing clients.
 pub fn server_model_access_declarations_for_models(
     allows_deployment: bool,
+    device_inventory_unavailable: bool,
     models: &[ModelListItem],
 ) -> Vec<DeclaredModelAccess> {
     let mut result = server_model_access_declarations(
         allows_deployment,
         models.iter().map(|item| item.access_kind),
     );
+    if device_inventory_unavailable {
+        result.push(DeclaredModelAccess {
+            id: "personal-runner-inventory".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "Personal Runner".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Unavailable {
+                reason: ModelAccessReason::ConnectionUnavailable,
+                retry_after_seconds: None,
+            },
+        });
+    }
     let mut seen: BTreeSet<String> = result.iter().map(|item| item.id.clone()).collect();
     for model in models {
         if seen.insert(model.access_id.clone()) {
@@ -1227,6 +1242,9 @@ impl RuntimeModelReasoningControl {
 pub struct AdmittedModelExecution {
     /// Server-only provenance bound to this admitted Genesis execution.
     pub usage_attestation: Option<GenesisUsageAttestation>,
+    /// Explicit device transport material. A device route must never fall
+    /// through to the Server's HTTP client, including auxiliary inference.
+    pub device_binding: Option<crate::runner_model_bindings::ResolvedRunnerModelBinding>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub response_scope: Option<String>,
@@ -1355,6 +1373,14 @@ impl AdmittedModelExecution {
     pub fn has_same_execution_identity(&self, other: &Self) -> bool {
         self.offering_id == other.offering_id
             && self
+                .device_binding
+                .as_ref()
+                .map(|binding| &binding.definition.source)
+                == other
+                    .device_binding
+                    .as_ref()
+                    .map(|binding| &binding.definition.source)
+            && self
                 .subscription
                 .as_ref()
                 .map(|binding| binding.connection_id())
@@ -1386,6 +1412,7 @@ impl AdmittedModelExecution {
         let scope_key = offering.model.response_scope_key.clone();
         let mut execution = Self {
             usage_attestation: None,
+            device_binding: None,
             inference_protocol: offering.model.inference_protocol,
             responses_reasoning_history: offering.model.responses_reasoning_history,
             response_scope: None,
@@ -1434,6 +1461,7 @@ impl AdmittedModelExecution {
     ) -> Self {
         Self {
             usage_attestation: None,
+            device_binding: None,
             inference_protocol: None,
             responses_reasoning_history: None,
             response_scope: None,
@@ -2818,6 +2846,7 @@ fn admitted_user_model_from_row(
         personal_model_cache_capability(&provider, &base_url, inference_protocol);
     let mut execution = AdmittedModelExecution {
         usage_attestation: None,
+        device_binding: None,
         responses_reasoning_history,
         inference_protocol,
         response_scope: None,
@@ -3456,6 +3485,7 @@ pub struct UserModelCatalog {
     pub items: Vec<ModelListItem>,
     pub default_offering_id: Option<String>,
     pub allows_deployment: bool,
+    pub device_inventory_unavailable: bool,
 }
 
 async fn read_user_model_catalog<T: ModelService + ?Sized>(
@@ -3468,6 +3498,7 @@ async fn read_user_model_catalog<T: ModelService + ?Sized>(
             .default_user_model_offering_id(user_id.clone())
             .await?,
         allows_deployment: service.allows_deployment_models(user_id).await?,
+        device_inventory_unavailable: false,
     })
 }
 
@@ -3504,8 +3535,11 @@ pub trait ModelService: Send + Sync {
             catalog.items,
             astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         );
-        let declared =
-            server_model_access_declarations_for_models(catalog.allows_deployment, &offerings);
+        let declared = server_model_access_declarations_for_models(
+            catalog.allows_deployment,
+            catalog.device_inventory_unavailable,
+            &offerings,
+        );
         let user_default = catalog
             .default_offering_id
             .map(|offering_id| ModelDefaultCandidate {
@@ -4537,11 +4571,17 @@ impl ModelService for DatabaseModelService {
         user_id: String,
     ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
         if let Some(subject) = self.uc_subject(&user_id).await? {
-            let catalog = self.genesis_catalog(&subject).await?;
+            let mut catalog = self.genesis_catalog(&subject).await?;
+            let device = self.device_catalog(&user_id, &subject).await;
+            let device_inventory_unavailable = device.is_none();
+            if let Some(items) = device {
+                catalog.items.extend(items);
+            }
             return Ok(UserModelCatalog {
                 items: catalog.items,
                 default_offering_id: catalog.default_offering_id,
                 allows_deployment: false,
+                device_inventory_unavailable,
             });
         }
 
@@ -4561,6 +4601,7 @@ impl ModelService for DatabaseModelService {
                 .default_user_model_offering_id_from_rows(user_id)
                 .await?,
             allows_deployment,
+            device_inventory_unavailable: false,
         })
     }
 
@@ -5264,6 +5305,9 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         offering_id: String,
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        if offering_id.starts_with("runner-") {
+            return self.admit_device(&user_id, &offering_id).await;
+        }
         if let Some(subject) = self.uc_subject(&user_id).await? {
             return self.admit_genesis(&subject, &offering_id).await;
         }
@@ -5285,6 +5329,13 @@ impl ModelService for DatabaseModelService {
             .map_err(model_offering_resolution_error_response)?;
         if offering_ids.is_empty() {
             return Ok(Vec::new());
+        }
+        if offering_ids.iter().any(|id| id.starts_with("runner-")) {
+            let mut admitted = Vec::with_capacity(offering_ids.len());
+            for offering in offering_ids {
+                admitted.push(self.admit_model_offering(user_id.clone(), offering).await?);
+            }
+            return Ok(admitted);
         }
         if let Some(subject) = self.uc_subject(&user_id).await? {
             let catalog = self.genesis_catalog(&subject).await?;
@@ -5334,13 +5385,12 @@ impl ModelService for DatabaseModelService {
             validate_model_selector_admissions(&selectors, &offering_ids, None, &admitted)?;
             return Ok(admitted);
         }
-        if let Some(subject) = self.uc_subject(&user_id).await? {
-            let catalog = self.genesis_catalog(&subject).await?;
+        if self.uc_subject(&user_id).await?.is_some() {
+            let catalog = self.user_model_catalog(user_id.clone()).await?;
             let offering_ids = resolve_model_selector_offerings(&selectors, &catalog.items)?;
-            let admitted = offering_ids
-                .iter()
-                .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
-                .collect::<Result<Vec<_>, _>>()?;
+            let admitted = self
+                .admit_model_offerings(user_id.clone(), offering_ids.clone())
+                .await?;
             validate_model_selector_admissions(
                 &selectors,
                 &offering_ids,
@@ -5519,8 +5569,8 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
-        if let Some(subject) = self.uc_subject(&user_id).await? {
-            return Ok(self.genesis_catalog(&subject).await?.items);
+        if self.uc_subject(&user_id).await?.is_some() {
+            return Ok(self.user_model_catalog(user_id).await?.items);
         }
         let deployment_allowed = is_admin || self.allows_deployment_models(user_id.clone()).await?;
         self.list_models_with_deployment_access(user_id, is_admin, deployment_allowed)
@@ -9061,6 +9111,7 @@ mod tests {
 
         let changed_name = AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9078,6 +9129,7 @@ mod tests {
 
         let changed_source = AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9519,6 +9571,7 @@ mod tests {
 
         let refreshed_material = AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9531,6 +9584,7 @@ mod tests {
 
         let changed_upstream = AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9541,6 +9595,7 @@ mod tests {
 
         let changed_provider = AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -9551,6 +9606,7 @@ mod tests {
 
         let changed_source = AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,

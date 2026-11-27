@@ -293,6 +293,7 @@ dependencies = [
  "base64",
  "dirs",
  "fs2",
+ "hmac 0.12.1",
  "jsonwebtoken",
  "libc",
  "rand 0.8.6",
@@ -306,6 +307,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -316,22 +318,29 @@ dependencies = [
  "astra-build-info",
  "astra-core",
  "astra-credentials",
+ "astra-inference-adapter",
  "astra-logging",
  "astra-runtime-env",
  "astra-server-types",
  "astra-services",
+ "astra-thin-client",
  "astra-tools",
  "astra-turn-core",
  "astra-turn-types",
  "base64",
+ "bytes",
  "clap",
  "fastrand",
  "fs2",
  "futures-util",
  "hostname",
+ "jsonwebtoken",
+ "libc",
  "md-5 0.10.6",
  "nix 0.31.3",
+ "rand 0.8.6",
  "reqwest 0.12.28",
+ "rsa 0.9.10",
  "rustls",
  "serde",
  "serde_json",
@@ -354,6 +363,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "astra-inference-adapter"
+version = "0.2.15"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -621,6 +646,7 @@ version = "0.2.15"
 dependencies = [
  "astra-config",
  "astra-core",
+ "astra-credentials",
  "astra-logging",
  "astra-runtime-env",
  "astra-sync-protocol",

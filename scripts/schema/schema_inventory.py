@@ -296,6 +296,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / inference_execution",
         product_owner="provider delivery audit, retry safety, usage reconciliation, and latency",
     ),
+    "runner_model_binding_publications": TableMetadata(
+        semantic_owner="astra_services::runner_model_bindings",
+        state_class="immutable personal device model publication receipt",
+        primary_query="current journal publication and exact operation replay by owner, runner, journal and revision",
+        retention_policy="retain while the enrolled journal or admitted inference routes reference the publication",
+        rebuildability="not reconstructable from current socket presence because immutable publication revisions fence execution",
+        merge_guidance="reuse edge_agent_registry for presence and inference_routes for admitted execution; this table owns only publication receipts",
+        migration_owner="astra_services::storage / runner_model_bindings",
+        product_owner="personal device model discovery and exact execution binding",
+    ),
     "inference_routes": TableMetadata(
         semantic_owner="astra_services::inference_execution",
         state_class="immutable admitted inference route fact",

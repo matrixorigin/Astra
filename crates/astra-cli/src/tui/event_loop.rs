@@ -10049,6 +10049,8 @@ pub(crate) async fn run_tui_session(
     }
     let (model_catalog_tx, mut model_catalog_rx) = tokio::sync::mpsc::channel(2);
     let mut model_catalog_tasks = tokio::task::JoinSet::new();
+    #[cfg(unix)]
+    let mut _device_model_runner: Option<crate::cli::device_models::DeviceRunner> = None;
     let mut model_setup_tasks = tokio::task::JoinSet::<(
         crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
         u64,
@@ -10400,7 +10402,8 @@ pub(crate) async fn run_tui_session(
                 if let crate::cli::model_connections::ConnectProgress::Waiting(url) = progress {
                     bottom_pane.push_view(Box::new(super::bottom_pane::info_view::InfoView::from_plain(
                         "Continue with ChatGPT", vec!["Authorize in your browser. Esc cancels while waiting.".into(),
-                        "Your credentials are encrypted on the selected Astra deployment.".into(), url])));
+                        if crate::cli::native_auth::active().is_some() { "OpenAI credentials stay in private files on this computer. Server still receives chat content and results.".into() }
+                        else { "Your credentials are encrypted on the selected Astra deployment.".into() }, url])));
                     model_setup_view_open = true;
                 }
                 frame_requester.schedule_frame();
@@ -10410,6 +10413,35 @@ pub(crate) async fn run_tui_session(
                 match completed {
                     Ok((owner, epoch, result)) if owner.is_current() && epoch == state.session_attachment_epoch => {
                         match result {
+                            #[cfg(unix)]
+                            Ok(super::model_setup::Outcome::DeviceSaved { offering_id, catalog, runner }) => {
+                                _device_model_runner = Some(runner);
+                                match catalog {
+                                    Ok(catalog) => {
+                                        bottom_pane.cache_model_catalog(catalog);
+                                        slash_dispatch::apply_model_picker_result(&bottom_pane::view::ViewResult::Model { name: offering_id }, &mut state, &mut bottom_pane, &mut chat_widget);
+                                        chat_widget.commit_system(history_cell::system::SystemCell::response("Using your ChatGPT plan on this device. Keep Astra open; platform login and workspace permissions still apply."));
+                                    },
+                                    Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+                                }
+                            }
+                            Ok(super::model_setup::Outcome::DeviceConnections { connections, models }) => {
+                                let mut choices = Vec::new();
+                                for connection in connections {
+                                    let id = connection.connection_ref.to_string();
+                                    if connection.enabled && connection.credential_state == astra_credentials::chatgpt::CredentialState::Ready {
+                                        choices.push((format!("Choose models · {}", connection.label), Some("No new ChatGPT sign-in needed".into()), super::model_setup::Action::Models(id.clone())));
+                                    }
+                                    choices.push((format!("Reauthorize · {}", connection.label), None, super::model_setup::Action::Connect(Some(id.clone()))));
+                                    choices.push((format!("Disconnect · {}", connection.label), Some("Clears this computer's ChatGPT credential; keeps MOI login and history".into()), super::model_setup::Action::Disconnect(id)));
+                                }
+                                for (name, model) in models {
+                                    choices.push((format!("Use {name}"), Some(format!("{model} · this device")), super::model_setup::Action::Activate(name.clone())));
+                                    choices.push((format!("Remove {name}"), None, super::model_setup::Action::ConfirmRemove { model_id: name.clone(), name }));
+                                }
+                                choices.push(("Connect another ChatGPT account on this device".into(), None, super::model_setup::Action::Connect(None)));
+                                super::model_setup::choices(&mut bottom_pane, "My device ChatGPT", choices);
+                            }
                             Ok(super::model_setup::Outcome::Sources(chatgpt)) => {
                                 if chatgpt["available"] != true {
                                     chat_widget.commit_system(history_cell::system::SystemCell::info(
@@ -10508,6 +10540,15 @@ pub(crate) async fn run_tui_session(
                                 bottom_pane.clear_model_catalog();
                                 chat_widget.commit_system(history_cell::system::SystemCell::response("ChatGPT disconnected. Your conversation is retained. Use /model to select a model or reconnect."));
                             }
+                            Ok(super::model_setup::Outcome::DeviceDisconnected { revocation_confirmed }) => {
+                                bottom_pane.clear_model_catalog();
+                                let message = if revocation_confirmed {
+                                    "Device ChatGPT disconnected and OpenAI revocation confirmed. Conversation history is retained. Use /model to select a model."
+                                } else {
+                                    "Device ChatGPT disconnected locally. OpenAI revocation is unconfirmed; check this account's connected apps. Conversation history is retained."
+                                };
+                                chat_widget.commit_system(history_cell::system::SystemCell::response(message));
+                            }
                             Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
                         }
                     }
@@ -10558,6 +10599,7 @@ pub(crate) async fn run_tui_session(
                     }
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         if !bottom_pane.can_park_editors_for(None, state.session_attachment_epoch) {
+                            bottom_pane.model_setup_after_login = None;
                             let error = auth_flow::DRAFTS_BLOCK_AUTH_CHANGE;
                             chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
                             recover_followups_after_rejected_authentication(
@@ -10573,6 +10615,7 @@ pub(crate) async fn run_tui_session(
                         let mut retirement = match auth_flow::prepare_browser_session_retirement(&mut state) {
                             Ok(retirement) => retirement,
                             Err(error) => {
+                                bottom_pane.model_setup_after_login = None;
                                 chat_widget.commit_system(history_cell::system::SystemCell::warning(error));
                                 pending_deferred_slash_flush = false;
                                 authentication_followup_handoff(&mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget, &mut followup_replay_armed, None);
@@ -10647,6 +10690,7 @@ pub(crate) async fn run_tui_session(
                             &mut login_tasks, profile, context, authentication, &mut state,
                         ));
                         if let Err(error) = preparation {
+                            bottom_pane.model_setup_after_login = None;
                             chat_widget.commit_system(history_cell::system::SystemCell::error(error));
                             pending_deferred_slash_flush = false;
                             authentication_followup_handoff(&mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget, &mut followup_replay_armed, None);
@@ -10677,6 +10721,7 @@ pub(crate) async fn run_tui_session(
                                 chat_widget.commit_system(history_cell::system::SystemCell::info("Completing sign-in; registering local execution…"));
                             }
                             Err(error) => {
+                                bottom_pane.model_setup_after_login = None;
                                 chat_widget.commit_system(history_cell::system::SystemCell::error(error));
                                 pending_deferred_slash_flush = false;
                                 authentication_followup_handoff(&mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget, &mut followup_replay_armed, None);
@@ -10700,6 +10745,7 @@ pub(crate) async fn run_tui_session(
                         let authenticated = result.is_ok();
                         spawn_post_auth_sync(&mut model_catalog_tasks, model_catalog_tx.clone(), api.clone(), prepared.token.clone(), profile.map(str::to_owned), &state);
                         model_catalog_loading = true;
+                        super::model_setup::finish_login(&mut bottom_pane, authenticated);
                         match result {
                             Ok(()) => {
                                 crate::cli::edge_lifecycle::complete_login_rebind(api, &prepared.token, profile, &mut edge_heartbeat_task).await;
@@ -10757,6 +10803,7 @@ pub(crate) async fn run_tui_session(
                                 plan_task_projection_sequence = None;
                                 spawn_post_auth_sync(&mut model_catalog_tasks, model_catalog_tx.clone(), api.clone(), token.clone(), profile.map(str::to_owned), &state);
                                 model_catalog_loading = true;
+                                super::model_setup::finish_login(&mut bottom_pane, registration.is_ok());
                                 match registration {
                                     Ok(()) => {
                                         crate::cli::edge_lifecycle::complete_login_rebind(api, &token, profile, &mut edge_heartbeat_task).await;
@@ -10765,10 +10812,14 @@ pub(crate) async fn run_tui_session(
                                     Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
                                 }
                             }
-                            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+                            Err(error) => {
+                                bottom_pane.model_setup_after_login = None;
+                                chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                            }
                         }
                     }
                     Err(error) => {
+                        bottom_pane.model_setup_after_login = None;
                         // Cancellation before publication retains the old identity.
                         // Reattach its retired service only while the original
                         // credential binding is current, without an identity read.
@@ -14222,6 +14273,10 @@ pub(crate) async fn run_tui_session(
                                 let mut followup_session_rebound = false;
                                 if result.is_none() && !bottom_pane.has_active_view() {
                                     model_picker_scope = None;
+                                    if login_tasks.is_empty() {
+                                        // The user dismissed the sign-in prompt or password form.
+                                        bottom_pane.model_setup_after_login = None;
+                                    }
                                 }
                                 if let Some(result) = result {
                                     if let bottom_pane::view::ViewResult::WorkspaceTrust(choice) = &result {
@@ -14293,6 +14348,7 @@ pub(crate) async fn run_tui_session(
                                     };
                                     if let Some((username, password, email)) = password_form {
                                         if email.is_some() && !bottom_pane.can_park_editors_for(None, state.session_attachment_epoch) {
+                                            bottom_pane.model_setup_after_login = None;
                                             chat_widget.commit_system(history_cell::system::SystemCell::error(crate::cli::auth_flow::DRAFTS_BLOCK_AUTH_CHANGE));
                                             frame_requester.schedule_frame();
                                             continue;
@@ -14365,12 +14421,15 @@ pub(crate) async fn run_tui_session(
                                                 ("Keep model".into(), None, Action::Sources),
                                                 ("Remove personal model".into(), None, Action::Remove(model_id)),
                                             ]),
-                                            Action::Subscription { connection_id, model } => super::model_setup::model_form(&mut bottom_pane, "chatgpt".into(), Some(connection_id), Some(model)),
+                                            Action::Subscription { connection_id, model } => {
+                                                if crate::cli::native_auth::active().is_some() { super::model_setup::device_model_form(&mut bottom_pane, connection_id, model); }
+                                                else { super::model_setup::model_form(&mut bottom_pane, "chatgpt".into(), Some(connection_id), Some(model)); }
+                                            },
                                             action => {
                                                 model_setup_phase.reset();
                                                 model_setup_cancel = tokio_util::sync::CancellationToken::new();
                                                 let owner = match &action {
-                                                    Action::Create { owner, .. } => owner.clone(),
+                                                    Action::Create { owner, .. } | Action::DeviceCreate { owner, .. } => owner.clone(),
                                                     _ => crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
                                                 };
                                                 let epoch = state.session_attachment_epoch;

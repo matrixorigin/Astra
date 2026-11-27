@@ -38,9 +38,12 @@ fn push_retention_owner_joins(query: &mut QueryBuilder<MySql>, owners: &[&str]) 
    ON physical.user_id = context.user_id AND physical.attempt_id = context.attempt_id
   AND physical.invocation_id = context.invocation_id
   AND physical.session_id = context.session_id AND physical.run_id <=> context.run_id", "physical"),
-    (" JOIN inference_invocations invocation
+    (" LEFT JOIN inference_invocations invocation
    ON invocation.user_id = physical.user_id AND invocation.invocation_id = physical.invocation_id
   AND invocation.session_id = context.session_id AND invocation.run_id <=> context.run_id", "invocation"),
+    (" LEFT JOIN agent_runs run_owner
+   ON run_owner.user_id = physical.user_id AND run_owner.run_id = physical.run_id
+  AND run_owner.session_id = context.session_id", "run_owner"),
     (" LEFT JOIN inference_invocation_settlement_debts debt
    ON debt.user_id = invocation.user_id AND debt.invocation_id = invocation.invocation_id", "debt"),
     (" LEFT JOIN inference_provider_attempts open_attempt
@@ -55,10 +58,13 @@ fn push_retention_owner_joins(query: &mut QueryBuilder<MySql>, owners: &[&str]) 
 }
 
 const RETENTION_SETTLED_PREDICATE: &str = "
- invocation.status IN ('succeeded','failed','cancelled','delivery_unknown')
- AND physical.status IN ('succeeded','failed','cancelled','delivery_unknown')
- AND invocation.terminal_fingerprint IS NOT NULL AND physical.terminal_fingerprint IS NOT NULL
- AND debt.invocation_id IS NULL AND open_attempt.attempt_id IS NULL";
+ physical.status IN ('succeeded','failed','cancelled','delivery_unknown')
+ AND physical.terminal_fingerprint IS NOT NULL
+ AND ((invocation.status IN ('succeeded','failed','cancelled','delivery_unknown')
+       AND invocation.terminal_fingerprint IS NOT NULL
+       AND debt.invocation_id IS NULL AND open_attempt.attempt_id IS NULL)
+   OR (invocation.invocation_id IS NULL AND physical.runner_grant_json IS NOT NULL
+       AND run_owner.status IN ('completed','delegated','failed','cancelled')))";
 
 /// Only a transient scan position; execution and deletion authority stay in SQL.
 #[derive(Debug, Default)]

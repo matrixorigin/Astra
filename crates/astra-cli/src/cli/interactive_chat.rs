@@ -28,6 +28,33 @@ pub(crate) async fn run_interactive_chat(
         eprintln!("For scripts/CI:     astra --print \"your message\"");
         return Err("no TTY".into());
     }
+    #[cfg(unix)]
+    let (device_runner, startup_failed) =
+        match crate::cli::device_models::start_for_model(initial_model, false).await {
+            Ok(runner) => (runner, false),
+            Err(error) => {
+                eprintln!("Device ChatGPT unavailable: {error}");
+                (None, true)
+            }
+        };
+    // The picker can switch to a device model even when the initial model is
+    // organizational. Make saved models available without waiting to open TUI.
+    #[cfg(unix)]
+    let _picker_device_runner = if device_runner.is_none() && !startup_failed {
+        Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async {
+                match crate::cli::device_models::start_for_model(None, true).await {
+                    Ok(runner) => runner,
+                    Err(error) => {
+                        tracing::debug!(%error, "device model host unavailable for the picker");
+                        None
+                    }
+                }
+            },
+        )))
+    } else {
+        None
+    };
     // Box::pin to reduce the parent future's stack frame size (avoids stack
     // overflow in debug-mode tests that instantiate execute_cli_command).
     Box::pin(crate::tui::run_tui(

@@ -926,6 +926,7 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
             .and_then(|v| v.as_str())
             .or_else(|| json.get("message").and_then(|v| v.as_str()))
             .or_else(|| json.get("detail").and_then(|v| v.as_str()))
+            .or_else(|| json.get("msg").and_then(|v| v.as_str()))
         {
             let base = format!("request failed ({status}): {}", api_error_preview(msg, 512));
             let mut context_lines = Vec::new();
@@ -1582,6 +1583,17 @@ mod tests {
     }
 
     // ── read_api_error ────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_api_error_shows_moi_denial_without_unrelated_fields() {
+        let error = read_api_error(
+            403,
+            r#"{"code":"ErrDeviceModelSourceDenied","msg":"Source disabled","data":{"extra":"unrelated"}}"#,
+        );
+        assert!(error.contains("Source disabled"));
+        assert!(error.contains("error_code: ErrDeviceModelSourceDenied"));
+        assert!(!error.contains("unrelated"));
+    }
 
     #[test]
     fn read_api_error_omits_gateway_page_and_preserves_trace_id() {

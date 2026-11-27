@@ -6,7 +6,7 @@
 
 use super::*;
 
-const SERVICE_KEY_ENV: &str = "ASTRA_BACKEND_SERVICE_KEY";
+pub(super) const SERVICE_KEY_ENV: &str = "ASTRA_BACKEND_SERVICE_KEY";
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Use a boolean inequality so the length mismatch contributes exactly 0 or 1

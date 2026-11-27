@@ -130,6 +130,7 @@ async fn provider_rejection_http_to_run_terminal_contract() {
                         cache_capability: None,
                         route: LlmExecutionRoute {
                             usage_attestation: None,
+                            device_binding: None,
                             inference_protocol: None,
                             response_scope: None,
                             subscription: None,

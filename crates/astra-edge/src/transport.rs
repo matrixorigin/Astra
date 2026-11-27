@@ -73,6 +73,9 @@ pub async fn upgrade_edge_socket(
     let (websocket, _) = client_async_tls_with_config(
         request,
         stream,
+        // Tool requests have their own server-side bound and may exceed the
+        // inference control-message budget. Preserve tungstenite's established
+        // receive limits for this shared tool/inference transport.
         None,
         Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
     )
@@ -92,5 +95,48 @@ pub(super) async fn accept_edge_socket(stream: TcpStream) -> EdgeSocket {
     EdgeSocket {
         websocket,
         received,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test]
+    async fn observed_socket_accepts_large_tool_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            websocket.send(Message::Text("ready".into())).await.unwrap();
+            let request = serde_json::json!({
+                "type": "tool_request", "id": "large-request", "tool": "write_file",
+                "args": {"path": "output.txt", "content": "x".repeat(300 * 1024)}
+            });
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&request).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut socket = connect_edge_socket(format!("ws://{address}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            socket.websocket.next().await.unwrap().unwrap(),
+            Message::Text("ready".into())
+        );
+        let frame = socket.websocket.next().await.unwrap().unwrap();
+        let request: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(
+            request["args"]["content"].as_str().unwrap().len(),
+            300 * 1024
+        );
+        peer.await.unwrap();
     }
 }

@@ -40,6 +40,7 @@ impl ModelService for CatalogSpy {
             items: self.items.lock().unwrap().clone(),
             default_offering_id: None,
             allows_deployment: false,
+            device_inventory_unavailable: false,
         })
     }
     async fn model_catalog_revision(&self, _: String, _: bool) -> HttpResult<String> {

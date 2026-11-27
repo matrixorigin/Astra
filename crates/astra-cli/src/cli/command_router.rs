@@ -628,8 +628,10 @@ fn effective_one_shot_model<'a>(
         .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct ResolvedOneShotModel {
+    #[cfg(unix)]
+    _device_runner: Option<crate::cli::device_models::DeviceRunner>,
     model: Option<String>,
     offering_id: Option<String>,
 }
@@ -641,20 +643,23 @@ async fn resolve_one_shot_model(
     restored_model: Option<&str>,
     fallback_model: Option<&str>,
 ) -> Result<ResolvedOneShotModel, String> {
-    let Some(requested_model) =
-        effective_one_shot_model(explicit_model, restored_model, fallback_model)
-    else {
+    let requested_model = effective_one_shot_model(explicit_model, restored_model, fallback_model);
+    let Some(requested_model) = requested_model else {
         return match session_runtime::resolve_server_default_model(api, token).await {
             session_runtime::ServerDefaultModel::Selected(selection) => {
                 // The default resolver already validated the Offering against
                 // the authoritative Model Access projection. Do not fetch the
                 // model catalog a second time just to recover the same id.
                 Ok(ResolvedOneShotModel {
+                    #[cfg(unix)]
+                    _device_runner: None,
                     model: Some(selection.name),
                     offering_id: Some(selection.offering_id),
                 })
             }
             session_runtime::ServerDefaultModel::NoModels => Ok(ResolvedOneShotModel {
+                #[cfg(unix)]
+                _device_runner: None,
                 model: None,
                 offering_id: None,
             }),
@@ -662,15 +667,57 @@ async fn resolve_one_shot_model(
         };
     };
 
-    let selection = session_runtime::resolve_server_model_selection(
-        api,
-        token,
-        requested_model,
-        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-    )
-    .await
-    .map_err(|error| format!("failed to resolve selected model '{requested_model}': {error}"))?;
+    let resolve = || {
+        session_runtime::resolve_server_model_selection(
+            api,
+            token,
+            requested_model,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+    };
+    #[cfg(unix)]
+    let (selection, device_runner) = {
+        use crate::cli::device_models::start_for_model;
+        let exact_device = crate::cli::device_models::is_device_offering_selector(requested_model);
+        let mut runner = if exact_device {
+            start_for_model(Some(requested_model), false).await?
+        } else {
+            None
+        };
+        let mut selection = resolve().await;
+        // Resolve an active organization Offering before inspecting local
+        // device state. A missing alias can still be a saved, offline model.
+        let needs_device_lookup = match &selection {
+            Ok(selected) => {
+                astra_services::runner_model_bindings::is_runner_offering_id(&selected.offering_id)
+            }
+            Err(error) => error.kind == astra_core::ErrorKind::InvalidRequest,
+        };
+        if !exact_device && needs_device_lookup {
+            runner = start_for_model(Some(requested_model), false).await?;
+        }
+        if runner.is_some() && needs_device_lookup {
+            let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+            let catalog =
+                session_runtime::wait_for_device_catalog(api, &owner, requested_model).await?;
+            selection = session_runtime::resolve_server_model_selection_from_catalog(
+                requested_model,
+                &catalog,
+            )
+            .map_err(|error| {
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+            });
+        }
+        (selection, runner)
+    };
+    #[cfg(not(unix))]
+    let selection = resolve().await;
+    let selection = selection.map_err(|error| {
+        format!("failed to resolve selected model '{requested_model}': {error}")
+    })?;
     Ok(ResolvedOneShotModel {
+        #[cfg(unix)]
+        _device_runner: device_runner,
         // Preserve the caller's thinking suffix and spelling in the turn
         // payload; the shared resolver owns the canonical Offering identity.
         model: Some(requested_model.to_string()),
@@ -1791,6 +1838,17 @@ async fn execute_cli_command_impl(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
+    #[cfg(not(unix))]
+    if crate::cli::native_auth::active().is_some()
+        && matches!(
+            &command,
+            Some(Command::Model(
+                ModelCmd::Connect(_) | ModelCmd::Connections | ModelCmd::Disconnect { .. }
+            ))
+        )
+    {
+        return Err("Device ChatGPT requires Linux or macOS. Organizational models remain available; device operations cannot use Server credentials.".into());
+    }
     match command {
         // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
@@ -3268,6 +3326,34 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Model(ModelCmd::Connect(args))) => {
+            #[cfg(unix)]
+            if let Some(binding) = crate::cli::native_auth::active() {
+                if args.retry_authorization_id.is_some() {
+                    return Err("Device ChatGPT cannot reuse a Server authorization ID. Start a new browser authorization with model connect chatgpt, optionally using --connection.".into());
+                }
+                let device = crate::cli::device_models::DeviceModels::current(binding).await?;
+                let connection = device
+                    .connect(
+                        args.connection,
+                        args.label,
+                        tokio_util::sync::CancellationToken::new(),
+                        |progress| {
+                            if let crate::cli::model_connections::ConnectProgress::Waiting(url) =
+                                progress
+                            {
+                                // Ephemeral authorization output, never persisted in a transcript.
+                                stdout_println!(
+                                    "Open this page to authorize ChatGPT on this device:\n{url}"
+                                );
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await?;
+                print_json_or_raw(&serde_json::json!({"connection_id":connection.connection_ref,
+                    "label":connection.label,"enabled":connection.enabled,"state":connection.credential_state,"execution":"device"}).to_string());
+                return Ok(ExitCode::Success);
+            }
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let value =
                 crate::cli::model_connections::connect(api, &token, args, profile.as_deref())
@@ -3276,6 +3362,16 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
         Some(Command::Model(ModelCmd::Connections)) => {
+            #[cfg(unix)]
+            if let Some(binding) = crate::cli::native_auth::active() {
+                let device = crate::cli::device_models::DeviceModels::current(binding).await?;
+                let rows: Vec<_> = device.connections().await?.into_iter().map(|connection| serde_json::json!({
+                    "connection_id":connection.connection_ref,"label":connection.label,
+                    "enabled":connection.enabled,"state":connection.credential_state,"execution":"device"
+                })).collect();
+                print_json_or_raw(&serde_json::json!({"connections":rows}).to_string());
+                return Ok(ExitCode::Success);
+            }
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let body = api
                 .get_bearer_path_query_text(&token, crate::cli::model_connections::CONNECTIONS, &[])
@@ -3285,6 +3381,13 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
         Some(Command::Model(ModelCmd::Disconnect { connection_id })) => {
+            #[cfg(unix)]
+            if let Some(binding) = crate::cli::native_auth::active() {
+                let device = crate::cli::device_models::DeviceModels::current(binding).await?;
+                let revoked = device.disconnect(&connection_id).await?;
+                print_json_or_raw(&serde_json::json!({"disconnected_locally":true,"revocation_confirmed":revoked,"execution":"device"}).to_string());
+                return Ok(ExitCode::Success);
+            }
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let path =
                 crate::cli::model_connections::connection_path(&connection_id, "disconnect")?;
@@ -3309,6 +3412,9 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Model(ModelCmd::Add(args))) => {
+            if crate::cli::native_auth::active().is_some() {
+                return Err("For MOI device models, open Astra and use /model to choose the ChatGPT model and its context/output limits. Server personal model configuration is separate.".into());
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let interactive =
                 !args.api_key_stdin && std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -3491,6 +3597,9 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Model(ModelCmd::Show(args))) => {
+            if crate::cli::native_auth::active().is_some() {
+                return Err("Use /model to manage MOI device models. This command manages standalone Server personal models.".into());
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = if let Some(model_id) =
                 find_personal_model_id(api, &token, &args.model_name).await?
@@ -3508,6 +3617,9 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Model(ModelCmd::Probe(args))) => {
+            if crate::cli::native_auth::active().is_some() {
+                return Err("Use /model to manage MOI device models. This command manages standalone Server personal models.".into());
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let model_id = find_personal_model_id(api, &token, &args.model_name)
                 .await?
@@ -3521,6 +3633,9 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Model(ModelCmd::Delete(args))) => {
+            if crate::cli::native_auth::active().is_some() {
+                return Err("Use /model to manage MOI device models. This command manages standalone Server personal models.".into());
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let model_id = find_personal_model_id(api, &token, &args.model_name)
                 .await?

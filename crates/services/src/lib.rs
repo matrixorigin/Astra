@@ -30,6 +30,7 @@ pub mod observation_capture;
 pub mod pagination;
 pub mod reflect;
 pub(crate) mod registry_payload;
+pub mod runner_model_bindings;
 pub use registry_payload::validate_registered_endpoint_url;
 pub mod delegation_model_requirement;
 pub mod resource_governor;

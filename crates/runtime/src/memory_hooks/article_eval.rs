@@ -35,6 +35,7 @@ impl Model {
     fn route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             usage_attestation: None,
+            device_binding: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,

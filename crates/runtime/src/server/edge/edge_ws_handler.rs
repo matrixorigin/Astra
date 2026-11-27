@@ -531,12 +531,18 @@ async fn handle_edge_connection(
         ToolTransportKind::EdgeWebSocket,
     )
     .and_then(|mut capabilities| {
-        if capabilities.get("capacity_rpc_v1").is_some() {
-            if let Some(origin) = &state.execution.edge_capacity_relay_origin {
-                capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
-            } else if state.execution.edge_registry_service.has_durable_routing() {
-                return Err("capacity node routing is not configured".to_string());
-            }
+        let preview = capabilities["protocol_capabilities"]
+            [astra_turn_types::runner_inference::RUNNER_PREVIEW_CAPABILITY]
+            == true;
+        if (preview || capabilities.get("capacity_rpc_v1").is_some())
+            && let Some(origin) = &state.execution.edge_capacity_relay_origin
+        {
+            // Server-owned socket route. Sanitization strips peer-supplied origins.
+            capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
+        } else if capabilities.get("capacity_rpc_v1").is_some()
+            && state.execution.edge_registry_service.has_durable_routing()
+        {
+            return Err("capacity node routing is not configured".to_string());
         }
         Ok(capabilities)
     }) {
@@ -1449,6 +1455,32 @@ async fn handle_edge_connection(
     }));
 
     // ── Phase 3: Bidirectional message loop ──────────────────────────
+    // Inference has a bounded control worker. The reader never awaits its DB
+    // enrollment, grant, evidence, or custody writes. A queue overflow closes
+    // the connection without ACK; the device retains and replays its journal.
+    let (inference_tx, inference_task) =
+        match astra_turn_types::runner_inference::RunnerInferenceId::new(edge_agent_id.clone()) {
+            Ok(runner_id) => {
+                let (sender, receiver) = mpsc::channel(super::runner_inference::CONTROL_CAPACITY);
+                let connection =
+                    astra_services::runner_model_bindings::AuthenticatedRunnerConnection {
+                        user_id: user_id.clone(),
+                        runner_id,
+                        edge_id: edge_id_for_registry.clone(),
+                    };
+                let task = tokio::spawn(super::runner_inference::run(
+                    state.shared_pool.clone(),
+                    state.model_service.clone(),
+                    state.edge_connection_pool.clone(),
+                    connection,
+                    pool_generation,
+                    receiver,
+                ));
+                (Some(sender), Some(task))
+            }
+            Err(_) => (None, None),
+        };
+
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
     let read_inflight = inflight_dispatches.clone();
@@ -1804,14 +1836,60 @@ async fn handle_edge_connection(
                                 Ok(EdgeClientMessage::Ping {}) => {
                                     pong_wake.notify_one();
                                 }
+                                Ok(message @ (EdgeClientMessage::InferenceHello { .. }
+                                    | EdgeClientMessage::InferenceBindingPublish { .. }
+                                    | EdgeClientMessage::InferenceStartEvidence { .. }
+                                    | EdgeClientMessage::InferenceCapacityRetired { .. }
+                                    | EdgeClientMessage::InferenceProgress { .. }
+                                    | EdgeClientMessage::InferenceTerminal { .. }
+                                    | EdgeClientMessage::InferenceResponseChunk { .. }
+                                    | EdgeClientMessage::InferenceRequestCredit { .. })) => {
+                                    if !state.edge_connection_pool.is_current_inference_connection(&user_id, &edge_agent_id, pool_generation)
+                                        || !super::runner_inference::validate_ingress(&message, &user_id, &edge_agent_id, pool_generation) {
+                                        break;
+                                    }
+                                    if let Some(sender) = &inference_tx {
+                                        let disposable_progress = matches!(
+                                            &message,
+                                            EdgeClientMessage::InferenceProgress { .. }
+                                        );
+                                        if sender.try_send(message).is_err() {
+                                            if disposable_progress {
+                                                // A full control queue is a normal
+                                                // preview gap, not a reason to tear
+                                                // down the authenticated socket. The
+                                                // terminal transfer has its own
+                                                // custody/reconciliation path.
+                                                tracing::debug!(
+                                                    target: "astra_runtime::edge_ws",
+                                                    user_id = %user_id,
+                                                    edge_agent_id = %edge_agent_id,
+                                                    "dropping Runner progress because the inference queue is full"
+                                                );
+                                                continue;
+                                            }
+                                            let _ = queue_edge_msg(&control_tx, EdgeServerMessage::Closing { reason: "inference control capacity unavailable".into() });
+                                            break;
+                                        }
+                                    } else {
+                                        let _ = queue_edge_msg(&control_tx, EdgeServerMessage::InferenceHelloAck {
+                                            negotiation: astra_turn_types::runner_inference::RunnerInferenceNegotiation::Unavailable {
+                                                reason: astra_turn_types::runner_inference::RunnerInferenceRejection::InferenceUnsupported,
+                                            },
+                                        });
+                                    }
+                                }
                                 Ok(EdgeClientMessage::Auth { .. }) => {
                                     // Already authenticated, ignore duplicate auth
                                 }
                                 Err(e) => {
+                                    let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
                                     tracing::warn!(
                                         user_id = %user_id,
                                         edge_agent_id = %edge_agent_id,
-                                        error = %e,
+                                        category = diagnostic.category,
+                                        line = diagnostic.line,
+                                        column = diagnostic.column,
                                         "Edge: invalid message"
                                     );
                                 }
@@ -1829,6 +1907,16 @@ async fn handle_edge_connection(
 
     read_loop.await;
     let last_receipt = last_receipt.map(|receipt| (receipt, cleanup.live_permit.clone()));
+
+    drop(inference_tx);
+    if let Some(mut task) = inference_task {
+        if tokio::time::timeout(Duration::from_millis(250), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
 
     // ── Cleanup ──────────────────────────────────────────────────────
     // Signal the relay before any cleanup can yield, so it cannot start a
@@ -3009,6 +3097,9 @@ pub(super) fn validate_edge_capabilities(
     transport: ToolTransportKind,
 ) -> Result<serde_json::Value, String> {
     let capabilities = capabilities.ok_or_else(|| "edge capabilities are required".to_string())?;
+    let preview = capabilities["protocol_capabilities"]
+        [astra_turn_types::runner_inference::RUNNER_PREVIEW_CAPABILITY]
+        == true;
     let runtime_process_authorization_v1 =
         astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
             &capabilities,
@@ -3094,6 +3185,12 @@ pub(super) fn validate_edge_capabilities(
             .map_err(|_| "capacity providers could not be serialized".to_string())?;
     }
     let mut accepted = serde_json::Map::new();
+    if preview {
+        accepted.insert(
+            astra_turn_types::runner_inference::RUNNER_PREVIEW_CAPABILITY.into(),
+            serde_json::Value::Bool(true),
+        );
+    }
     if runtime_process_authorization_v1 {
         accepted.insert(
             astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY
@@ -3407,7 +3504,7 @@ mod tests {
 
     #[test]
     fn validate_edge_capabilities_accepts_control_only_edge() {
-        let capabilities = edge_advertisement_with_tools(&[]);
+        let capabilities = astra_edge::inference_host::control_only_capabilities("edge-agent");
         let sanitized = validate_edge_capabilities(
             Some(capabilities),
             "edge-agent",

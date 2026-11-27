@@ -5,11 +5,11 @@ use crate::auth::FernetTokenEncryptor;
 use crate::{CancellationSafePoolConnection, CancellationSafeTransaction};
 use astra_core::model_wire::responses::ResponsesStreamError;
 use astra_core::{ErrorResponse, SharedPool, error_response_coded, internal_error};
+use astra_credentials::chatgpt::protocol::{self, AuthorizationRequest, Identity};
 use axum::{Json, http::StatusCode};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use jsonwebtoken::{Algorithm, Validation, decode, decode_header, jwk::JwkSet};
+use jsonwebtoken::jwk::JwkSet;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,11 +26,8 @@ use uuid::Uuid;
 pub const PROVIDER: &str = "chatgpt";
 #[cfg(test)]
 mod tests;
-pub const API_BASE: &str = "https://api.openai.com/v1";
-const ISSUER: &str = "https://auth.openai.com";
-const SCOPES: &str =
-    "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
-const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
+pub use astra_credentials::chatgpt::API_BASE;
+use astra_credentials::chatgpt::{ISSUER, PLAN_SCOPE};
 const AUTH_LIFETIME: i64 = 900;
 const REFRESH_BUDGET: Duration = Duration::from_secs(25);
 const REFRESH_LEASE_SECONDS: i64 = 30;
@@ -298,12 +295,6 @@ struct TokenResponse {
     scope: Option<String>,
     #[serde(default)]
     expires_in: i64,
-}
-#[derive(Deserialize)]
-struct Identity {
-    sub: String,
-    nonce: Option<String>,
-    email: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -739,21 +730,7 @@ impl ExecutionCredential {
     }
 }
 
-pub fn validate_redirect(value: &str) -> Result<(), &'static str> {
-    let url = Url::parse(value).map_err(|_| "Invalid OAuth redirect URI")?;
-    if url.scheme() != "http"
-        || url.host_str() != Some("127.0.0.1")
-        || url.port().is_none()
-        || url.path() != "/auth/callback"
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err("OAuth redirect must be http://127.0.0.1:<port>/auth/callback");
-    }
-    Ok(())
-}
+pub use astra_credentials::chatgpt::protocol::validate_redirect;
 
 impl ChatgptConnections {
     pub fn new(
@@ -953,30 +930,18 @@ impl ChatgptConnections {
         let state = Uuid::new_v4().simple().to_string();
         let nonce = Uuid::new_v4().simple().to_string();
         let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let id = Uuid::new_v4().to_string();
         let expires = unix_now() + AUTH_LIFETIME;
-        let mut url = config.provider_url(&config.authorize)?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs
-                .append_pair("client_id", &client_id)
-                .append_pair("ext_agent_host_id", &config.host_id)
-                .append_pair("response_type", "code")
-                .append_pair("redirect_uri", &request.redirect_uri)
-                .append_pair("scope", SCOPES)
-                .append_pair("resource", API_BASE)
-                .append_pair("state", &state)
-                .append_pair("nonce", &nonce)
-                .append_pair("code_challenge_method", "S256")
-                .append_pair("code_challenge", &challenge);
-            if client_id == "dynamic_agent_client" {
-                pairs.append_pair("agent_name_hint", "Astra");
-            }
-            if need_consent {
-                pairs.append_pair("prompt", "consent");
-            }
+        let url = AuthorizationRequest {
+            client_id: client_id.clone(),
+            host_id: config.host_id.clone(),
+            redirect_uri: request.redirect_uri.clone(),
+            state: state.clone(),
+            nonce: nonce.clone(),
+            verifier: verifier.clone(),
+            consent: need_consent,
         }
+        .authorization_url(config.provider_url(&config.authorize)?);
         query("DELETE FROM user_llm_authorizations WHERE user_id = ? AND expires_at < ?")
             .bind(owner)
             .bind(unix_now() - 86400)
@@ -1334,28 +1299,10 @@ impl ChatgptConnections {
         nonce: Option<&str>,
     ) -> ApiResult<Identity> {
         let config = self.config()?;
-        let header = decode_header(id_token).map_err(|_| reauth())?;
-        if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
-            return Err(reauth());
-        }
-        let kid = header.kid.as_deref().ok_or_else(reauth)?;
-        let jwks = self.signing_keys(Some(kid)).await?;
-        let key = jwks.find(kid).ok_or_else(reauth)?;
-        let key = jsonwebtoken::DecodingKey::from_jwk(key).map_err(|_| reauth())?;
-        let mut validation = Validation::new(header.alg);
-        validation.leeway = 0;
-        validation.set_issuer(&[config.issuer.as_str()]);
-        validation.set_audience(&[client_id]);
-        validation.set_required_spec_claims(&["exp", "iss", "sub", "aud"]);
-        let identity = decode::<Identity>(id_token, &key, &validation)
-            .map_err(|_| reauth())?
-            .claims;
-        if identity.sub.is_empty()
-            || identity.sub.len() > 255
-            || identity.email.as_ref().is_some_and(|e| e.len() > 255)
-        {
-            return Err(reauth());
-        }
+        let kid = protocol::identity_key_id(id_token).map_err(|_| reauth())?;
+        let jwks = self.signing_keys(Some(&kid)).await?;
+        let identity = protocol::verify_identity(id_token, client_id, &config.issuer, &jwks)
+            .map_err(|_| reauth())?;
         if let Some(expected) = nonce
             && !identity.nonce.as_deref().is_some_and(|n| {
                 self.encryptor
@@ -2280,45 +2227,8 @@ impl ChatgptConnections {
             .await?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| internal_error("OpenAI returned an invalid JSON response"))?;
-        let models = value
-            .get("models")
-            .and_then(Value::as_array)
-            .ok_or_else(|| internal_error("OpenAI subscription catalog is invalid"))?;
-        let mut items = Vec::new();
-        for model in models.iter().filter(|model| model["visibility"] == "list") {
-            let slug = model["slug"]
-                .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 255)
-                .ok_or_else(|| {
-                    internal_error("OpenAI subscription catalog has an invalid model slug")
-                })?;
-            let mut efforts = Vec::new();
-            if let Some(levels) = model["supported_reasoning_levels"].as_array() {
-                if levels.len() > 16 {
-                    return Err(internal_error("Invalid subscription reasoning inventory"));
-                }
-                for level in levels {
-                    let effort = level["effort"]
-                        .as_str()
-                        .filter(|s| {
-                            !s.is_empty()
-                                && s.len() <= 32
-                                && s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
-                        })
-                        .ok_or_else(|| internal_error("Invalid subscription reasoning effort"))?;
-                    if efforts.iter().any(|value| value == effort) {
-                        return Err(internal_error("Duplicate subscription reasoning effort"));
-                    }
-                    if astra_core::model_wire::thinking::ThinkingProtocol::supports_responses_effort(
-                        effort,
-                    ) {
-                        efforts.push(effort.to_owned());
-                    }
-                }
-            }
-            items.push(json!({"slug":slug,"display_name":model["display_name"].as_str().unwrap_or(slug),
-                "supported_reasoning_efforts":efforts,"default_reasoning_effort":model["default_reasoning_level"].as_str().filter(|effort| efforts.iter().any(|value| value == effort))}));
-        }
+        let items = astra_core::model_wire::responses::subscription_catalog(&value)
+            .map_err(internal_error)?;
         Ok(json!({"connection_id":binding.connection_id(),"items":items}))
     }
     pub async fn probe(
