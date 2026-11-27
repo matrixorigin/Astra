@@ -1304,7 +1304,7 @@ impl ThinClient {
         Self::json_or_error(response).await
     }
 
-    /// Read the owner-scoped durable Run activity for one Work branch.
+    /// Read the branch's durable Run activity and its Work event head.
     pub async fn get_work_branch_activity(
         &self,
         token: &str,
@@ -3694,6 +3694,7 @@ mod tests {
                 "work_id": "work-1",
                 "branch_id": "branch-1",
                 "branch_revision": 3,
+                "event_head": 7,
                 "activity": "working",
                 "observed_at": "2026-09-15T00:00:00Z"
             })))
@@ -3708,6 +3709,7 @@ mod tests {
         assert_eq!(activity.work_id, "work-1");
         assert_eq!(activity.branch_id, "branch-1");
         assert_eq!(activity.branch_revision, 3);
+        assert_eq!(activity.event_head, 7);
         assert_eq!(
             activity.activity,
             astra_server_types::WorkBranchActivityV1::Working
