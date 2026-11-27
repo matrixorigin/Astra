@@ -327,12 +327,12 @@ The same settings are available under `[tui]` in `runtime.toml`.
 | Show terminal tips | `show_tips = true` (default) or `false` | Immediately, including in restored sessions |
 | Terminal theme | `theme = "auto"` (default), `dark`, `light`, `dark-ansi`, `light-ansi`, or `plain` | Next launch |
 | Terminal glyphs | `glyphs = "unicode"` (default) or `ascii` | Next launch |
-| Terminal foreground/background | `foreground` and `background` accept `"#RRGGBB"` or `"auto"` (default) | Next launch |
+| Terminal background hint | `background` accepts `"#RRGGBB"` or `"auto"` (default) | Next launch |
 
 With the auto theme, Astra uses configured colors first, then the terminal's
 OSC 10/11 response, then `COLORFGBG`. A manual background or explicit theme
-skips color queries. A manual foreground can be combined with a detected
-background. The existing startup capability query shares a 300 ms budget with
+skips color queries. The hint helps select the theme and blend its surfaces.
+The existing startup capability query shares a 300 ms budget with
 color detection on macOS and Linux. Redirected I/O and `TERM=dumb` skip the
 query. `NO_COLOR` selects the plain profile. Stderr uses its own color
 capability when stdout is redirected.

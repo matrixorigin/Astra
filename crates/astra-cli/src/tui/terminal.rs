@@ -359,33 +359,28 @@ impl TerminalGuard {
             || queried_size.0 != self.terminal.last_known_screen_size.width;
         let superseded = interrupted || (size.width, size.height) != queried_size;
         let needs_anchor = self.unreconciled_width && cursor.is_none();
-        if !superseded && needs_anchor {
-            let now = Instant::now();
-            let deadline = self
-                .inline_recovery_deadline
-                .get_or_insert(now + Duration::from_millis(500));
-            if now >= *deadline {
+        if !superseded {
+            let append_pending =
+                self.terminal.viewport_area.top() >= self.terminal.last_known_screen_size.height;
+            let timed_out = needs_anchor && {
+                let now = Instant::now();
+                let deadline = self
+                    .inline_recovery_deadline
+                    .get_or_insert(now + Duration::from_millis(500));
+                now >= *deadline
+            };
+            if append_pending || timed_out {
                 // The reader keeps the unanswered cursor request quarantined.
-                if size == self.terminal.last_known_screen_size {
-                    // Reflow can restore the old frame's geometry while
-                    // leaving the cursor displaced. Repaint the old footprint.
-                    self.clear_viewport_from = Some(self.terminal.viewport_area.top());
-                } else {
-                    self.terminal.clear_inline_from_cursor()?;
-                    self.terminal.set_viewport_area(ratatui::layout::Rect::new(
-                        0,
-                        size.height,
-                        size.width,
-                        0,
-                    ));
-                    self.terminal
-                        .set_cursor_position(ratatui::layout::Position::new(
-                            0,
-                            size.height.saturating_sub(1),
-                        ))?;
-                    self.clear_viewport_from = None;
-                }
+                // Reflow may have moved committed rows into the old frame's
+                // footprint. Allocate fresh rows after the physical bottom.
+                self.terminal.set_viewport_area(ratatui::layout::Rect::new(
+                    0,
+                    size.height,
+                    size.width,
+                    0,
+                ));
                 self.terminal.resize(size)?;
+                self.clear_viewport_from = None;
                 self.clipped_reflow_below_cursor = None;
                 self.unreconciled_width = false;
                 self.inline_recovery_deadline = None;

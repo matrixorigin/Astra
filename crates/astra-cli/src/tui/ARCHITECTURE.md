@@ -98,10 +98,10 @@ They yield to typing, approval, queued messages, and small terminals.
 Primary workspaces use the alternate screen while the normal screen keeps
 conversation scrollback. The composer is redrawn from its draft when the
 workspace closes. The alternate screen resizes from dimensions alone. After
-a lost normal-screen cursor reply, the inline frame retires its painted rows
-relative to the cursor before redrawing. On exit, pending chat rows are
-appended in order. Glyph profiles provide ASCII fallbacks, and font selection
-remains under the terminal's control.
+a lost normal-screen cursor reply, the inline frame appends fresh rows after
+the physical bottom. The old frame may remain above the live composer.
+On exit, pending chat rows are appended in order. Glyph profiles provide ASCII
+fallbacks, and font selection remains under the terminal's control.
 The first visible assistant text uses the start time of its physical model
 item. The runtime assigns that clock when it opens an attempt before dispatch.
 Live text events, durable transcript payloads and local journals carry the

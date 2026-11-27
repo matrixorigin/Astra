@@ -9840,10 +9840,7 @@ pub(crate) async fn run_tui_session(
     let mut startup_terminal = super::terminal_startup::StartupTerminal::begin()
         .map_err(|error| format!("Terminal startup failed: {error}"))?;
 
-    // ── Initialize the gradient gutter time origin (PR #335) ─────────
-    // Without this, the first cell to finalize before any
-    // `elapsed_since_start()` call would saturate to 0 and the gutter
-    // would jump on freeze. Eager init guarantees `>= PROCESS_START`.
+    // Establish the animation clock before the first status frame.
     super::shimmer::init_time_origin();
 
     // ── Business initialization BEFORE entering TUI ─────────────────────

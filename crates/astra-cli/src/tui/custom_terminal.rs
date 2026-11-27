@@ -24,7 +24,7 @@
 use std::io;
 use std::io::Write;
 
-use crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
+use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::Colors;
 use crossterm::style::Print;
@@ -507,36 +507,6 @@ where
             return Ok(());
         }
         self.clear_after_position(self.viewport_area.as_position())
-    }
-
-    /// Erase the painted inline frame relative to the terminal's actual
-    /// cursor. This also works when the terminal relocated the frame and did
-    /// not report its absolute cursor position.
-    pub(crate) fn clear_inline_from_cursor(&mut self) -> io::Result<()>
-    where
-        B: Write,
-    {
-        if !self.viewport_area.contains(self.last_known_cursor_pos)
-            || !self
-                .previous_buffer()
-                .content
-                .iter()
-                .any(|cell| cell != &Cell::EMPTY)
-        {
-            return Ok(());
-        }
-
-        // With no cursor report, only the painted rows up to the cursor
-        // are a safe bound. Predicted wraps may not have happened. Moving
-        // up over them can erase committed chat on terminals that clip.
-        let rows_above = self.last_known_cursor_pos.y - self.viewport_area.top();
-        if rows_above > 0 {
-            queue!(self.backend, MoveUp(rows_above))?;
-        }
-        queue!(self.backend, MoveToColumn(0))?;
-        Self::backend_io(self.backend.clear_region(ClearType::AfterCursor))?;
-        self.previous_buffer_mut().reset();
-        Ok(())
     }
 
     /// Clear from position through the end of the visible screen and force a full redraw.

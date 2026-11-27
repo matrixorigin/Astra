@@ -349,14 +349,8 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             value: serde_json::json!(config.tui.glyphs.unwrap_or_default()),
         },
         SettingItem {
-            id: "tui.foreground".to_string(),
-            label: "Terminal text color (next launch)".to_string(),
-            kind: SettingKind::Text,
-            value: serde_json::json!(config.tui.foreground.unwrap_or_default()),
-        },
-        SettingItem {
             id: "tui.background".to_string(),
-            label: "Terminal background (next launch)".to_string(),
+            label: "Terminal background hint (next launch)".to_string(),
             kind: SettingKind::Text,
             value: serde_json::json!(config.tui.background.unwrap_or_default()),
         },
@@ -657,7 +651,7 @@ pub fn apply_edit(
         }
         "tui.theme" => config.tui.theme = Some(serde_json::from_value(new_value)?),
         "tui.glyphs" => config.tui.glyphs = Some(serde_json::from_value(new_value)?),
-        "tui.foreground" | "tui.background" => {
+        "tui.background" => {
             let value = new_value
                 .as_str()
                 .ok_or_else(|| OverlayError::TypeMismatch {
@@ -665,13 +659,10 @@ pub fn apply_edit(
                     expected: "string".to_string(),
                     got: describe(&new_value),
                 })?;
-            let color = TuiColor::try_from(value.to_string())
-                .map_err(|message| OverlayError::InvalidInvariant(message.into()))?;
-            if id == "tui.foreground" {
-                config.tui.foreground = Some(color);
-            } else {
-                config.tui.background = Some(color);
-            }
+            config.tui.background = Some(
+                TuiColor::try_from(value.to_string())
+                    .map_err(|message| OverlayError::InvalidInvariant(message.into()))?,
+            );
         }
         "explain.report_format" => {
             let value = new_value
@@ -747,7 +738,6 @@ mod tests {
             ("tui.theme", "dark-ansi"),
             ("tui.glyphs", "ascii"),
             ("tui.background", "#F5F5F5"),
-            ("tui.foreground", "auto"),
         ] {
             config = apply_edit(config, id, Value::from(value)).unwrap();
         }

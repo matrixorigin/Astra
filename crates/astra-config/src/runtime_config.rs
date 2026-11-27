@@ -198,8 +198,6 @@ pub struct TuiConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glyphs: Option<TuiGlyphProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub foreground: Option<TuiColor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<TuiColor>,
 }
 

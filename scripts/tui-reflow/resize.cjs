@@ -15,9 +15,10 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function journey(sizes, draft = false, rapid = false, displacedCursor = false, expiredReply = false) {
   const checkTranscriptReturn = draft && sizes.length === 0 && !rapid;
   const checkContextReturn = !draft && sizes.length === 0 && !rapid;
+  const historyRows = expiredReply === 'width' ? 18 : 0;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
-  const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root], {
+  const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root, String(historyRows)], {
     stdio: ['pipe', 'pipe', 'inherit'],
   });
   const exited = once(child, 'exit');
@@ -119,6 +120,30 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     await delay(200);
     await waitFor(() => Date.now() - lastOutput >= 200);
   }
+  function liveDraft() {
+    const buffer = terminal.buffer.active;
+    const screen = lines().slice(buffer.baseY);
+    const top = screen.slice(0, buffer.cursorY + 1).findLastIndex(line => line.startsWith('╭'));
+    const bottom = screen.findIndex((line, row) => row > buffer.cursorY && line.startsWith('╰'));
+    if (top < 0 || bottom < 0 || !screen[buffer.cursorY]?.startsWith('│')) return '';
+    return screen.slice(top + 1, bottom).map(line => line.slice(1, -1)).join('').replace(/[\s›▏]/g, '');
+  }
+  function checkHistory(label) {
+    const all = lines();
+    const context = label + '\n' + all.join('\n');
+    const flattened = all.join('').replace(/\s/g, '');
+    assert.equal(all.filter(line => line.includes('RESIZE_HISTORY_SENTINEL')).length, 1,
+      'pre-existing history was lost or duplicated: ' + context);
+    const history = flattened.match(/RESIZE_HISTORY_SENTINEL((?:history)+)/);
+    assert.equal(history?.[1], 'history'.repeat(20), 'history text was damaged: ' + context);
+    for (let row = 0; row < historyRows; row++) {
+      assert(flattened.includes('REFLOW-' + String(row).padStart(2, '0') + 'wide-line'.repeat(21)),
+        'wrapped history was lost or damaged: ' + context);
+    }
+    assert.equal(all.filter(line => line.includes('Workspace trusted')).length, 1,
+      'committed startup history was lost or duplicated: ' + context);
+    assert(!Buffer.concat(output).includes(Buffer.from('\x1b[3J')), 'resize purged native scrollback');
+  }
   function check(label) {
     const all = lines();
     const visible = all.slice(terminal.buffer.active.baseY, terminal.buffer.active.baseY + terminal.rows);
@@ -128,10 +153,6 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     assert.equal(footers.length, 1, 'footer leaked into screen/scrollback: ' + context);
     assert.equal(prompts.length, 1, 'composer missing or duplicated: ' + context);
     assert(visible.some(line => line.includes(draft ? 'DRAFT_SENTINEL' : 'Message Astra')), 'live composer not visible: ' + context);
-    assert.equal(all.filter(line => line.includes('RESIZE_HISTORY_SENTINEL')).length, 1,
-      'pre-existing history was lost or duplicated: ' + context);
-    const history = all.join('').replace(/\s/g, '').match(/RESIZE_HISTORY_SENTINEL((?:history)+)/);
-    assert.equal(history?.[1], 'history'.repeat(20), 'history text was damaged: ' + context);
     const tips = all.filter(line => line.includes('· Tip'));
     const shortcuts = all.filter(line => line.startsWith('  Ctrl+G agents · Ctrl+O transcript'));
     assert.equal(shortcuts.length, visible.filter(line => shortcuts.includes(line)).length,
@@ -155,9 +176,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       assert.equal(tips.length, 1, 'the live composer should show a tip: ' + context);
       assert(tips[0].includes('Message Astra'), 'the tip left its input row: ' + context);
     }
-    assert.equal(all.filter(line => line.includes('Workspace trusted')).length, 1,
-      'committed startup history was lost or duplicated: ' + context);
-    assert(!Buffer.concat(output).includes(Buffer.from('\x1b[3J')), 'resize purged native scrollback');
+    checkHistory(label);
     console.log('PASS', label);
   }
   try {
@@ -249,13 +268,11 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
         'reply timeout erased previous scrollback');
       await resize(65, 22);
       send({ input: '\x1b[200~_AFTER_SECOND_RESIZE\x1b[201~' });
-      await waitFor(() => visible().some(line => line.includes('DROPPED_REPLY_DRAFT_AFTER_SECOND_RESIZE')));
+      await waitFor(() => liveDraft() === 'DROPPED_REPLY_DRAFT_AFTER_SECOND_RESIZE');
       await settle();
       assert.equal(cursorReports, reportsBeforeLoss + 1, 'issued a query while the first reply was missing');
-      assert.equal(lines().filter(line => line.includes('DROPPED_REPLY_DRAFT')).length, 1,
-        'the abandoned composer remained on the screen');
-      const history = lines().join('').replace(/\s/g, '').match(/RESIZE_HISTORY_SENTINEL((?:history)+)/);
-      assert.equal(history?.[1], 'history'.repeat(20), 'second resize damaged previous scrollback');
+      assert.equal(liveDraft(), 'DROPPED_REPLY_DRAFT_AFTER_SECOND_RESIZE');
+      checkHistory('second resize during cursor reply quarantine');
       return;
     }
     if (expiredReply) {
@@ -271,24 +288,28 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       // usable, but another indistinguishable DSR must not overlap this one.
       await settle();
       send({ input: '\x1b[200~ PENDING_INPUT\x1b[201~' });
-      if (expiredReply !== 'width') await waitFor(() => lines().join('').includes('PENDING_INPUT'));
+      await waitFor(() => liveDraft().includes('PENDING_INPUT'));
       await settle();
       assert.equal(cursorReports, before + 1, 'issued another cursor query before the expired reply was consumed');
       if (expiredReply === 'width') {
-        assert.equal(lines().filter(line => line.includes('Workspace trusted')).length, 1,
-          'width query timeout erased committed history:\n' + lines().join('\n'));
+        checkHistory('width query timeout; paste remains responsive');
       } else {
         check('cursor reply deadline; paste remains responsive');
       }
       holdCursorReply = false;
       send({ input: expired });
       send({ input: '\x1b[200~ RECOVERED_INPUT\x1b[201~' });
-      await waitFor(() => lines().join('').includes('RECOVERED_INPUT'));
+      await waitFor(() => liveDraft().includes('RECOVERED_INPUT'));
       await resize(160, 30);
       await waitFor(() => cursorReports > before + 1);
       await settle();
-      assert(lines().join('').includes('PENDING_INPUT'), 'input was lost during cursor reply quarantine');
-      check('late cursor reply quarantined; fresh resize recovered');
+      const expected = 'DRAFT_SENTINEL' + 'draft'.repeat(20) + 'PENDING_INPUTRECOVERED_INPUT';
+      assert.equal(liveDraft(), expected, 'resize changed the live draft');
+      if (expiredReply === 'width') {
+        checkHistory('late cursor reply quarantined; fresh resize recovered');
+      } else {
+        check('late cursor reply quarantined; fresh resize recovered');
+      }
       return;
     }
     tracingResize = rapid;

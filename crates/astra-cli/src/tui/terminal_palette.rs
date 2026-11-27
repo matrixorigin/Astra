@@ -63,6 +63,7 @@ pub(crate) struct TerminalColors {
     pub bg: Option<(u8, u8, u8)>,
 }
 
+#[cfg(test)]
 pub(crate) fn default_fg() -> Option<(u8, u8, u8)> {
     DEFAULT_COLORS
         .get_or_init(|| resolve_terminal_defaults(TerminalColors::default()))
@@ -214,7 +215,6 @@ fn resolve_terminal_defaults(queried: TerminalColors) -> TerminalColors {
     let tui = &astra_config::RuntimeConfig::cached().tui;
     let hint = std::env::var("COLORFGBG").ok();
     resolve_colors(
-        tui.foreground.and_then(TuiColor::rgb),
         tui.background.and_then(TuiColor::rgb),
         queried,
         hint.as_deref(),
@@ -222,14 +222,13 @@ fn resolve_terminal_defaults(queried: TerminalColors) -> TerminalColors {
 }
 
 fn resolve_colors(
-    fg: Option<(u8, u8, u8)>,
     bg: Option<(u8, u8, u8)>,
     queried: TerminalColors,
     hint: Option<&str>,
 ) -> TerminalColors {
     let hint = hint.and_then(|value| parse_colorfgbg(value.trim()));
     TerminalColors {
-        fg: fg.or(queried.fg).or(hint.map(|colors| colors.fg)),
+        fg: queried.fg.or(hint.map(|colors| colors.fg)),
         bg: bg.or(queried.bg).or(hint.map(|colors| colors.bg)),
     }
 }
@@ -350,15 +349,13 @@ mod tests {
     }
 
     #[test]
-    fn manual_colors_override_queries_and_queries_override_environment_hints() {
+    fn manual_background_overrides_queries_and_queries_override_environment_hints() {
         let queried = super::TerminalColors {
             fg: Some((1, 2, 3)),
             bg: Some((255, 255, 255)),
         };
-        let resolved = super::resolve_colors(Some((16, 32, 48)), None, queried, Some("15;0"));
-        assert_eq!(resolved.fg, Some((16, 32, 48)));
-        assert_eq!(resolved.bg, Some((255, 255, 255)));
-        let resolved = super::resolve_colors(None, Some((0, 0, 0)), queried, Some("0;15"));
+        assert_eq!(super::resolve_colors(None, queried, Some("15;0")), queried);
+        let resolved = super::resolve_colors(Some((0, 0, 0)), queried, Some("0;15"));
         assert_eq!(resolved.fg, Some((1, 2, 3)));
         assert_eq!(resolved.bg, Some((0, 0, 0)));
     }
@@ -369,10 +366,9 @@ mod tests {
             fg: None,
             bg: Some((255, 255, 255)),
         };
-        assert_eq!(super::resolve_colors(None, None, queried, None), queried);
+        assert_eq!(super::resolve_colors(None, queried, None), queried);
         assert_eq!(
             super::resolve_colors(
-                None,
                 Some((255, 255, 255)),
                 super::TerminalColors::default(),
                 None
@@ -384,41 +380,11 @@ mod tests {
     #[test]
     fn unavailable_or_malformed_response_falls_back_per_channel() {
         let queried = super::TerminalColors::default();
-        assert_eq!(super::resolve_colors(None, None, queried, None), queried);
-        let colors = super::resolve_colors(None, None, queried, Some("0;15"));
+        assert_eq!(super::resolve_colors(None, queried, None), queried);
+        let colors = super::resolve_colors(None, queried, Some("0;15"));
         assert_eq!(colors.fg, Some((0, 0, 0)));
         assert_eq!(colors.bg, Some((255, 255, 255)));
         assert_eq!(parse_colorfgbg("0;default;15"), parse_colorfgbg("0;15"));
-    }
-
-    #[test]
-    fn manual_colors_override_environment_hints_per_channel() {
-        let queried = super::TerminalColors::default();
-        let resolved = super::resolve_colors(Some((16, 32, 48)), None, queried, Some("15;0"));
-        assert_eq!(resolved.fg, Some((16, 32, 48)));
-        assert_eq!(resolved.bg, Some((0, 0, 0)));
-        let resolved = super::resolve_colors(None, Some((0, 0, 0)), queried, Some("0;15"));
-        assert_eq!(resolved.fg, Some((0, 0, 0)));
-        assert_eq!(resolved.bg, Some((0, 0, 0)));
-    }
-
-    #[test]
-    fn manual_colors_work_independently_without_environment_hints() {
-        let queried = super::TerminalColors::default();
-        assert_eq!(
-            super::resolve_colors(None, Some((255, 255, 255)), queried, None),
-            super::TerminalColors {
-                fg: None,
-                bg: Some((255, 255, 255))
-            },
-        );
-        assert_eq!(
-            super::resolve_colors(Some((16, 32, 48)), None, queried, None),
-            super::TerminalColors {
-                fg: Some((16, 32, 48)),
-                bg: None
-            },
-        );
     }
 
     #[test]
