@@ -868,7 +868,7 @@ pub fn extract_session_state_from_metadata(
     let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
         Ok(v) => v,
         Err(e) => {
-            let prefix = &metadata_json[..metadata_json.len().min(200)];
+            let prefix = &metadata_json[..metadata_json.floor_char_boundary(200)];
             return Err(format!(
                 "session metadata JSON parse failed: {e}; payload_prefix={prefix:?}"
             ));
@@ -1767,6 +1767,23 @@ mod tests {
         let state = extract_session_state_from_metadata(metadata).unwrap();
         assert_eq!(state.git_branch.as_deref(), Some("feature/cloud-sync"));
         assert_eq!(state.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn extract_session_state_from_metadata_reports_malformed_multibyte_payload() {
+        // Byte 200 falls inside a Chinese character; the error preview must
+        // stop at a character boundary instead of panicking the restore.
+        let metadata = format!("{{\"summary\":\"x{}", "会话摘要".repeat(40));
+        assert!(!metadata.is_char_boundary(200));
+        let err = extract_session_state_from_metadata(&metadata).unwrap_err();
+        assert!(
+            err.starts_with("session metadata JSON parse failed:"),
+            "{err}"
+        );
+        assert!(
+            err.contains("payload_prefix=\"{\\\"summary\\\":\\\"x会话摘要"),
+            "{err}"
+        );
     }
 
     #[test]
