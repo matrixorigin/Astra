@@ -538,13 +538,9 @@ pub(crate) fn active_viewport(
         let mut lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
             && cell.is_live()
         {
-            let mut lines = sanitize_lines_for_buffer(
-                assistant.live_viewport_lines(inner_w, live_assistant_rows),
-            );
-            if lines.iter().any(|line| !line.spans.is_empty()) {
-                lines.insert(0, AssistantCell::speaker_line());
-            }
-            lines
+            sanitize_lines_for_buffer(
+                assistant.live_reply_lines(width.saturating_sub(2).max(1), live_assistant_rows),
+            )
         } else {
             history_cell_lines_for_buffer(cell, inner_w)
         };
@@ -771,9 +767,8 @@ pub(crate) fn do_draw(
     // below it. The run navigator remains reachable through Ctrl+G and
     // Left/Esc returns to it, giving this surface browser-tab semantics.
     if bottom_pane.primary_workspace_is_open() {
-        let height = terminal_size.height.max(1);
         return guard
-            .draw(height, |frame| {
+            .draw_workspace(|frame| {
                 let area = frame.area();
                 if let Some((x, y)) = render_primary_workspace(
                     area,

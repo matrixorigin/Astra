@@ -57,6 +57,7 @@ pub(crate) enum TurnEvent {
     /// lines — that way theme changes or width changes between
     /// runs render correctly.
     Assistant {
+        /// RFC3339 time when the inline client received the first reply delta.
         #[serde(default)]
         ts: Option<String>,
         /// Raw markdown the model emitted. No ANSI, no line splits.

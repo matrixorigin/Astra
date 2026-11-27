@@ -3375,8 +3375,9 @@ impl ChatWidget {
             self.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Assistant)
         ) {
-            let mut cell = AssistantCell::new_streaming();
-            cell.model_item_id = model_item_id.map(str::to_owned);
+            let cell = AssistantCell::new_streaming().with_model_item(model_item_id, || {
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            });
             self.install_active_cell(Box::new(cell));
         }
 

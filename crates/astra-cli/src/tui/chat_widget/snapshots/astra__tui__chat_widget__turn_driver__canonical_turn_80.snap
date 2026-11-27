@@ -9,7 +9,7 @@ expression: snapshot
   ├ ls /tmp
   └ 3 entries
 
-  Astra
+  Astra  HH:MM:SS
   There are 3 files.
 
   1.2s total · ttft 400ms · 240 tokens · 1 tool

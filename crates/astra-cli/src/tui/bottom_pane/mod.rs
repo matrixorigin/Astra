@@ -2558,7 +2558,7 @@ impl BottomPane {
         self.view_stack.get_mut(index)
     }
 
-    fn popup_height(&self) -> u16 {
+    fn command_popup_height(&self) -> u16 {
         if let Some(m) = &self.slash_menu {
             return slash_popup_render::desired_composer_height(m);
         }
@@ -2568,7 +2568,7 @@ impl BottomPane {
         if let Some(p) = &self.skill_popup {
             return p.height();
         }
-        self.composer.history_suggestions_height()
+        0
     }
 
     pub(super) fn has_composer_hints(&self, width: u16) -> bool {
@@ -2979,7 +2979,8 @@ impl BottomPane {
         if self.has_active_view() {
             0
         } else {
-            self.popup_height().saturating_sub(1)
+            self.command_popup_height().saturating_sub(1)
+                + self.composer.history_suggestions_height()
         }
     }
 
@@ -3007,7 +3008,7 @@ impl BottomPane {
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
         let next_turn_queue_h = self.next_turn_submission_height();
-        let popup_h = self.popup_height();
+        let popup_h = self.command_popup_height() + self.composer.history_suggestions_height();
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
@@ -3040,13 +3041,16 @@ impl BottomPane {
                 .desired_height(area.width)
                 .saturating_sub(composer),
         );
-        let popup_rows = self.popup_height();
-        let popup = take(popup_rows.min(1));
+        let command_rows = self.command_popup_height();
+        let popup = take(command_rows.min(1));
         let queue = take(self.user_intent_height());
         let next_turn_queue = take(self.next_turn_submission_height());
         let context = take(1);
         let footer = take(1);
-        let popup = popup + take(popup_rows.saturating_sub(popup));
+        // History is optional even when it has a candidate. Leave room for
+        // live output and status before allocating the list on short screens.
+        let popup = popup
+            + take(command_rows.saturating_sub(popup) + self.composer.history_suggestions_height());
         let hints = take(u16::from(self.has_composer_hints(area.width)));
         let mut y = area.y;
         let mut row = |height| {

@@ -328,7 +328,11 @@ fn probe_child() {
         assert!(astra_tools::display_sixel::cached_sixel_support().is_none());
     }
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let mut stream = crate::tui::event::TuiEventStream::new(rx, guard.resize_pending.clone());
+    let mut stream = crate::tui::event::TuiEventStream::new(
+        rx,
+        guard.resize_pending.clone(),
+        guard.alternate_screen.clone(),
+    );
     println!("INPUT_READY");
     if let Some(paste) = queued_paste_input(&case) {
         use crate::tui::{

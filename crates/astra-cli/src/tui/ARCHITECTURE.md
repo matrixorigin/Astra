@@ -95,14 +95,27 @@ latest live output. Optional task and agent details use remaining space. A Tip c
 empty composer’s input row. Tips rotate
 using the existing draw tick and switch between idle and active-run shortcuts.
 They yield to typing, approval, queued messages, and small terminals.
-Primary workspaces keep their own canvas. Glyph profiles provide ASCII
-fallbacks, and font selection remains under the terminal's control.
+Primary workspaces use the alternate screen while the normal screen keeps
+conversation scrollback. The composer is redrawn from its draft when the
+workspace closes. The alternate screen resizes from dimensions alone. After
+a lost normal-screen cursor reply, the inline frame retires its painted rows
+relative to the cursor before redrawing. On exit, pending chat rows are
+appended in order. Glyph profiles provide ASCII fallbacks, and font selection
+remains under the terminal's control.
+The first visible assistant text uses the start time of its physical model
+item. The runtime assigns that clock when it opens an attempt before dispatch.
+Live text events, durable transcript payloads and local journals carry the
+same model item identity.
 Inside a delegated conversation the activity line reads that exact run's
 existing status and elapsed evidence, instead of attributing the global agent
 summary to the selected child. Unknown and stale status remain qualified;
 completed durations do not continue ticking. Pending tabs retain their place
 when a run identity arrives, and paging uses the actual area left after
 workspace chrome and approval notices.
+
+The `You` and `Astra` headings show local clock times when available.
+A streamed reply keeps its model item time when it settles or is replayed.
+Older items use the available receipt or record timestamp.
 
 Tool result previews preserve output whitespace and expand tabs only for
 display; the transcript's full text export keeps the original logical lines.

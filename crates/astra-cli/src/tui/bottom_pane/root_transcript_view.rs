@@ -369,7 +369,7 @@ impl RootTranscriptView {
             let state = if local_live.settled {
                 "Local result · history pending"
             } else {
-                "Live activity · history pending"
+                "Local live activity · history pending"
             };
             items.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(u64::MAX - 1),
@@ -772,7 +772,7 @@ mod tests {
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(
             text.lines()
-                .any(|line| line.starts_with("  Live activity · history pending")),
+                .any(|line| line.starts_with("  Local live activity · history pending")),
             "{text}"
         );
         assert!(text.contains("live model output"), "{text}");

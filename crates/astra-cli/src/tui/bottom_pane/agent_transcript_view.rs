@@ -392,8 +392,10 @@ impl LiveTranscript {
             }
             _ => {
                 self.finish_open_model_item();
-                let mut cell = AssistantCell::new_streaming();
-                cell.model_item_id = model_item_id.map(str::to_owned);
+                let mut cell = AssistantCell::new_streaming()
+                    .with_model_item(model_item_id, || {
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    });
                 cell.push_delta(text);
                 self.push(LiveTranscriptItem::Assistant(Arc::new(Mutex::new(cell))));
             }
@@ -1058,7 +1060,7 @@ impl AgentTranscriptView {
         if let Some(live) = &self.local_root_live {
             projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(u64::MAX - 1),
-                "Live activity · history pending",
+                "Local live activity · history pending",
             ));
             projected.push(live.item.clone());
         }
@@ -1765,12 +1767,10 @@ fn project_durable_transcript(
                 if item.role == "assistant" || !item.tool_calls.is_empty() =>
             {
                 if item.role == "assistant" && !item.content.trim().is_empty() {
-                    let mut cell =
-                        crate::tui::history_cell::assistant::AssistantCell::from_markdown(
-                            item.content.clone(),
-                        )
-                        .with_timestamp(item.created_at.clone());
-                    cell.model_item_id = item.model_item_id.clone().filter(|id| !id.is_empty());
+                    let cell = AssistantCell::from_markdown(item.content.clone()).with_model_item(
+                        item.model_item_id.as_deref().filter(|id| !id.is_empty()),
+                        || item.created_at.clone(),
+                    );
                     projected.push(TranscriptItem::committed(id, Arc::new(cell), 1));
                 }
                 for (index, call) in item.tool_calls.iter().enumerate() {
@@ -4406,6 +4406,38 @@ mod tests {
             assert!(view.local_root_live.is_none());
             assert_eq!(rendered(&view).matches("root_live_body").count(), 1);
         }
+    }
+
+    #[test]
+    fn child_reply_keeps_its_model_item_time_when_the_durable_page_arrives() {
+        let mut view = loading_view(80, 24);
+        let model_item_id = "019a93c5-d340-7000-8000-000000000001";
+        let time = chrono::DateTime::from_timestamp_millis(0x019a93c5d340)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        let heading = format!("Astra  {time}");
+        assert!(view.apply_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some(model_item_id.into()),
+                text: "Found the race.".into(),
+            },
+        }));
+        let live = rendered(&view);
+        assert!(live.contains(&heading), "{live}");
+        let mut durable = page();
+        durable.items[0].model_item_id = Some(model_item_id.into());
+        // Persisted later than the model item started.
+        durable.items[0].created_at = "2026-07-11T00:00:07".into();
+        view.apply_page(durable.clone(), true, AgentTranscriptSource::DurableServer);
+        let settled = rendered(&view);
+        assert_eq!(settled.matches(&heading).count(), 1, "{settled}");
+        assert_eq!(settled.matches("Found the race.").count(), 1, "{settled}");
+        let mut reopened = loading_view(80, 24);
+        reopened.apply_page(durable, true, AgentTranscriptSource::DurableServer);
+        assert!(rendered(&reopened).contains(&heading));
     }
 
     fn page() -> astra_thin_client::SessionTranscriptPage {

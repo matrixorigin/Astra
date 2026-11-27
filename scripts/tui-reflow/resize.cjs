@@ -14,6 +14,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function journey(sizes, draft = false, rapid = false, displacedCursor = false, expiredReply = false) {
   const checkTranscriptReturn = draft && sizes.length === 0 && !rapid;
+  const checkContextReturn = !draft && sizes.length === 0 && !rapid;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
   const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root], {
@@ -25,13 +26,17 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   let tracingResize = false;
   let cursorReports = 0;
   let holdCursorReply = false;
+  let dropCursorReplies = false;
   let heldCursorReply;
   const send = message => {
     if (tracingResize) snapshot('send ' + JSON.stringify(message));
     child.stdin.write(JSON.stringify(message) + '\n');
   };
   terminal.onData(input => {
-    if (/\x1b\[\d+;\d+R/.test(input)) cursorReports++;
+    if (/\x1b\[\d+;\d+R/.test(input)) {
+      cursorReports++;
+      if (dropCursorReplies) return;
+    }
     if (tracingResize) snapshot('reply ' + JSON.stringify(input));
     // A slow terminal reply must not let a resize draw use an older geometry.
     if (rapid && /\x1b\[\d+;\d+R/.test(input)) {
@@ -171,6 +176,9 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     check('initial 100x30');
     if (checkTranscriptReturn) {
       const draftText = 'DRAFT_SENTINEL';
+      const inline = terminal.buffer.active;
+      const originalDraftRow = lines().slice(inline.baseY).findIndex(line => line.includes(draftText));
+      const originalCursor = inline.cursorY;
       send({ input: '\x0f' });
       await waitFor(() => lines().some(line => line.includes('· Transcript')));
       send({ input: '\x0f' });
@@ -178,14 +186,76 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       await settle();
       const buffer = terminal.buffer.active;
       const draftRow = lines().slice(buffer.baseY).findIndex(line => line.includes(draftText));
-      assert(draftRow >= terminal.rows - 10,
-        'returning from the transcript moved the composer away from the bottom: ' + lines().join('\n'));
+      assert.equal(draftRow, originalDraftRow,
+        'returning from the transcript moved the draft: ' + lines().join('\n'));
+      assert.equal(buffer.cursorY, originalCursor, 'returning from the transcript moved the cursor');
       const cursor = buffer.cursorY;
       send({ input: '\x1b[200~跟进 patch.rs\x1b[201~' });
       await waitFor(() => lines().some(line => line.includes('跟进 patch.rs')));
       await settle();
       assert.equal(buffer.cursorY, cursor, 'typing on the current line moved the input cursor');
       check('typing after a transcript round trip');
+    }
+    if (checkContextReturn) {
+      const visible = () => lines().slice(terminal.buffer.active.baseY);
+      assert(visible().some(line => line.includes('RESIZE_HISTORY_SENTINEL')),
+        'baseline history must be visible before opening the panel');
+      const openContext = async () => {
+        send({ input: '\x1b[200~/context\x1b[201~\r' });
+        await waitFor(() => visible().some(line => line.includes('Esc close')));
+        await settle();
+        assert.equal(terminal.buffer.active.type, 'alternate');
+      };
+      const closeContext = async (label) => {
+        send({ input: '\x1b' });
+        await waitFor(() => visible().some(line => line.includes('Opened context panel')) &&
+          visible().some(line => line.includes('Message Astra')));
+        await settle();
+        const screen = visible();
+        const note = screen.findIndex(line => line.includes('Opened context panel'));
+        const prompt = screen.findIndex(line => line.includes('Message Astra'));
+        assert(prompt > note && prompt - note <= 4, 'blank gap on return:\n' + screen.join('\n'));
+        assert.equal(terminal.buffer.active.type, 'normal');
+        check(label);
+      };
+      await openContext();
+      await closeContext('close /context without moving the conversation');
+      assert(visible().some(line => line.includes('RESIZE_HISTORY_SENTINEL')),
+        'closing the panel hid previously visible history');
+      await openContext();
+      const reportsBeforeResize = cursorReports;
+      await resize(42, 18);
+      await settle();
+      assert.equal(cursorReports, reportsBeforeResize, 'alternate resize asked for a cursor');
+      await closeContext('close /context after resize');
+
+      await openContext();
+      const reportsBeforeLoss = cursorReports;
+      dropCursorReplies = true;
+      for (const [cols, rows] of [[76, 24], [39, 16], [55, 21]]) {
+        await resize(cols, rows);
+        await settle();
+        assert.equal(terminal.buffer.active.type, 'alternate');
+        assert.equal(cursorReports, reportsBeforeLoss);
+      }
+      send({ input: '\x1b' });
+      await waitFor(() => terminal.buffer.active.type === 'normal' && cursorReports > reportsBeforeLoss);
+      send({ input: '\x1b[200~DROPPED_REPLY_DRAFT\x1b[201~' });
+      await waitFor(() => visible().some(line => line.includes('DROPPED_REPLY_DRAFT')));
+      await settle();
+      assert.equal(cursorReports, reportsBeforeLoss + 1, 'issued an ambiguous replacement query');
+      assert(lines().some(line => line.includes('RESIZE_HISTORY_SENTINEL')),
+        'reply timeout erased previous scrollback');
+      await resize(65, 22);
+      send({ input: '\x1b[200~_AFTER_SECOND_RESIZE\x1b[201~' });
+      await waitFor(() => visible().some(line => line.includes('DROPPED_REPLY_DRAFT_AFTER_SECOND_RESIZE')));
+      await settle();
+      assert.equal(cursorReports, reportsBeforeLoss + 1, 'issued a query while the first reply was missing');
+      assert.equal(lines().filter(line => line.includes('DROPPED_REPLY_DRAFT')).length, 1,
+        'the abandoned composer remained on the screen');
+      const history = lines().join('').replace(/\s/g, '').match(/RESIZE_HISTORY_SENTINEL((?:history)+)/);
+      assert.equal(history?.[1], 'history'.repeat(20), 'second resize damaged previous scrollback');
+      return;
     }
     if (expiredReply) {
       tracingResize = true;
@@ -265,6 +335,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   await journey([[100, 15], [100, 30], [100, 10], [100, 35], [40, 15], [160, 30]]);
   await journey([[40, 30], [160, 30], [40, 15], [100, 30]], true);
   await journey([], true);
+  await journey([]);
   const rapidSizes = Array.from({ length: 3 }, () => [[40, 30], [160, 30], [100, 15], [100, 30]]).flat();
   await journey(rapidSizes, false, true);
   await journey(rapidSizes, true, true);

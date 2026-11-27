@@ -3943,7 +3943,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
-    state.current_model_item_id = Some(Uuid::new_v4().to_string());
+    state.current_model_item_id = Some(astra_turn_core::agentic::model_item::new_id());
     let parent_cancel = state.cancellation.token.clone();
     let previous_inference_token = state.cancellation.inference_token.take();
     let mut guidance_wake = state.user_intents.guidance_wake.clone();
@@ -11078,7 +11078,7 @@ mod tests {
             let id = host.executed_model_item_ids[0]
                 .clone()
                 .expect("identity precedes host dispatch");
-            Uuid::parse_str(&id).expect("physical identity is not a round index");
+            assert!(astra_turn_core::agentic::model_item::started_at(&id).is_some());
             assert_eq!(state.final_text_model_item_id.as_ref(), Some(&id));
             assert!(
                 state

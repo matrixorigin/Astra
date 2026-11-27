@@ -24,7 +24,7 @@
 use std::io;
 use std::io::Write;
 
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
 use crossterm::queue;
 use crossterm::style::Colors;
 use crossterm::style::Print;
@@ -188,6 +188,17 @@ where
     visible_history_rows: u16,
 }
 
+/// The normal screen's render state while a workspace uses the terminal's
+/// alternate screen. The terminal itself retains the visible history.
+pub(crate) struct InlineScreen {
+    buffers: [Buffer; 2],
+    current: usize,
+    viewport_area: Rect,
+    screen_size: Size,
+    cursor: Position,
+    visible_history_rows: u16,
+}
+
 impl<B> Drop for Terminal<B>
 where
     B: Backend,
@@ -232,6 +243,29 @@ where
             last_known_cursor_pos: cursor_pos,
             visible_history_rows: 0,
         })
+    }
+
+    pub(crate) fn take_inline_screen(&mut self) -> InlineScreen {
+        InlineScreen {
+            buffers: std::mem::replace(
+                &mut self.buffers,
+                std::array::from_fn(|_| Buffer::empty(Rect::ZERO)),
+            ),
+            current: std::mem::take(&mut self.current),
+            viewport_area: std::mem::replace(&mut self.viewport_area, Rect::ZERO),
+            screen_size: self.last_known_screen_size,
+            cursor: std::mem::replace(&mut self.last_known_cursor_pos, Position::ORIGIN),
+            visible_history_rows: std::mem::take(&mut self.visible_history_rows),
+        }
+    }
+
+    pub(crate) fn restore_inline_screen(&mut self, inline: InlineScreen) {
+        self.buffers = inline.buffers;
+        self.current = inline.current;
+        self.viewport_area = inline.viewport_area;
+        self.last_known_screen_size = inline.screen_size;
+        self.last_known_cursor_pos = inline.cursor;
+        self.visible_history_rows = inline.visible_history_rows;
     }
 
     /// Get a Frame object which provides a consistent view into the terminal state for rendering.
@@ -475,7 +509,37 @@ where
         self.clear_after_position(self.viewport_area.as_position())
     }
 
-    /// Clear from `position` through the end of the visible screen and force a full redraw.
+    /// Erase the painted inline frame relative to the terminal's actual
+    /// cursor. This also works when the terminal relocated the frame and did
+    /// not report its absolute cursor position.
+    pub(crate) fn clear_inline_from_cursor(&mut self) -> io::Result<()>
+    where
+        B: Write,
+    {
+        if !self.viewport_area.contains(self.last_known_cursor_pos)
+            || !self
+                .previous_buffer()
+                .content
+                .iter()
+                .any(|cell| cell != &Cell::EMPTY)
+        {
+            return Ok(());
+        }
+
+        // With no cursor report, only the painted rows up to the cursor
+        // are a safe bound. Predicted wraps may not have happened. Moving
+        // up over them can erase committed chat on terminals that clip.
+        let rows_above = self.last_known_cursor_pos.y - self.viewport_area.top();
+        if rows_above > 0 {
+            queue!(self.backend, MoveUp(rows_above))?;
+        }
+        queue!(self.backend, MoveToColumn(0))?;
+        Self::backend_io(self.backend.clear_region(ClearType::AfterCursor))?;
+        self.previous_buffer_mut().reset();
+        Ok(())
+    }
+
+    /// Clear from position through the end of the visible screen and force a full redraw.
     pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
         self.set_cursor_position(position)?;
         Self::backend_io(self.backend.clear_region(ClearType::AfterCursor))?;

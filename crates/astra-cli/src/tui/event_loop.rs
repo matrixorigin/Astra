@@ -37,7 +37,7 @@ use super::event::{TuiEvent, TuiEventStream, is_background_task_manage_key};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
 use super::keymap::{AppAction, AppKeymap};
-use super::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
+use super::render::line_utils::history_cell_lines_for_buffer;
 #[cfg(test)]
 use super::status_line;
 use super::task_status::TaskStatus;
@@ -3412,10 +3412,10 @@ impl ReopenTarget {
 /// queues raw sixel bytes and we show each here on a clean, paused screen via
 /// `with_restored`, which drops raw mode, hands the whole screen to the image,
 /// and forces a full repaint once the user presses Enter to dismiss it.
-async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
+async fn render_pending_sixel_images(guard: &mut TerminalGuard, input: &mut TuiEventStream) {
     for bytes in astra_tools::display_sixel::take_pending_sixel() {
         let display_result = guard
-            .with_restored(|| async move {
+            .with_restored(input, || async move {
                 tokio::task::spawn_blocking(move || {
                     // Home + clear-to-end, blit the image at the top (full height),
                     // then a prompt line.
@@ -3451,12 +3451,15 @@ async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
 
 async fn edit_composer_in_external_editor(
     guard: &mut TerminalGuard,
+    input: &mut TuiEventStream,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     initial: String,
 ) {
     let edit_result = guard
-        .with_restored(|| crate::tui::external_editor::edit_in_external_editor_async(initial))
+        .with_restored(input, || {
+            crate::tui::external_editor::edit_in_external_editor_async(initial)
+        })
         .await;
     guard.terminal.invalidate_viewport();
     match edit_result {
@@ -4849,12 +4852,7 @@ fn transcript_item_for_cell(
         .downcast_ref::<history_cell::assistant::AssistantCell>()
         && cell.is_live()
     {
-        return TranscriptItem::rendered_cell(
-            id,
-            cell,
-            assistant.live_transcript_lines(width),
-            separator_rows,
-        );
+        return TranscriptItem::assistant_preview(id, assistant, width, separator_rows);
     }
 
     if let Some(reasoning) = cell
@@ -10008,7 +10006,11 @@ pub(crate) async fn run_tui_session(
     let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
-    let mut event_stream = TuiEventStream::new(draw_rx, guard.resize_pending.clone());
+    let mut event_stream = TuiEventStream::new(
+        draw_rx,
+        guard.resize_pending.clone(),
+        guard.alternate_screen.clone(),
+    );
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
     {
@@ -11444,7 +11446,7 @@ pub(crate) async fn run_tui_session(
                                         let command_for_child = command.clone();
                                         let shell_shutdown = session_shutdown_token.clone();
                                         let status = guard
-                                            .with_restored(|| async move {
+                                            .with_restored(&mut event_stream, || async move {
                                                 stdout_println!("! {command_for_child}");
                                                 run_interactive_shell_command(
                                                     &command_for_child,
@@ -13831,7 +13833,7 @@ pub(crate) async fn run_tui_session(
                                             .extend(pending_runtime_notifications);
                                         // Turn fully settled: blit any images display_sixel
                                         // queued this turn on a paused screen (see fn docs).
-                                        render_pending_sixel_images(&mut guard).await;
+                                        render_pending_sixel_images(&mut guard, &mut event_stream).await;
                                         r
                                     };
 
@@ -14165,6 +14167,7 @@ pub(crate) async fn run_tui_session(
                             BottomPaneAction::OpenExternalEditor(initial) => {
                                 edit_composer_in_external_editor(
                                     &mut guard,
+                                    &mut event_stream,
                                     &mut bottom_pane,
                                     &mut chat_widget,
                                     initial,
@@ -15564,6 +15567,10 @@ pub(crate) async fn run_tui_session(
     // The pipeline bundle owns the skill watcher. Drop it only after all
     // turn/agent work has stopped so no consumer outlives its provider.
     drop(pipeline_modules);
+    if let Err(error) = guard.prepare_inline_handoff(&mut event_stream).await {
+        tracing::warn!(%error, "could not reconcile the terminal before exit");
+    }
+    drop(event_stream);
     drop(guard);
     if finalization.is_ok()
         && let Some((label, command)) = resume_hint
@@ -29133,7 +29140,8 @@ mod tests {
         ));
         assert!(pane.take_projection_action().is_none());
         assert!(
-            render_bottom_pane_text(&pane, 100, 24).contains("Live activity · history pending"),
+            render_bottom_pane_text(&pane, 100, 24)
+                .contains("Local live activity · history pending"),
             "equal content from another call cannot retire the real local tool"
         );
         pane.refresh_agent_transcript(
@@ -29230,7 +29238,7 @@ mod tests {
 
         chat_widget.handle_event(chat_widget::AppEvent::wire(
             chat_widget::WireEvent::AnswerDelta {
-                model_item_id: None,
+                model_item_id: Some("019a93c5-d340-7000-8000-000000000001".into()),
                 text: "live durable-root output".into(),
             },
         ));
@@ -29244,8 +29252,13 @@ mod tests {
             refreshed.contains("live durable-root output"),
             "a durable root workspace must project the current root cell before its page catches up: {refreshed:?}"
         );
+        let time = chrono::DateTime::from_timestamp_millis(0x019a93c5d340)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        assert!(refreshed.contains(&format!("Astra  {time}")), "{refreshed}");
         assert!(
-            refreshed.contains("Live local projection"),
+            refreshed.contains("Local live activity · history pending"),
             "live root output must carry local provenance until durable reconciliation: {refreshed:?}"
         );
     }

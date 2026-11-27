@@ -17,8 +17,12 @@ use super::view::{
     ViewActionDisposition, ViewActionRequest, ViewCompletion,
 };
 use crate::tui::history_cell::{
-    HistoryCell, assistant::AssistantCell, explain_analyze::ExplainAnalyzeCell,
-    reasoning::ReasoningCell, tool::ToolCell, user::UserCell,
+    HistoryCell,
+    assistant::{AssistantCell, AssistantReplyPreview},
+    explain_analyze::ExplainAnalyzeCell,
+    reasoning::ReasoningCell,
+    tool::ToolCell,
+    user::UserCell,
 };
 use crate::tui::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 
@@ -66,6 +70,7 @@ impl TranscriptItemId {
 enum TranscriptContent {
     Committed(Arc<dyn HistoryCell>),
     Rendered(Vec<Line<'static>>),
+    AssistantPreview(AssistantReplyPreview),
     Activity(Arc<str>),
     ToolRequest {
         cell: Arc<ToolCell>,
@@ -286,6 +291,22 @@ impl TranscriptItem {
         }
     }
 
+    pub(crate) fn assistant_preview(
+        id: TranscriptItemId,
+        cell: &AssistantCell,
+        width: u16,
+        separator_rows: usize,
+    ) -> Self {
+        Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
+            tool_identity: None,
+            id,
+            kind: TranscriptItemKind::Assistant,
+            content: TranscriptContent::AssistantPreview(cell.live_transcript_preview(width)),
+            separator_rows,
+        }
+    }
+
     pub(crate) fn live_reasoning(
         id: TranscriptItemId,
         cell: Arc<Mutex<ReasoningCell>>,
@@ -438,7 +459,9 @@ impl TranscriptItem {
     fn is_expandable(&self, width: u16) -> bool {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
-            TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => false,
+            TranscriptContent::Rendered(_)
+            | TranscriptContent::RenderedTrusted(_)
+            | TranscriptContent::AssistantPreview(_) => false,
             TranscriptContent::Activity(text) => !text.is_empty(),
             TranscriptContent::ToolRequest { cell, .. } => !cell.description.is_empty(),
             TranscriptContent::Reasoning(cell) => !cell.text().is_empty(),
@@ -455,7 +478,9 @@ impl TranscriptItem {
             TranscriptContent::Activity(_) => "activity details",
             TranscriptContent::ToolRequest { .. } => "tool request",
             TranscriptContent::Reasoning(_) => "reasoning",
-            TranscriptContent::LiveAssistant(_) => "assistant output",
+            TranscriptContent::AssistantPreview(_) | TranscriptContent::LiveAssistant(_) => {
+                "assistant output"
+            }
             TranscriptContent::LiveReasoning(_) => "reasoning",
             TranscriptContent::Tool(_) => "tool details",
         }
@@ -464,6 +489,9 @@ impl TranscriptItem {
     fn render(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
         let lines = match &self.content {
             TranscriptContent::Committed(cell) => cell_lines(cell.as_ref(), width, expanded),
+            TranscriptContent::AssistantPreview(preview) => {
+                inset_live_assistant_preview(preview.clone().into_lines())
+            }
             TranscriptContent::Rendered(lines) => lines.clone(),
             TranscriptContent::Activity(_) | TranscriptContent::ToolRequest { .. } => {
                 let (text, heading) = self.detail_text().unwrap();
@@ -481,7 +509,7 @@ impl TranscriptItem {
                 } else if !cell.is_live() {
                     history_cell_lines_for_buffer(&*cell, width)
                 } else {
-                    cell.live_transcript_lines(width)
+                    inset_live_assistant_preview(cell.live_transcript_preview(width).into_lines())
                 }
             }
             TranscriptContent::LiveReasoning(cell) => {
@@ -526,6 +554,15 @@ impl TranscriptItem {
     }
 }
 
+fn inset_live_assistant_preview(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if lines.iter().any(|line| !line.spans.is_empty()) {
+        for line in &mut lines {
+            line.spans.insert(0, Span::raw("  "));
+        }
+    }
+    lines
+}
+
 fn render_detail(
     text: &str,
     heading: Option<(&'static str, &str)>,
@@ -558,7 +595,7 @@ fn render_detail(
         lines.push(Line::from("… expand for full activity"));
     }
     if let Some((heading, name)) = heading {
-        lines.insert(0, Line::from(format!("{name} · {heading}")));
+        lines.splice(0..0, detail_heading_lines(name, heading, inner));
     }
     if inner < usize::from(width) {
         for line in &mut lines {
@@ -566,6 +603,19 @@ fn render_detail(
         }
     }
     lines
+}
+
+fn detail_heading_lines(name: &str, label: &str, width: usize) -> Vec<Line<'static>> {
+    let name = crate::tui::render::line_utils::sanitize_terminal_text(name);
+    let title = format!("{name} · {label}");
+    if title.width() <= width {
+        return vec![Line::from(title)];
+    }
+    // Keep the status together whenever it fits on its own row.
+    crate::tui::wrapping::word_wrap_lines(
+        [Line::from(name.into_owned()), Line::from(label.to_owned())],
+        width,
+    )
 }
 
 fn detail_content_width(width: u16) -> usize {
@@ -1072,6 +1122,12 @@ impl TranscriptView {
                 }
                 let clean = crate::tui::render::line_utils::sanitize_terminal_text(text);
                 lines.extend(clean.split('\n').map(str::to_owned));
+            } else if let TranscriptContent::AssistantPreview(preview) = &item.content {
+                lines.extend(
+                    sanitize_lines_for_buffer(preview.body.clone())
+                        .iter()
+                        .map(line_plain_text),
+                );
             } else {
                 lines.extend(item.render(self.width, true).iter().map(line_plain_text));
             }
@@ -1596,18 +1652,22 @@ impl TranscriptView {
             if let Some((text, heading)) = detail {
                 let text = crate::tui::render::line_utils::sanitize_terminal_text(text);
                 let lower = text.to_lowercase();
-                let mut offset = usize::from(heading.is_some());
-                if heading.is_some_and(|(label, name)| {
-                    crate::tui::render::line_utils::sanitize_terminal_text(&format!(
-                        "{name} · {label}"
-                    ))
-                    .to_lowercase()
-                    .contains(&needle)
-                }) {
-                    record(index, 0);
+                let width = detail_content_width(self.width);
+                let mut offset = 0;
+                if let Some((label, name)) = heading {
+                    let rows = detail_heading_lines(name, label, width);
+                    let title = format!("{name} · {label}");
+                    let title = crate::tui::render::line_utils::sanitize_terminal_text(&title);
+                    if title.to_lowercase().contains(&needle) {
+                        let row = rows
+                            .iter()
+                            .position(|line| line_plain_text(line).to_lowercase().contains(&needle))
+                            .unwrap_or(0);
+                        record(index, row);
+                    }
+                    offset = rows.len();
                 }
                 for (line, lower_line) in text.lines().zip(lower.lines()) {
-                    let width = detail_content_width(self.width);
                     if UnicodeWidthStr::width(line) <= width && !line.contains('\t') {
                         if lower_line.contains(&needle) {
                             record(index, offset);
@@ -2214,12 +2274,15 @@ mod tests {
         view.replace_snapshot(snapshot("A".repeat(100)), 80);
         assert_eq!(view.lines.len(), 2);
         view.replace_snapshot(snapshot("B".repeat(100)), 10);
-        assert_eq!(view.lines.len(), 10);
-        assert!(
-            view.lines
-                .iter()
-                .all(|line| !super::line_plain_text(line).contains('A'))
-        );
+        // The two-column gutter leaves eight content columns at this width.
+        assert_eq!(view.lines.len(), 13);
+        let mut content = String::new();
+        for line in &view.lines {
+            assert!(line.width() <= 10);
+            let line = super::line_plain_text(line);
+            content.push_str(line.strip_prefix("  ").expect("activity gutter"));
+        }
+        assert_eq!(content, "B".repeat(100));
         view.replace_snapshot(TranscriptSnapshot::new(vec![]), 10);
         assert!(view.lines.is_empty());
         assert!(view.activity_cache.is_none());
@@ -2344,7 +2407,11 @@ mod tests {
         let full = item
             .render(80, true)
             .iter()
-            .map(super::line_plain_text)
+            .map(|line| {
+                assert!(line.width() <= 80);
+                let text = super::line_plain_text(line);
+                text.strip_prefix("  ").expect("activity gutter").to_owned()
+            })
             .collect::<String>();
         assert!(full.contains(&"x".repeat(2000)));
         let single =
@@ -2365,6 +2432,14 @@ mod tests {
         let request = tool.tool_request().unwrap();
         let same = tool.tool_request().unwrap();
         assert!(request.same_detail_source(&same.content));
+        let mut narrow = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![same]), 24, 40);
+        for query in ["result not loaded", "TAIL-MARKER"] {
+            narrow.find_search_match(query, true);
+            assert!(
+                super::line_plain_text(&narrow.lines[narrow.cursor]).contains(query),
+                "{query:?} must select its visible row"
+            );
+        }
         let mut view =
             TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![request]), 24, 80);
         assert!(!rendered(&view).contains("TAIL-MARKER"));

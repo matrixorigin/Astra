@@ -10,6 +10,17 @@ pub(crate) fn conversation_margin(width: u16) -> u16 {
     if width >= 60 { 2 } else { 0 }
 }
 
+/// Use the same runtime clock while streaming and when replaying the item.
+pub(crate) fn assistant_timestamp(
+    model_item_id: Option<&str>,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    model_item_id
+        .and_then(astra_turn_core::agentic::model_item::started_at)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(fallback)
+}
+
 /// Use one local clock format for recorded conversation headings.
 pub(crate) fn append_local_time(line: &mut Line<'static>, timestamp: Option<&str>, width: u16) {
     let Some(timestamp) = timestamp else {
@@ -18,13 +29,36 @@ pub(crate) fn append_local_time(line: &mut Line<'static>, timestamp: Option<&str
     if line.width() + "  HH:MM:SS".len() > usize::from(width) {
         return;
     }
-    if let Ok(time) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+    let time = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|time| time.to_utc())
+        .or_else(|_| {
+            // The transcript API also returns the stored UTC DATETIME
+            // without a zone suffix for root and run reads.
+            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|time| time.and_utc())
+        });
+    if let Ok(time) = time {
         line.spans.push(Span::styled(
             time.with_timezone(&chrono::Local)
                 .format("  %H:%M:%S")
                 .to_string(),
             Style::default().fg(super::theme::current().dim),
         ));
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::{Line, append_local_time};
+
+    #[test]
+    fn durable_clock_matches_the_equivalent_stream_timestamp() {
+        let mut live = Line::raw("Astra");
+        append_local_time(&mut live, Some("2026-06-26T20:00:00+08:00"), 80);
+        assert_eq!(live.spans.len(), 2);
+        let mut reopened = Line::raw("Astra");
+        append_local_time(&mut reopened, Some("2026-06-26T12:00:00"), 80);
+        assert_eq!(reopened, live);
     }
 }
 

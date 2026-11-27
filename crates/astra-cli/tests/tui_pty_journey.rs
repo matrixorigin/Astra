@@ -661,6 +661,45 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
         "the next user turn lost the background update: {}",
         requests[1]
     );
+
+    // Both submitted messages match "the". Look only below the composer so
+    // previous messages in scrollback cannot be mistaken for candidates.
+    let candidate = |screen: &str| {
+        let rows = screen.lines().skip_while(|row| !row.contains("│› the"));
+        rows.skip(1)
+            .take_while(|row| !row.contains("History ·"))
+            .find_map(|row| row.strip_prefix("› ").map(str::to_owned))
+    };
+    for byte in b"the" {
+        astra.write(&[*byte]);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    astra.wait_for_screen("two history choices", UI_TRANSITION_TIMEOUT, |screen| {
+        candidate(screen).is_some() && screen.contains("History · ↑↓ select · Tab insert")
+    });
+    let initial = candidate(&astra.current_screen()).unwrap();
+    astra.write(b"\x1b[A");
+    astra.wait_for_screen(
+        "Up selects the other history entry",
+        UI_TRANSITION_TIMEOUT,
+        |screen| candidate(screen).is_some_and(|selected| selected != initial),
+    );
+    let other = candidate(&astra.current_screen()).unwrap();
+    astra.record_frame("History selection after Up");
+    astra.write(b"\x1b[B");
+    astra.wait_for_screen(
+        "Down restores the first history entry",
+        UI_TRANSITION_TIMEOUT,
+        |screen| candidate(screen).is_some_and(|selected| selected == initial),
+    );
+    astra.write(b"\x1b[A");
+    astra.wait_for_screen("selection before Tab", UI_TRANSITION_TIMEOUT, |screen| {
+        candidate(screen).is_some_and(|selected| selected == other)
+    });
+    astra.write(b"\t");
+    astra.wait_for(&format!("│› {other}"), UI_TRANSITION_TIMEOUT);
+    assert_eq!(mock.received_requests().len(), 2, "Tab must not submit");
+
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
@@ -2392,7 +2431,12 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     });
     astra.record_frame("Context inspector");
     astra.write(b"\x1b");
-    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen("chat restored after context", UI_TRANSITION_TIMEOUT, |screen| {
+        let note = screen.lines().position(|line| line.contains("Opened context panel"));
+        let prompt = screen.lines().position(|line| line.contains("Message Astra"));
+        matches!((note, prompt), (Some(note), Some(prompt)) if prompt > note && prompt - note <= 4)
+    });
+    astra.record_frame("Chat after closing context inspector");
     astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -2480,6 +2524,21 @@ async fn settled_explain_report_expands_evidence_and_prepares_a_follow_up() {
         .skip(submitted + 1)
         .find_map(|(index, line)| line.trim_start().starts_with("Astra").then_some(index))
         .expect("visible assistant reply");
+    let user_heading = lines[..submitted].last().expect("visible user heading");
+    let reply_heading = lines[reply];
+    assert_eq!(
+        user_heading.find("You"),
+        reply_heading.find("Astra"),
+        "{settled}"
+    );
+    for (line, speaker) in [(*user_heading, "You  "), (reply_heading, "Astra  ")] {
+        let time = line
+            .trim_start()
+            .strip_prefix(speaker)
+            .expect("speaker heading and timestamp");
+        chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").expect("readable local time");
+    }
+    astra.record_frame("Settled exchange with both timestamps");
     let mut blank = 0;
     for line in &lines[submitted + 1..reply] {
         if line.trim().is_empty() {
@@ -3901,11 +3960,57 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
         |screen| screen.contains("│› delt") && screen.contains("History · ↑↓ select · Tab insert"),
     );
     astra.record_frame("Live history search");
+
+    astra.resize(5, 40);
+    astra.wait_for_screen(
+        "history yields to the live turn at five rows",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("› delt")
+                && screen.contains("Working")
+                && !screen.contains("› delegate_one_child")
+        },
+    );
+    astra.record_frame("Five-row live history frame");
+    astra.write(b"\t");
+    astra.write(b"e"); // A hidden Tab must leave the cursor inside the draft.
+    astra.wait_for("› delet", UI_TRANSITION_TIMEOUT);
+
+    astra.resize(30, 100);
+    astra.wait_for_screen(
+        "history returns after growing the terminal",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("│› delet")
+                && screen.contains("› delegate_one_child_and_keep_it_observable")
+                && screen.contains("History · ↑↓ select · Tab insert")
+        },
+    );
+    astra.record_frame("Restored live history frame");
     astra.write(b"\t");
     astra.wait_for(
         "│› delegate_one_child_and_keep_it_observable",
         UI_TRANSITION_TIMEOUT,
     );
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    astra.write(b"\x1b[200~keep this draft\x1b[201~");
+    astra.wait_for("│› keep this draft", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x12]); // Ctrl+R keeps the explicit reverse search.
+    astra.wait_for("(reverse-i-search)", UI_TRANSITION_TIMEOUT);
+    astra.write(b"deleg");
+    astra.wait_for_screen(
+        "explicit reverse search result",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.lines().any(|line| {
+                line.contains("reverse-i-search") && line.contains("delegate_one_child")
+            })
+        },
+    );
+    astra.write(b"\x1b");
+    astra.wait_for("│› keep this draft", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x15]);
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
@@ -3967,6 +4072,20 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
                 .lines()
                 .any(|line| line.starts_with("  Parent acknowledged"))
     });
+    let recorded_root_time = chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S");
+    let recorded_root_heading = format!("  Astra  {recorded_root_time}");
+    astra.wait_for_screen(
+        "root transcript uses the persisted clock",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.trim_end() == recorded_root_heading)
+        },
+    );
     astra.record_frame("Aligned live root transcript");
     astra.write(b"\x1b[1;2C"); // Shift+Right follows the retained tab order.
     astra.wait_for_screen(
@@ -3993,6 +4112,15 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "root clock remains stable after completion",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.trim_end() == recorded_root_heading)
+        },
+    );
     astra.record_frame("Returned to root transcript");
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");

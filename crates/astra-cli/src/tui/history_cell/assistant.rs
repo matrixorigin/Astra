@@ -52,6 +52,23 @@ use crate::tui::markdown_render::{
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::turn_event::TurnEvent;
 
+/// Rows of a bounded live reply, with its display-only heading kept separate.
+#[derive(Debug, Clone)]
+pub(crate) struct AssistantReplyPreview {
+    heading: Option<Line<'static>>,
+    pub(crate) body: Vec<Line<'static>>,
+}
+
+impl AssistantReplyPreview {
+    pub(crate) fn into_lines(self) -> Vec<Line<'static>> {
+        let Self { heading, mut body } = self;
+        if let Some(heading) = heading {
+            body.insert(0, heading);
+        }
+        body
+    }
+}
+
 /// The expensive, width-sensitive part of an assistant reply. The renderer
 /// receives one final draw at the same inner width used while streaming, so a
 /// completed reply can reuse its last live layout instead of reparsing a long
@@ -226,6 +243,15 @@ impl AssistantCell {
     pub(crate) fn with_timestamp(mut self, timestamp: String) -> Self {
         self.ts = Some(timestamp);
         self
+    }
+
+    pub(crate) fn with_model_item(
+        mut self,
+        id: Option<&str>,
+        fallback: impl FnOnce() -> String,
+    ) -> Self {
+        self.model_item_id = id.map(str::to_owned);
+        self.with_timestamp(crate::tui::style::assistant_timestamp(id, fallback))
     }
 
     /// Append streamed content. Deliberately takes `&str` (not
@@ -512,16 +538,27 @@ impl AssistantCell {
         out
     }
 
-    pub(crate) fn live_transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        // Reserve one of the 48 preview rows for the speaker heading.
-        let mut lines = self.live_viewport_lines(width.saturating_sub(2), 47);
-        if lines.iter().any(|line| !line.spans.is_empty()) {
-            for line in &mut lines {
-                line.spans.insert(0, Span::raw("  "));
-            }
-            lines.insert(0, self.settled_speaker_line(width));
-        }
-        lines
+    fn reply_preview(
+        &self,
+        width: u16,
+        maximum: usize,
+        timestamp: Option<&str>,
+    ) -> AssistantReplyPreview {
+        let body = self.live_viewport_lines(width, maximum);
+        let heading = body
+            .iter()
+            .any(|line| !line.spans.is_empty())
+            .then(|| Self::speaker_line(width, timestamp));
+        AssistantReplyPreview { heading, body }
+    }
+
+    pub(crate) fn live_reply_lines(&self, width: u16, maximum: usize) -> Vec<Line<'static>> {
+        self.reply_preview(width, maximum, self.ts.as_deref())
+            .into_lines()
+    }
+
+    pub(crate) fn live_transcript_preview(&self, width: u16) -> AssistantReplyPreview {
+        self.reply_preview(width.saturating_sub(2), 47, self.ts.as_deref())
     }
 
     /// Render a bounded rich Markdown suffix for a mutable reply. The cache
@@ -692,16 +729,17 @@ impl AssistantCell {
     }
 
     fn settled_speaker_line(&self, width: u16) -> Line<'static> {
-        let mut heading = prefix_settled_row(Self::speaker_line().into()).line;
-        crate::tui::style::append_local_time(&mut heading, self.ts.as_deref(), width);
-        heading
+        prefix_settled_row(Self::speaker_line(width.saturating_sub(2), self.ts.as_deref()).into())
+            .line
     }
 
-    pub(crate) fn speaker_line() -> Line<'static> {
-        Line::styled(
+    fn speaker_line(width: u16, timestamp: Option<&str>) -> Line<'static> {
+        let mut heading = Line::styled(
             "Astra",
             Style::default().fg(crate::tui::theme::current().fg).bold(),
-        )
+        );
+        crate::tui::style::append_local_time(&mut heading, timestamp, width);
+        heading
     }
 }
 
@@ -1260,7 +1298,7 @@ mod tests {
             "# BEGIN\n\n```text\n{}END中文🦀\n```",
             "row\n".repeat(5_000)
         );
-        let mut c = AssistantCell::new_streaming();
+        let mut c = AssistantCell::new_streaming().with_timestamp("2026-06-26T12:00:00Z".into());
         c.push_delta(&source);
         assert!(line_text(&c.live_viewport_lines(80, 3)).contains("hidden"));
         assert!(
@@ -1268,7 +1306,9 @@ mod tests {
         );
         c.finalize();
         c.prepare_scrollback_layout(80);
-        let expected = AssistantCell::from_markdown(source.clone()).display_lines(80);
+        let expected = AssistantCell::from_markdown(source.clone())
+            .with_timestamp(c.ts.clone().expect("new reply timestamp"))
+            .display_lines(80);
         let mut actual = Vec::new();
         let mut start = 0;
         loop {
@@ -1286,6 +1326,30 @@ mod tests {
         assert!(line_text(&actual).contains("END中文🦀"));
         assert!(!line_text(&actual).contains("hidden"));
         assert_eq!(c.source(), source);
+    }
+
+    #[test]
+    fn reply_timestamp_survives_settlement_and_replay() {
+        let id = "019a93c5-d340-7000-8000-000000000001";
+        let mut cell = AssistantCell::new_streaming()
+            .with_model_item(Some(id), || panic!("use the model clock"));
+        cell.push_delta("First text");
+        let heading = line_text(&cell.live_reply_lines(40, 3)[..1]);
+        assert_eq!(
+            line_text(&cell.live_transcript_preview(40).into_lines()[..1]),
+            heading
+        );
+        let time = heading.strip_prefix("Astra  ").expect("Astra reply time");
+        chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").expect("readable local time");
+        cell.push_delta(" and more");
+        assert_eq!(line_text(&cell.live_reply_lines(40, 3)[..1]), heading);
+
+        cell.finalize();
+        let expected = format!("  {heading}");
+        assert_eq!(line_text(&cell.display_lines(40)[..1]), expected);
+        let replayed = AssistantCell::from_persist(cell.to_persist().unwrap()).unwrap();
+        assert_eq!(line_text(&replayed.display_lines(40)[..1]), expected);
+        assert_eq!(line_text(&replayed.display_lines(12)[..1]), "  Astra");
     }
 
     #[test]
@@ -1370,7 +1434,7 @@ mod tests {
 
     #[test]
     fn final_scrollback_reuses_the_last_live_markdown_layout() {
-        let mut c = AssistantCell::new_streaming();
+        let mut c = AssistantCell::new_streaming().with_timestamp("2026-06-26T12:00:00Z".into());
         c.push_delta("# Result\n\n- one\n- two\n\n`cargo test`");
 
         // `active_viewport` gives a live assistant the terminal width minus
@@ -1389,7 +1453,13 @@ mod tests {
         c.finalize();
         let settled = c.display_lines(80);
         let text = line_text(&settled);
-        assert!(text.starts_with("  Astra\n  Result"), "{text:?}");
+        assert!(text.starts_with("  Astra  "), "{text:?}");
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("  Result")),
+            "{text:?}"
+        );
         assert!(settled.iter().all(|line| !line.spans.is_empty()));
         let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
         assert!(matches!(
