@@ -3797,19 +3797,20 @@ pub(crate) fn visit_durable_journal_append_delta_for_owner(
     file.read_exact(&mut snapshot)?;
     drop(file);
 
+    let text = std::str::from_utf8(&snapshot).map_err(|error| {
+        let line = snapshot[..error.valid_up_to()]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal {session_id} contains non-UTF-8 JSONL at append line {line}: {error}"),
+        )
+    })?;
     let mut event_count = 0_usize;
-    for (line_index, line) in snapshot.split_inclusive(|byte| *byte == b'\n').enumerate() {
-        let line = std::str::from_utf8(line)
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "journal {session_id} contains non-UTF-8 JSONL at append line {}: {error}",
-                        line_index + 1
-                    ),
-                )
-            })?
-            .trim();
+    for (line_index, line) in text.lines().enumerate() {
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
@@ -8308,14 +8309,18 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let first =
             serde_json::to_vec(&JournalEvent::config_change(Some(session), "model", "a")).unwrap();
-        let large_value = "b".repeat(128 * 1024);
+        let large_value = format!("{}🙂", "b".repeat(128 * 1024));
         let second = serde_json::to_vec(&JournalEvent::config_change(
             Some(session),
             "model",
             &large_value,
         ))
         .unwrap();
-        let split = second.len() / 2;
+        let split = second
+            .windows("🙂".len())
+            .position(|bytes| bytes == "🙂".as_bytes())
+            .unwrap()
+            + 2;
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(&first).unwrap();
         file.write_all(b"\n").unwrap();
@@ -8345,6 +8350,42 @@ mod tests {
             Some(large_value.as_str())
         );
         assert_eq!(next.next_offset, std::fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn durable_projection_validates_utf8_before_visiting_records() {
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let session = "projection-invalid-utf8";
+        let path = journal_file_path(session);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let event = JournalEvent::config_change(Some(session), "model", &"x".repeat(1024));
+        let line = serde_json::to_vec(&event).unwrap();
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        for _ in 0..512 {
+            file.write_all(&line).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.write_all(b"\xff\n").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let mut visited = 0;
+        let error = visit_durable_journal_append_delta_for_owner(
+            &OwnerScope::local_user(),
+            session,
+            0,
+            |_| {
+                visited += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("append line 513"));
+        assert_eq!(visited, 0);
     }
 
     #[cfg(unix)]
