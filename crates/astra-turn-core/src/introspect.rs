@@ -109,6 +109,10 @@ pub struct IntrospectSnapshot {
     #[serde(default)]
     pub tool_errors: Vec<ToolErrorEntry>,
 
+    /// Failed model calls observed in the current run's bounded recent event window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_failures: Vec<ProviderFailureEntry>,
+
     /// Bridge circuit breaker state — surfaced in stall/full renders.
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerSnapshot>,
@@ -119,6 +123,42 @@ pub struct IntrospectSnapshot {
     /// observable here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<crate::thinking_config::ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderFailureEntry {
+    pub error_kind: String,
+    pub failure_stage: String,
+    pub stream_reason: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub latency_ms: Option<u64>,
+}
+
+impl ProviderFailureEntry {
+    fn summary(&self) -> String {
+        format!(
+            "kind={} stage={} stream_reason={} provider_request_id={} latency_ms={}",
+            self.error_kind,
+            self.failure_stage,
+            self.stream_reason.as_deref().unwrap_or("unknown"),
+            self.provider_request_id.as_deref().unwrap_or("unknown"),
+            self.latency_ms
+                .map_or_else(|| "unknown".into(), |ms| ms.to_string())
+        )
+    }
+}
+
+pub fn render_provider_failures(snapshot: &IntrospectSnapshot) -> String {
+    if snapshot.provider_failures.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(
+        "## Recent Model Request Failures\nCurrent run; at most 10 failures from the last 512 step events. Earlier events may be absent.\n",
+    );
+    for entry in &snapshot.provider_failures {
+        text.push_str(&format!("- {}\n", entry.summary()));
+    }
+    text
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1654,7 +1694,10 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
 /// Render `facet=errors` — recent tool failures with error previews.
 pub fn render_errors(s: &IntrospectSnapshot) -> String {
     if s.tool_errors.is_empty() {
-        return "## Recent Tool Errors\n(No failures in this live runtime projection. Admission rejections and durable session alerts may exist outside this recent-tool view; use reflect for session-wide evidence.)".to_string();
+        return format!(
+            "## Recent Tool Errors\n(No tool failures in this live runtime projection. Admission rejections and durable session alerts may exist outside this recent-tool view; use reflect for session-wide evidence.)\n{}",
+            render_provider_failures(s)
+        );
     }
     let mut out = String::from(
         "## Recent Tool Errors (admission refusals and execution failures)\n\
@@ -1719,6 +1762,7 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
             }
         }
     }
+    out.push_str(&render_provider_failures(s));
     out
 }
 
@@ -2425,6 +2469,7 @@ mod tests {
             injection_freshness: Vec::new(),
             current_round: 0,
             tool_errors: Vec::new(),
+            provider_failures: Vec::new(),
             circuit_breaker: None,
             thinking: None,
         }
@@ -3442,7 +3487,7 @@ mod tests {
         let snap = IntrospectSnapshot::default();
         let out = render_errors(&snap);
         assert!(
-            out.contains("No failures in this live runtime projection"),
+            out.contains("No tool failures in this live runtime projection"),
             "empty errors should state the bounded evidence scope: {out}"
         );
     }

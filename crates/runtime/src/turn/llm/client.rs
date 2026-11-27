@@ -333,6 +333,28 @@ fn attach_provider_request_id(
     error.with_details_json(details.to_string())
 }
 
+/// Attach bounded stream evidence before adding potentially large partial output.
+fn attach_stream_diagnostics(
+    mut error: astra_core::ClassifiedError,
+    status: u16,
+    request_id: Option<&str>,
+) -> astra_core::ClassifiedError {
+    if let Some(reason) = crate::server::run_trace::attempt_reason()
+        .and_then(astra_core::error_kind::validated_stream_failure_reason)
+    {
+        let mut details = error
+            .details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        details["stream_failure_reason"] = json!(reason);
+        error.message.push_str(&format!(" ({reason})"));
+        error = error.with_details_json(details.to_string());
+    }
+    attach_provider_request_id(error, status, request_id)
+}
+
 /// Parse only the versioned envelope emitted by the trusted MOI model gateway.
 /// The provider message is deliberately ignored: only bounded machine fields
 /// cross the provider boundary, so echoed prompts, credentials, and arbitrary
@@ -6677,6 +6699,9 @@ async fn call_prepared_llm_attempts(
                     }
                 }
             }
+            // A provider's request header identifies this HTTP request, not
+            // the model response or Astra's own incoming request.
+            let provider_request_id = llm_provider_request_id(response.headers());
             let stream_result = if is_responses {
                 responses::collect(
                     response,
@@ -6728,6 +6753,11 @@ async fn call_prepared_llm_attempts(
                     partial,
                     rejected,
                 }) => {
+                    let error = if error.kind == astra_core::ErrorKind::StreamTransport {
+                        attach_stream_diagnostics(error, status, provider_request_id.as_deref())
+                    } else {
+                        error
+                    };
                     let error = attach_llm_result_details(error, &partial);
                     if rejected {
                         finish_observed_provider_error_with_partial(
@@ -6823,13 +6853,15 @@ async fn call_prepared_llm_attempts(
                             Some(&partial),
                         )
                     } else {
-                        attach_partial_details(
+                        let error = attach_stream_diagnostics(
                             astra_core::ClassifiedError::new(
                                 kind,
                                 format!("LLM stream transport error: {error}"),
                             ),
-                            &partial,
-                        )
+                            status,
+                            provider_request_id.as_deref(),
+                        );
+                        attach_partial_details(error, &partial)
                     };
                     finish_observed_provider_delivery_unknown_with_partial(
                         attempt_observer,
@@ -9661,6 +9693,17 @@ pub(crate) enum ParsedSseEvent {
     Done,
 }
 
+fn note_invalid_sse(error: &astra_turn_core::sse::data_lines::SseJsonError, at_eof: bool) {
+    use serde_json::error::Category;
+    let reason = match (at_eof, error.source.classify()) {
+        (false, Category::Eof) => "invalid_sse_frame_json_eof",
+        (true, Category::Eof) => "invalid_sse_tail_json_eof",
+        (false, _) => "invalid_sse_frame_json",
+        (true, _) => "invalid_sse_tail_json",
+    };
+    crate::server::run_trace::note_attempt_reason(reason);
+}
+
 /// Parse OpenAI-style SSE bytes without collapsing `[DONE]` into ordinary EOF.
 /// Transport and framing errors surface as `Err`; a clean socket EOF without
 /// [`ParsedSseEvent::Done`] remains distinguishable to the caller.
@@ -9698,8 +9741,8 @@ pub(crate) fn parse_openai_sse_json_stream(
                 let d = match validated_sse_event(&block) {
                     Ok(event) => event,
                     Err(error) => {
-                        crate::server::run_trace::note_attempt_reason("invalid_sse");
-                        yield Err(error);
+                        note_invalid_sse(&error, false);
+                        yield Err(error.to_string());
                         return;
                     }
                 };
@@ -9723,8 +9766,8 @@ pub(crate) fn parse_openai_sse_json_stream(
                     }
                 }
                 Err(error) => {
-                    crate::server::run_trace::note_attempt_reason("invalid_sse");
-                    yield Err(error);
+                    note_invalid_sse(&error, true);
+                    yield Err(error.to_string());
                 },
             },
             Ok(None) => {},
@@ -13663,7 +13706,7 @@ mod tests {
                 "eof_before_terminal",
                 "without a terminal marker",
             ),
-            ("openai", Bytes::from_static(b"data: {invalid}\n\n"), "invalid_sse", "invalid"),
+            ("openai", Bytes::from_static(b"data: {invalid}\n\n"), "invalid_sse_frame_json", "invalid"),
             ("openai", Bytes::from_static(b"data: {\"x\":\"\xff\"}\n\n"), "invalid_sse", "invalid UTF-8"),
             ("openai", Bytes::from(oversized_event), "stream_size_limit", "SSE event exceeds"),
             (
@@ -14553,6 +14596,115 @@ mod tests {
             .expect_err("parse error");
         assert!(err.contains("invalid JSON in SSE event"), "{err}");
         assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_failure_preserves_boundary_and_upstream_request_identity() {
+        for (body, expected, header, expected_id) in [
+            (
+                "data: {\"text\":\"private marker\n\n",
+                "invalid_sse_frame_json_eof",
+                "req_0123456789abcdef",
+                Some("req_0123456789abcdef"),
+            ),
+            (
+                "data: {\"text\":\"private marker",
+                "invalid_sse_tail_json_eof",
+                "sk-private-credential",
+                None,
+            ),
+        ] {
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move {
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .header("x-request-id", header)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            let messages = [json!({"role":"user", "content":"fixture"})];
+            let call = trace_fixture_call(&messages, &base, "openai");
+            let error = call_trace_fixture(call, true, None).await.unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["stream_failure_reason"], expected);
+            assert_eq!(
+                details.get("request_id").and_then(Value::as_str),
+                expected_id
+            );
+            assert!(!error.message.contains("private marker"));
+            assert!(!format!("{error:?}").contains("sk-private-credential"));
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_failure_preserves_boundary_and_request_identity() {
+        for (body, expected) in [
+            (
+                "data: {\"text\":\"private marker\n\n",
+                "invalid_sse_frame_json_eof",
+            ),
+            (
+                "data: {\"text\":\"private marker",
+                "invalid_sse_tail_json_eof",
+            ),
+        ] {
+            let app = Router::new().route(
+                "/responses",
+                post(move || async move {
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .header("x-request-id", "req_0123456789abcdef")
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            let messages = [json!({"role":"user", "content":"fixture"})];
+            let mut call = trace_fixture_call(&messages, &base, "openai");
+            call.route.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
+            call.route.response_scope = Some("scope");
+            call.thinking = &ThinkingConfig::ModelDefault;
+            let error = call_trace_fixture(call, true, None).await.unwrap_err();
+            assert_eq!(
+                error.kind,
+                astra_core::ErrorKind::StreamTransport,
+                "{error:?}"
+            );
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["stream_failure_reason"], expected);
+            assert_eq!(details["request_id"], "req_0123456789abcdef");
+            assert!(!format!("{error:?}").contains("private marker"));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_failures_keep_their_own_boundary() {
+        async fn observe(body: &'static str) -> Option<&'static str> {
+            crate::server::run_trace::in_llm_call(async move {
+                let parts: Vec<Result<Bytes, reqwest::Error>> =
+                    vec![Ok(Bytes::from_static(body.as_bytes()))];
+                let stream = parse_openai_sse_json_stream(stream::iter(parts));
+                tokio::pin!(stream);
+                assert!(stream.next().await.unwrap().is_err());
+                tokio::task::yield_now().await;
+                crate::server::run_trace::attempt_reason()
+            })
+            .await
+        }
+        let (frame, tail) = tokio::join!(
+            observe("data: {\"x\":\"unfinished\n\n"),
+            observe("data: {\"x\":\"unfinished")
+        );
+        assert_eq!(frame, Some("invalid_sse_frame_json_eof"));
+        assert_eq!(tail, Some("invalid_sse_tail_json_eof"));
     }
 
     #[tokio::test]

@@ -358,7 +358,7 @@ impl ErrorKind {
                  and use at most one bounded convergence step when it is safe."
             }
             Self::StreamTransport => {
-                "The model response stream was interrupted. Check the run's recovery status before retrying."
+                "The model response stream could not be consumed completely. Check the run's recovery status before retrying."
             }
             Self::BudgetExhausted => {
                 "Turn/session time budget exhausted. \
@@ -448,7 +448,9 @@ impl ErrorKind {
             Self::ProviderForbidden => {
                 "Ask the model administrator to inspect the provider rejection; a 403 alone does not identify its cause."
             }
-            Self::RateLimit => "Reduce parallel tool calls or raise the provider rate-limit quota.",
+            Self::RateLimit => {
+                "Inspect the reported rate limit and retry timing; reduce request concurrency or consult the provider."
+            }
             Self::ServerError => {
                 "Transient provider issue. If it persists, switch model or provider."
             }
@@ -461,23 +463,22 @@ impl ErrorKind {
                  or switch to a larger-context model."
             }
             Self::InvalidRequest => {
-                "Request assembly bug or stale tool schema. Inspect the provider \
-                 payload and fix at the source — do not retry blindly."
+                "Inspect the structured rejection and request size or settings before retrying."
             }
             Self::ContractViolation => {
                 "Inspect the structured source/error_code fields and repair the producer/consumer \
                  contract. Treat this as a runtime defect, not user input or a retryable outage."
             }
             Self::StreamIdle => {
-                "Model stalled mid-stream. If recurring, switch model or reduce input size."
+                "No stream progress was observed before the idle deadline. Inspect the timing and provider response."
             }
             Self::ProviderDeadline => {
                 "Inspect the typed deadline phase and elapsed time. This is a provider-attempt \
                  deadline, not evidence that the agent turn/session budget was exhausted."
             }
             Self::StreamTransport => {
-                "Transport dropped mid-stream. Check network stability; if persistent, \
-                 change model endpoint or provider."
+                "The model response stream could not be consumed completely. Inspect the recorded \
+                 stream reason and request identity; the cause may be unknown."
             }
             Self::BudgetExhausted => {
                 "Extend the turn/session budget, or break the task into smaller goals."
@@ -522,9 +523,7 @@ impl ErrorKind {
                  operation was applied. Do not replay an uncertain external effect."
             }
             Self::ResourceLimit => {
-                "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). \
-                 Kill orphan processes: `ps aux | grep defunct`. May need to restart \
-                 the system or increase limits."
+                "Inspect the affected resource and configured limit; check system limits such as `ulimit` only when applicable."
             }
             Self::ConnectionPoolExhausted => {
                 "The reqwest HTTP pool is saturated. Reduce parallel LLM calls, \
@@ -914,6 +913,34 @@ pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
         is_uuid(value)
     };
     valid.then(|| value.to_string())
+}
+
+/// Content-free transport observations emitted by the provider stream owner.
+#[must_use]
+pub fn validated_stream_failure_reason(value: &str) -> Option<&str> {
+    matches!(
+        value,
+        "invalid_sse_frame_json_eof"
+            | "invalid_sse_tail_json_eof"
+            | "invalid_sse_frame_json"
+            | "invalid_sse_tail_json"
+            | "invalid_sse"
+            | "stream_size_limit"
+            | "eof_before_terminal"
+            | "timeout"
+            | "connect_error"
+            | "request_build"
+            | "decode_error"
+            | "body_error"
+            | "transport_error"
+            | "connection_refused"
+            | "connection_reset"
+            | "connection_aborted"
+            | "broken_pipe"
+            | "unexpected_eof"
+            | "provider_error_event"
+    )
+    .then_some(value)
 }
 
 // ── LLM error-message classification helpers ─────────────────────────────────

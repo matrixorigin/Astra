@@ -1408,6 +1408,10 @@ fn build_introspect_snapshot_with_tool_admission(
         injection_freshness: Vec::new(),
         current_round,
         tool_errors,
+        provider_failures: recent_provider_failures(
+            &state.step_recorder,
+            state.current_run_id.as_deref(),
+        ),
         circuit_breaker,
         thinking: Some(state.thinking.clone()),
     };
@@ -1418,6 +1422,51 @@ fn build_introspect_snapshot_with_tool_admission(
     }
 
     snapshot
+}
+
+fn recent_provider_failures(
+    recorder: &astra_pipeline::step_recorder::StepRecorder,
+    run_id: Option<&str>,
+) -> Vec<astra_turn_core::introspect::ProviderFailureEntry> {
+    use astra_pipeline::step_protocol::StepEventType;
+    let Some(run_id) = run_id else {
+        return Vec::new();
+    };
+    recorder
+        .events()
+        .iter()
+        .rev()
+        .take(512)
+        .filter(|event| event.run_id == run_id && event.event_type == StepEventType::LlmRoundFailed)
+        .filter_map(|event| {
+            let payload = event.payload.as_ref()?;
+            let kind = payload
+                .get("error_kind")
+                .and_then(Value::as_str)
+                .and_then(astra_core::ErrorKind::parse_tag)
+                .unwrap_or(astra_core::ErrorKind::Unknown);
+            let stage = payload
+                .get("failure_stage")
+                .and_then(Value::as_str)
+                .filter(|stage| matches!(*stage, "admission" | "provider" | "settlement"))
+                .unwrap_or("unknown");
+            let reason = payload
+                .get("stream_failure_reason")
+                .and_then(Value::as_str)
+                .and_then(astra_core::error_kind::validated_stream_failure_reason);
+            Some(astra_turn_core::introspect::ProviderFailureEntry {
+                error_kind: kind.as_str().into(),
+                failure_stage: stage.into(),
+                stream_reason: reason.map(str::to_owned),
+                provider_request_id: payload
+                    .get("provider_request_id")
+                    .and_then(Value::as_str)
+                    .and_then(astra_core::validated_llm_provider_request_id),
+                latency_ms: payload.get("latency_ms").and_then(Value::as_u64),
+            })
+        })
+        .take(10)
+        .collect()
 }
 
 fn semantic_cache_decision_from_tool_result(
@@ -14461,6 +14510,73 @@ print(json.dumps({'context': 'user said: ' + msg}))
             astra_turn_core::introspect::render_errors(&snapshot)
                 .contains("parallel topology was not admitted")
         );
+    }
+
+    #[test]
+    fn introspection_keeps_recent_failed_provider_rounds_after_recovery() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-1".into());
+        state.step_recorder =
+            astra_pipeline::step_recorder::StepRecorder::new("user", "session", "task")
+                .with_invocation_run_id("run-1");
+        for (turn, reason) in [
+            (1, "invalid_sse_frame_json_eof"),
+            (2, "invalid_sse_tail_json_eof"),
+        ] {
+            state.step_recorder.begin_turn(turn);
+            state.step_recorder.begin_llm_round(
+                "model",
+                astra_turn_types::InferencePurpose::PrimaryAgent,
+                "invocation",
+                0,
+            );
+            let error = astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "private error")
+                .with_details_json(serde_json::json!({"stream_failure_reason": reason, "request_id":"req_0123456789abcdef", "partial_reasoning":"private reasoning"}).to_string());
+            state.step_recorder.fail_llm_round(
+                "model",
+                astra_turn_types::InferencePurpose::PrimaryAgent,
+                &error,
+                12,
+                true,
+            );
+            state.step_recorder.end_turn(false);
+        }
+        state.step_recorder.begin_turn(3);
+        state.step_recorder.begin_llm_round(
+            "model",
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+            "recovery",
+            0,
+        );
+        state.step_recorder.end_llm_round(
+            "model",
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+            1,
+            1,
+            0,
+            0,
+            3,
+        );
+        let snapshot = build_introspect_snapshot(&state, String::new(), None);
+        assert_eq!(snapshot.provider_failures.len(), 2);
+        assert!(snapshot.tool_errors.is_empty());
+        let report = astra_turn_core::introspect::render_introspect_request(
+            &snapshot,
+            &astra_turn_core::introspect::IntrospectRequest::from_args(
+                &serde_json::json!({"facet":"errors", "format":"json"}),
+            ),
+        );
+        assert!(report.contains("invalid_sse_frame_json_eof"));
+        assert!(report.contains("invalid_sse_tail_json_eof"));
+        assert!(report.contains("req_0123456789abcdef"));
+        assert!(!report.contains("private reasoning"));
+        let local_reflect = crate::turn::inspection_service::local_reflect_from_snapshot(
+            &snapshot,
+            astra_core::ObservationFacet::Errors,
+        );
+        assert!(local_reflect.contains("invalid_sse_frame_json_eof"));
+        assert!(!local_reflect.contains("private reasoning"));
+        assert!(recent_provider_failures(&state.step_recorder, Some("another-run")).is_empty());
     }
 
     #[test]

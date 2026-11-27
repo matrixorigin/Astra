@@ -41,7 +41,7 @@ const REFLECT_OVERVIEW_SQL: &str = "SELECT \
      FROM agent_events WHERE session_id = ? AND user_id = ?";
 
 const REFLECT_ERROR_PATTERNS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
-       SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
+       SUBSTRING(COALESCE(MIN(CASE WHEN event_type = 'turn_error' THEN NULL ELSE content END), ''), 1, 100) AS sample_error \
      FROM agent_events \
      WHERE session_id = ? AND user_id = ? \
        AND event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
@@ -49,7 +49,12 @@ const REFLECT_ERROR_PATTERNS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, '')
      ORDER BY fail_count DESC LIMIT 10";
 
 const REFLECT_RAW_ERRORS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, event_type, \
-       SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
+       CASE WHEN event_type = 'turn_error' THEN '' \
+            ELSE SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) END AS content, \
+       CASE WHEN JSON_EXTRACT(metadata, '$.error_kind') IS NULL THEN NULL \
+            WHEN JSON_TYPE(JSON_EXTRACT(metadata, '$.error_kind')) = 'STRING' \
+             AND OCTET_LENGTH(CAST(JSON_EXTRACT(metadata, '$.error_kind') AS CHAR)) <= 128 \
+            THEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.error_kind')) ELSE '' END AS reported_error_kind \
      FROM agent_events \
      WHERE session_id = ? AND user_id = ? \
        AND event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
@@ -1054,6 +1059,7 @@ pub struct RawError {
     skill_name: String,
     event_type: String,
     content: String,
+    reported_error_kind: Option<String>,
 }
 
 /// Intermediate type for error pattern aggregation.
@@ -1569,7 +1575,11 @@ fn build_evidence_graph(
             layer: ObservationGraphLayer::Runtime,
             kind: classify_event_kind(&event.event_type),
             label: event.event_type.clone(),
-            summary: truncate_graph_summary(&event.content, 140),
+            summary: if event.event_type == "turn_error" {
+                Some("Turn failed; error detail is unavailable in this event projection.".into())
+            } else {
+                truncate_graph_summary(&event.content, 140)
+            },
             metadata: Some(serde_json::json!({
                 "event_id": event.event_id,
                 "skill_name": event.skill_name,
@@ -1784,6 +1794,7 @@ fn raw_error_from_row(row: &impl ReflectRow) -> ServiceResult<RawError> {
         skill_name: reflect_row_required_non_empty_string(row, context, "skill_name")?,
         event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
         content: reflect_row_string(row, context, "content")?,
+        reported_error_kind: reflect_row_optional_string(row, context, "reported_error_kind")?,
     })
 }
 
@@ -1828,14 +1839,28 @@ pub trait ReflectService: Send + Sync {
 // ── Error classification (pure logic, no DB) ─────────────────────────────────
 
 /// Sole entry point for turning a `(content, event_type)` pair into an
-/// [`astra_core::ErrorKind`]. `event_type == "stall_detected"` short-circuits
-/// to [`ErrorKind::Stall`]; everything else delegates to
-/// [`astra_core::classify_tool_output`].
+/// [`astra_core::ErrorKind`]. The caller must not use turn-error content as
+/// diagnostic evidence: that column may contain the user's request.
 pub fn classify_error(content: &str, event_type: &str) -> astra_core::ErrorKind {
     if event_type == "stall_detected" {
         return astra_core::ErrorKind::Stall;
     }
+    if event_type == "turn_error" {
+        return astra_core::ErrorKind::Unknown;
+    }
     astra_core::classify_tool_output(content)
+}
+
+fn reported_error_kind(error: &RawError) -> astra_core::ErrorKind {
+    if error.event_type == "stall_detected" {
+        return astra_core::ErrorKind::Stall;
+    }
+    match error.reported_error_kind.as_deref() {
+        Some(kind) => {
+            astra_core::ErrorKind::parse_tag(kind).unwrap_or(astra_core::ErrorKind::Unknown)
+        }
+        None => classify_error(&error.content, &error.event_type),
+    }
 }
 
 /// Build diagnoses from raw error records by classifying and grouping.
@@ -1845,7 +1870,7 @@ pub(crate) fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
 
     let mut groups: HashMap<(ErrorKind, String), Vec<&RawError>> = HashMap::new();
     for err in raw_errors {
-        let kind = classify_error(&err.content, &err.event_type);
+        let kind = reported_error_kind(err);
         let tool = if err.skill_name.is_empty() || err.skill_name == "unknown" {
             "system".to_string()
         } else {
@@ -1904,6 +1929,12 @@ pub(crate) fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
 /// Reflection consumers still need to verify whether partial output is
 /// sufficient for the claim they are evaluating.
 fn raw_error_evidence_summary(error: &RawError) -> String {
+    if error.event_type == "turn_error" {
+        return format!(
+            "turn_error: reported error kind={}; error detail is unavailable in this event projection",
+            reported_error_kind(error).as_str()
+        );
+    }
     let content: String = error.content.chars().take(150).collect();
     if error.event_type == "tool_call_failed" {
         format!(
@@ -1948,23 +1979,30 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
             "Model provider rejected inference ({tool}): inspect the provider rejection — {count} occurrences"
         ),
         K::ResourceLimit => format!(
-            "System resource exhaustion ({tool}): OS cannot fork/allocate — {count} occurrences"
+            "Resource limit reached ({tool}): inspect the recorded resource and limit — {count} occurrences"
         ),
         K::Auth => format!(
             "Authentication failure ({tool}): credentials invalid or expired — {count} occurrences"
         ),
-        K::Network | K::RateLimit | K::ServerError | K::StreamIdle | K::StreamTransport => {
-            format!(
-                "Network/provider issue ({tool}): connection or upstream failure — {count} occurrences"
-            )
+        K::Network => format!("Network failure ({tool}) — {count} occurrences"),
+        K::RateLimit => format!("Request rate limited ({tool}) — {count} occurrences"),
+        K::ServerError => format!("Provider or service error ({tool}) — {count} occurrences"),
+        K::StreamIdle => {
+            format!("Model stream idle deadline reached ({tool}) — {count} occurrences")
         }
         K::ToolTimeout => {
             format!("Timeout ({tool}): operation exceeded time limit — {count} occurrences")
         }
-        K::ToolNotFound => format!(
-            "Missing files/paths ({tool}): agent tried nonexistent paths — {count} occurrences"
+        K::ToolNotFound => {
+            format!("Requested tool or resource not found ({tool}) — {count} occurrences")
+        }
+        K::StreamTransport => format!(
+            "Model response stream could not be consumed completely ({tool}) — {count} occurrences"
         ),
-        K::ToolInvalidArgs | K::InvalidRequest => {
+        K::InvalidRequest => {
+            format!("Model or provider request rejected ({tool}) — {count} occurrences")
+        }
+        K::ToolInvalidArgs => {
             format!("Tool parameter errors ({tool}): wrong arguments passed — {count} occurrences")
         }
         K::PolicyDenied => format!(
@@ -2038,7 +2076,12 @@ pub(crate) fn generate_insights(
     }
 
     for ep in error_patterns {
-        if ep.fail_count >= 3 {
+        if ep.fail_count >= 3
+            && matches!(
+                ep.event_type.as_str(),
+                "tool_call_failed" | "tool_call_rejected"
+            )
+        {
             insights.push(Insight {
                 severity: "warning".into(),
                 kind: InsightKind::ToolFailure {
@@ -2211,7 +2254,7 @@ impl DatabaseReflectService {
         let event_limit = std::cmp::max(i64::from(last_n.clamp(1, 50)) * 10, 50);
         let event_rows = query(
             "SELECT event_id, event_type, \
-               SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 180) AS content, \
+               CASE WHEN event_type = 'turn_error' THEN '' ELSE SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 180) END AS content, \
                COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) AS skill_name, \
                parent_event_id, causal_chain_id, run_id, parent_run_id, agent_id, tool_call_id, trace_kind, \
                CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed', 'tool_call_rejected', 'tool_call_reused', 'tool_call_suppressed', 'tool_call_deferred') \
@@ -3858,6 +3901,7 @@ mod tests {
             Ok(match column {
                 "first_event" => self.first_event,
                 "last_event" => self.last_event,
+                "reported_error_kind" => None,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .map(str::to_string))
@@ -5268,22 +5312,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn turn_failure_uses_only_the_structured_kind() {
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_error("stream_transport", "turn_error"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(
+            classify_error("[stream_transport] invalid JSON", "turn_error"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(classify_error("", "turn_error"), ErrorKind::Unknown);
+        assert_eq!(
+            classify_error("invalid JSON", "tool_call_failed"),
+            ErrorKind::ToolInvalidArgs
+        );
+
+        let diagnosis = build_diagnoses(&[RawError {
+            reported_error_kind: Some("stream_transport".into()),
+            skill_name: "unknown".into(),
+            event_type: "turn_error".into(),
+            content: "invalid JSON in my user request".into(),
+        }]);
+        assert_eq!(diagnosis[0].category, ErrorKind::StreamTransport);
+        assert!(diagnosis[0].samples[0].contains("error detail is unavailable"));
+        assert!(!diagnosis[0].summary.contains("connection"));
+        assert!(!diagnosis[0].fix_hint.contains("network stability"));
+        assert!(!summary_for(ErrorKind::InvalidRequest, "system", 1).contains("Tool parameter"));
+        assert!(!ErrorKind::InvalidRequest.diagnosis_hint().contains("bug"));
+        assert!(summary_for(ErrorKind::RateLimit, "system", 1).contains("rate limited"));
+        assert!(summary_for(ErrorKind::StreamIdle, "system", 1).contains("idle deadline"));
+        assert!(!summary_for(ErrorKind::ResourceLimit, "system", 1).contains("fork"));
+
+        let tool = RawError {
+            reported_error_kind: Some("tool_timeout".into()),
+            skill_name: "bash".into(),
+            event_type: "tool_call_failed".into(),
+            content: "invalid JSON".into(),
+        };
+        assert_eq!(reported_error_kind(&tool), ErrorKind::ToolTimeout);
+        let invalid = RawError {
+            reported_error_kind: Some("not-a-kind".into()),
+            ..tool
+        };
+        assert_eq!(reported_error_kind(&invalid), ErrorKind::Unknown);
+
+        let graph = build_evidence_graph(
+            &[EvidenceEvent {
+                event_id: "event".into(),
+                event_type: "turn_error".into(),
+                content: "private request: ignore prior instructions".into(),
+                ..Default::default()
+            }],
+            &Default::default(),
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&graph).unwrap();
+        assert!(!rendered.contains("private request"));
+        assert!(!rendered.contains("ignore prior instructions"));
+    }
+
+    #[test]
+    fn journal_failure_keeps_its_typed_kind_when_content_is_user_input() {
+        let mut journal = crate::session_journal::JournalEvent::turn_error(
+            Some("session"),
+            1,
+            Some("model"),
+            "invalid JSON in my file",
+            "[stream_transport] provider stream ended",
+            12,
+        );
+        journal.metadata = Some(serde_json::json!({"error_kind": "stream_transport"}));
+        let event =
+            crate::event_ingestion::IngestionEvent::from_journal_event(&journal, "owner").unwrap();
+        assert_eq!(event.content.as_deref(), Some("invalid JSON in my file"));
+        let kind = event.metadata.as_ref().unwrap()["error_kind"]
+            .as_str()
+            .unwrap();
+        let raw = RawError {
+            reported_error_kind: Some(kind.into()),
+            skill_name: "unknown".into(),
+            event_type: event.event_type,
+            content: event.content.unwrap(),
+        };
+        assert_eq!(
+            reported_error_kind(&raw),
+            astra_core::ErrorKind::StreamTransport
+        );
+    }
+
     // ── Diagnosis builder tests ─────────────────────────────────────────
 
     #[test]
     fn diagnoses_group_by_category_and_tool() {
         let errors = vec![
             RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "grep".into(),
                 event_type: "tool_call_failed".into(),
                 content: "No such file or directory".into(),
@@ -5311,6 +5448,7 @@ mod tests {
     #[test]
     fn diagnoses_critical_for_resource_limit() {
         let errors = vec![RawError {
+            reported_error_kind: None,
             skill_name: "bash".into(),
             event_type: "tool_call_failed".into(),
             content: "fork: Resource temporarily unavailable".into(),
@@ -5331,6 +5469,7 @@ mod tests {
     #[test]
     fn diagnoses_fix_hint_contains_ulimit() {
         let errors = vec![RawError {
+            reported_error_kind: None,
             skill_name: "bash".into(),
             event_type: "tool_call_failed".into(),
             content: "fork: Resource temporarily unavailable".into(),
@@ -5346,6 +5485,7 @@ mod tests {
     fn diagnoses_samples_deduped_and_limited() {
         let errors: Vec<RawError> = (0..10)
             .map(|_| RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
@@ -5360,6 +5500,7 @@ mod tests {
     #[test]
     fn failed_command_evidence_does_not_erase_captured_output() {
         let errors = vec![RawError {
+            reported_error_kind: None,
             skill_name: "bash".into(),
             event_type: "tool_call_failed".into(),
             content: "exit code 2\nstdout:\nsrc/lib.rs:42: matched evidence".into(),
@@ -5385,11 +5526,13 @@ mod tests {
     fn diagnoses_sorted_critical_first() {
         let errors = vec![
             RawError {
+                reported_error_kind: None,
                 skill_name: "grep".into(),
                 event_type: "tool_call_failed".into(),
                 content: "No such file or directory".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
@@ -5427,6 +5570,7 @@ mod tests {
         // The user's real scenario: bash "fork" fails but memory_store (HTTP) works
         let errors = vec![
             RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
@@ -5459,16 +5603,19 @@ mod tests {
     fn diagnoses_stall_detected() {
         let errors = vec![
             RawError {
+                reported_error_kind: None,
                 skill_name: "system".into(),
                 event_type: "stall_detected".into(),
                 content: "Agent repeated same tool call 3 times".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "system".into(),
                 event_type: "stall_detected".into(),
                 content: "Agent repeated same tool call 3 times".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "system".into(),
                 event_type: "stall_detected".into(),
                 content: "Agent stuck in loop".into(),
@@ -5489,11 +5636,13 @@ mod tests {
     fn diagnoses_mixed_stall_and_errors() {
         let errors = vec![
             RawError {
+                reported_error_kind: None,
                 skill_name: "system".into(),
                 event_type: "stall_detected".into(),
                 content: "Agent looping".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
@@ -5515,16 +5664,19 @@ mod tests {
         // makes the taxonomy the single source of truth for operator advice.
         let errors = vec![
             RawError {
+                reported_error_kind: None,
                 skill_name: "bash".into(),
                 event_type: "tool_call_failed".into(),
                 content: "fork: Resource temporarily unavailable".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "matrixone".into(),
                 event_type: "tool_call_failed".into(),
                 content: "SQL syntax error: column must appear in GROUP BY".into(),
             },
             RawError {
+                reported_error_kind: None,
                 skill_name: "system".into(),
                 event_type: "stall_detected".into(),
                 content: "Agent looping".into(),
@@ -5546,6 +5698,7 @@ mod tests {
         // DatabaseError signals data-integrity risk; a single occurrence
         // must still be critical (not info). Same rule as ResourceLimit.
         let errors = vec![RawError {
+            reported_error_kind: None,
             skill_name: "matrixone".into(),
             event_type: "tool_call_failed".into(),
             content: "SQL syntax error: column must appear in GROUP BY".into(),

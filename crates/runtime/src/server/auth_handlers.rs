@@ -123,7 +123,7 @@ pub(super) async fn auth_register_handler(
     }
     tracing::info!(
         target: "astra_runtime::auth",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         user_id = %user.user_id,
         is_admin,
         "user registered"
@@ -160,7 +160,7 @@ pub(super) async fn auth_login_handler(
     // Intentionally omit username: avoid PII in application logs (correlate via request_id / JWT).
     tracing::info!(
         target: "astra_runtime::auth",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         "login succeeded"
     );
     Ok(Json(AuthTokenResponse::from(tokens)))
@@ -175,7 +175,7 @@ pub(super) async fn auth_memoria_handler(
         .auth_service
         .login_memoria(request.connection_key.trim())
         .await?;
-    tracing::info!(target: "astra_runtime::auth", request_id = %trace.request_id, "Memoria login succeeded");
+    tracing::info!(target: "astra_runtime::auth", request_id = %trace.log_id(), "Memoria login succeeded");
     Ok(Json(AuthMemoriaResponse {
         user_id: login.tokens.user_id,
         access_token: login.tokens.access_token,
@@ -211,7 +211,7 @@ pub(super) async fn auth_refresh_handler(
         .await?;
     tracing::info!(
         target: "astra_runtime::auth",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         "access token refreshed"
     );
     Ok((
@@ -233,7 +233,7 @@ pub(super) async fn auth_logout_handler(
         .await?;
     tracing::info!(
         target: "astra_runtime::auth",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         "logout"
     );
     Ok(Json(AuthLogoutResponse {
@@ -254,7 +254,7 @@ pub(super) async fn auth_reauthenticate_handler(
         .await?;
     tracing::info!(
         target: "astra_runtime::auth",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         user_id = %user.user_id,
         purpose = proof.purpose.as_str(),
         "reauthentication proof issued"

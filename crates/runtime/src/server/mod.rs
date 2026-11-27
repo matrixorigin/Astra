@@ -141,6 +141,7 @@ use astra_server_types::*;
 mod completions;
 
 pub use request_trace::RequestTrace;
+pub(crate) use request_trace::log_request_id;
 pub use state_builder::build_server_state;
 
 /// Test-only helper: return the raw `Router` without the CORS/body-limit

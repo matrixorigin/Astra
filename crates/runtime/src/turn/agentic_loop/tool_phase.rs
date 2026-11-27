@@ -218,19 +218,19 @@ fn reconcile_logical_tool_telemetry(
     }
 }
 
-fn publish_live_snapshot_for_introspection_calls<H: AgenticLoopHost + ?Sized>(
+fn publish_live_snapshot_for_observation_calls<H: AgenticLoopHost + ?Sized>(
     host: &mut H,
     state: &AgenticLoopState,
     tool_calls: &[Value],
 ) {
     let requests_live_snapshot = tool_calls
         .iter()
-        .any(|tool_call| tool_call_name(tool_call) == Some("introspect"));
+        .any(|tool_call| matches!(tool_call_name(tool_call), Some("introspect" | "reflect")));
     if !requests_live_snapshot {
         return;
     }
 
-    // The normal post-tool publication is too late for an introspect call in
+    // The normal post-tool publication is too late for an observation call in
     // the first tool batch: the executor would read its empty/default cache
     // and report zero usage as current truth. Publish at the observation
     // boundary as well so diagnostics see all state ingested from the LLM
@@ -1732,7 +1732,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 .to_string(),
         );
         }
-        publish_live_snapshot_for_introspection_calls(host, state, all_tool_calls);
+        publish_live_snapshot_for_observation_calls(host, state, all_tool_calls);
         let active_server_rollback_boundary =
             state.runtime_tool_executor.as_deref().and_then(|executor| {
                 open_server_rollback_boundary(
@@ -3753,7 +3753,7 @@ mod tests {
         state.runtime_tool_executor = Some(executor.clone());
         let mut host = MockHost::new(Vec::new());
 
-        publish_live_snapshot_for_introspection_calls(
+        publish_live_snapshot_for_observation_calls(
             &mut host,
             &state,
             &[json!({
@@ -3789,6 +3789,61 @@ mod tests {
             "{}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn first_reflect_fallback_reads_current_provider_failure() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-1".into());
+        state.step_recorder =
+            astra_pipeline::step_recorder::StepRecorder::new("user", "session", "task")
+                .with_invocation_run_id("run-1");
+        state.step_recorder.begin_turn(1);
+        state.step_recorder.begin_llm_round(
+            "model",
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+            "invocation",
+            0,
+        );
+        let error = astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "private detail")
+            .with_details_json(json!({"stream_failure_reason":"invalid_sse_frame_json_eof", "partial_reasoning":"private thinking"}).to_string());
+        state.step_recorder.fail_llm_round(
+            "model",
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+            &error,
+            12,
+            true,
+        );
+        state.step_recorder.end_turn(false);
+        let workspace = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                workspace.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            ),
+        );
+        state.runtime_tool_executor = Some(executor.clone());
+        let mut host = MockHost::new(Vec::new());
+        publish_live_snapshot_for_observation_calls(
+            &mut host,
+            &state,
+            &[json!({
+                "id":"call-reflect", "type":"function", "function":{"name":"reflect", "arguments":"{\"facet\":\"errors\"}"}
+            })],
+        );
+        let result = executor
+            .execute_with_metadata("reflect", &json!({"facet":"errors"}))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("invalid_sse_frame_json_eof"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("private thinking"));
     }
 
     #[test]
