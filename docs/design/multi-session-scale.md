@@ -320,9 +320,10 @@ polling and checks stream availability again after about five minutes.
 
 Local canonical replay owns one working message vector. It moves appended
 messages into that vector, replaces it on a compaction commit, and validates
-each commit against its predecessor and its recorded root. Existing roots
-include the serialized prefix length, so verifying a cold replay can still
-hash earlier messages more than once.
+each commit against its predecessor and its recorded root. Appends count only
+the new messages toward the canonical byte length, and replacements count their
+new history from scratch. The V1 root still hashes the full prefix at each
+commit. Replay keeps one byte count and does not buffer an encoded history.
 
 A CLI attached to a Server conversation refreshes local terminal facts without
 reconstructing a second display history. One-shot local settlement can reuse
@@ -331,3 +332,7 @@ still match under the exclusive append lock. The normal post-sync check reads
 only the new batch. A changed version requires fresh validation, and an
 ambiguous write uses complete readback before settlement. Session authority,
 retained records and cloud synchronization use their existing contracts.
+
+One-shot CLI commands select a Session before acquiring its execution lease
+and fetch the full Server resume bundle once the lease is held. Local
+continuation uses the same journal read to enforce privacy and recover history.

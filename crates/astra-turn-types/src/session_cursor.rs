@@ -79,16 +79,43 @@ pub fn canonical_conversation_root(messages: &[Value]) -> String {
 /// the byte length is domain-separated ahead of the payload. Returning that
 /// count avoids a third full-history traversal in segmented storage.
 pub fn canonical_conversation_identity(messages: &[Value]) -> (String, u64) {
-    let mut counter = CountingWriter::default();
-    write_canonical_messages(messages, &mut counter)
-        .expect("counting canonical JSON bytes cannot fail");
+    let bytes = canonical_conversation_serialized_len(messages);
+    (hash_canonical_messages(messages, bytes), bytes)
+}
 
+/// Compute a V1 identity after appending messages to a verified prefix.
+///
+/// `prefix_bytes` is the canonical array length (including both brackets)
+/// of the first `prefix_messages` messages. Only the suffix needs counting;
+/// the hash still covers the whole conversation.
+pub fn canonical_conversation_append_identity(
+    messages: &[Value],
+    prefix_messages: usize,
+    prefix_bytes: u64,
+) -> (String, u64) {
+    let mut counter = CountingWriter {
+        bytes: prefix_bytes,
+        ..Default::default()
+    };
+    write_canonical_elements(
+        &messages[prefix_messages..],
+        prefix_messages != 0,
+        &mut counter,
+    )
+    .expect("counting appended canonical JSON bytes cannot fail");
+    (
+        hash_canonical_messages(messages, counter.bytes),
+        counter.bytes,
+    )
+}
+
+fn hash_canonical_messages(messages: &[Value], bytes: u64) -> String {
     let mut digest = Sha256::new();
     digest.update(ROOT_HASH_DOMAIN);
-    digest.update(counter.bytes.to_be_bytes());
+    digest.update(bytes.to_be_bytes());
     write_canonical_messages(messages, &mut DigestWriter(&mut digest))
         .expect("hashing canonical JSON bytes cannot fail");
-    (format!("{:x}", digest.finalize()), counter.bytes)
+    format!("{:x}", digest.finalize())
 }
 
 /// Number of bytes in the canonical JSON representation used by
@@ -169,13 +196,23 @@ impl Write for DigestWriter<'_> {
 
 fn write_canonical_messages(messages: &[Value], out: &mut impl Write) -> io::Result<()> {
     out.write_all(b"[")?;
-    for (index, message) in messages.iter().enumerate() {
-        if index > 0 {
+    write_canonical_elements(messages, false, out)?;
+    out.write_all(b"]")
+}
+
+fn write_canonical_elements(
+    messages: &[Value],
+    mut needs_separator: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    for message in messages {
+        if needs_separator {
             out.write_all(b",")?;
         }
         write_canonical_json(message, out)?;
+        needs_separator = true;
     }
-    out.write_all(b"]")
+    Ok(())
 }
 
 fn write_canonical_json(value: &Value, out: &mut impl Write) -> io::Result<()> {

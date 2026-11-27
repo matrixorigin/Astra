@@ -2,9 +2,10 @@ use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::{
-    SessionContinuation, continuation_from_resume_bundle, load_session_continuation_for_recovery,
-    portable_resume_descriptor, sanitize_continuation_messages,
+    SessionContinuation, continuation_from_validated_resume_bundle, portable_resume_descriptor,
+    try_load_session_continuation_for_recovery,
 };
+use crate::cli::session::session_execution_lease::RequestSessionExecutionLease;
 use crate::cli::session::session_restore_client::{
     has_server_auth, list_cloud_resumable_sessions, restore_session_snapshot_with_client,
 };
@@ -14,7 +15,6 @@ pub(crate) struct OneShotSessionResumeMetadata {
     pub(crate) completed_turn_count: u32,
     pub(crate) model: Option<String>,
     pub(crate) permission_mode: Option<String>,
-    pub(crate) continuation_messages: Vec<serde_json::Value>,
     pub(crate) resume_bundle: Option<astra_turn_types::ResumeBundleV1>,
 }
 
@@ -43,6 +43,22 @@ impl OneShotSessionRouting {
             ));
         }
 
+        let validated_remote_root_hash = match remote_bundle.as_ref() {
+            Some(bundle) => match bundle.validated_materialized_root_hash() {
+                Some(root_hash) => Some(root_hash),
+                None => {
+                    tracing::warn!(
+                        "remote one-shot resume bundle does not materialize its declared root"
+                    );
+                    return Err(
+                        "remote one-shot resume bundle failed canonical root validation"
+                            .to_string(),
+                    );
+                }
+            },
+            None => None,
+        };
+
         // A canonical bundle returned for an attached Server session is the
         // authority, while the CLI journal is only a local replica. Their
         // journal sequence numbers are allocated by independent stores and
@@ -55,49 +71,26 @@ impl OneShotSessionRouting {
             })
         {
             let remote = remote_bundle.expect("canonical remote bundle was checked above");
-            if !remote.validates_root() {
-                tracing::warn!(
-                    "remote one-shot resume bundle does not materialize its declared root"
-                );
-                return Err(
-                    "remote one-shot resume bundle failed canonical root validation".to_string(),
-                );
-            }
-            return continuation_from_resume_bundle(remote)
+            let root_hash = validated_remote_root_hash
+                .as_deref()
+                .expect("remote bundle root was validated above");
+            return continuation_from_validated_resume_bundle(remote, root_hash)
                 .map(Some)
                 .ok_or_else(|| "remote ResumeBundle failed causal validation".to_string());
         }
 
-        if let Some(session_id) = self.history_source_session_id.as_deref() {
-            let allowed =
-                crate::cli::session::session_continuation::local_journal_privacy_allows_resume(
-                    session_id,
-                )
-                .map_err(|error| {
-                    format!("cannot verify local continuation privacy boundary: {error}")
-                })?;
-            if !allowed {
-                return Err("local continuation was omitted by privacy policy; select a new session or an explicitly authorized Server canonical resume".into());
-            }
-        }
         let local = self
             .history_source_session_id
             .as_deref()
-            .and_then(load_session_continuation_for_recovery);
+            .map(try_load_session_continuation_for_recovery)
+            .transpose()?
+            .flatten();
 
         let mut candidates = Vec::with_capacity(2);
         if let Some(local) = local.as_ref() {
             candidates.push(portable_resume_descriptor(local.resume.clone()));
         }
         if let Some(remote) = remote_bundle.as_ref() {
-            if !remote.validates_root() {
-                tracing::warn!(
-                    "remote one-shot resume bundle does not materialize its declared root"
-                );
-                return Err(
-                    "remote one-shot resume bundle failed canonical root validation".to_string(),
-                );
-            }
             candidates.push(portable_resume_descriptor(remote.descriptor()));
         }
         if candidates.is_empty() {
@@ -116,7 +109,12 @@ impl OneShotSessionRouting {
             return Ok(local);
         }
         let had_remote_bundle = remote_bundle.is_some();
-        let continuation = remote_bundle.and_then(continuation_from_resume_bundle);
+        let continuation = remote_bundle.and_then(|remote| {
+            let root_hash = validated_remote_root_hash
+                .as_deref()
+                .expect("remote bundle root was validated above");
+            continuation_from_validated_resume_bundle(remote, root_hash)
+        });
         if had_remote_bundle && continuation.is_none() {
             return Err("remote ResumeBundle failed causal validation".to_string());
         }
@@ -158,6 +156,15 @@ impl OneShotSessionRouting {
 
     pub(crate) fn restored_permission_mode(&self) -> Option<&str> {
         self.resume_metadata.permission_mode.as_deref()
+    }
+
+    /// Move a local-only continuation onto a newly created Server session.
+    /// Restored preferences still apply, but the new Server identity has no
+    /// completed turns of its own.
+    pub(crate) fn bind_fresh_server_session(&mut self, session_id: String) {
+        self.resume_metadata.completed_turn_count = 0;
+        self.server_session_id = Some(session_id.clone());
+        self.history_source_session_id = Some(session_id);
     }
 
     /// Return the 1-based turn index for the next Server-owned turn.
@@ -239,11 +246,6 @@ async fn load_one_shot_resume_metadata(
 
     match restored {
         Some(restored) => {
-            let continuation_messages = if restored.resume_bundle.is_some() {
-                Vec::new()
-            } else {
-                sanitize_continuation_messages(restored.conversation_messages)
-            };
             if server_session && restored.resume_bundle.is_none() {
                 return Err(format!(
                     "selected Server session {session_id} omitted required versioned ResumeBundle"
@@ -256,7 +258,6 @@ async fn load_one_shot_resume_metadata(
                 completed_turn_count: restored.turn_count,
                 model: restored.model,
                 permission_mode: restored.permission_mode,
-                continuation_messages,
                 resume_bundle: restored.resume_bundle,
             })
         }
@@ -286,7 +287,35 @@ async fn attach_one_shot_resume_metadata(
     Ok(routing)
 }
 
+pub(crate) async fn admit_one_shot_session(
+    routing: OneShotSessionRouting,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<
+    (
+        OneShotSessionRouting,
+        std::sync::Arc<RequestSessionExecutionLease>,
+    ),
+    String,
+> {
+    let lease = RequestSessionExecutionLease::new(routing.server_session_id.as_deref())
+        .map_err(|failure| failure.message)?;
+    let routing = attach_one_shot_resume_metadata(routing, api, profile).await?;
+    Ok((routing, lease))
+}
+
 pub(crate) async fn resolve_one_shot_session_routing(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    current_session_id: Option<String>,
+    allow_resume: bool,
+) -> Result<OneShotSessionRouting, String> {
+    let routing =
+        resolve_one_shot_session_identity(api, profile, current_session_id, allow_resume).await?;
+    attach_one_shot_resume_metadata(routing, api, profile).await
+}
+
+pub(crate) async fn resolve_one_shot_session_identity(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     current_session_id: Option<String>,
@@ -314,7 +343,7 @@ pub(crate) async fn resolve_one_shot_session_routing(
                 select_one_shot_session_routing(Some(session_id), None, None)
             }
         };
-        return attach_one_shot_resume_metadata(routing, api, profile).await;
+        return Ok(routing);
     }
 
     let local_session_id = (!has_server_auth(profile))
@@ -338,8 +367,11 @@ pub(crate) async fn resolve_one_shot_session_routing(
             None
         }
     };
-    let routing = select_one_shot_session_routing(None, remote_session_id, local_session_id);
-    attach_one_shot_resume_metadata(routing, api, profile).await
+    Ok(select_one_shot_session_routing(
+        None,
+        remote_session_id,
+        local_session_id,
+    ))
 }
 
 #[cfg(test)]
@@ -604,10 +636,6 @@ mod tests {
             server_session_id: Some(session_id.clone()),
             history_source_session_id: Some(session_id),
             resume_metadata: OneShotSessionResumeMetadata {
-                continuation_messages: vec![
-                    serde_json::json!({"role": "user", "content": "inspect"}),
-                    serde_json::json!({"role": "assistant", "content": "done"}),
-                ],
                 ..Default::default()
             },
         };
@@ -835,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_consumes_remote_history_instead_of_retaining_an_extra_copy() {
+    fn one_shot_releases_the_remote_wire_bundle_after_conversion() {
         let session_id = "long-one-shot";
         let messages = (0..2_048)
             .map(|index| serde_json::json!({"role": "user", "content": format!("message-{index}")}))
@@ -856,7 +884,6 @@ mod tests {
             routing.resume_metadata.resume_bundle.is_none(),
             "routing must release its large wire payload once continuation owns it"
         );
-        assert!(routing.resume_metadata.continuation_messages.is_empty());
     }
 
     #[test]
@@ -1163,12 +1190,115 @@ mod tests {
         mock_missing_resume(&server, &session_id).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let error =
-            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id.clone()), true)
-                .await
-                .expect_err("an explicit session with no restore state must fail closed");
+        let identity = super::resolve_one_shot_session_identity(
+            &api,
+            Some("default"),
+            Some(session_id.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        let Err(error) = super::admit_one_shot_session(identity, &api, Some("default")).await
+        else {
+            panic!("an explicit session with no restore state must fail closed");
+        };
 
         assert!(error.contains("no restorable canonical state"), "{error}");
+        assert!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .is_ok()
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cancelled_resume_drops_the_admission_lease_before_stream_start() {
+        use axum::{Router, routing::post};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let received = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            &format!("/sessions/{session_id}/resume"),
+            post({
+                let received = received.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let received = received.clone();
+                    async move {
+                        assert!(headers.contains_key(axum::http::header::AUTHORIZATION));
+                        received.notify_one();
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = astra_thin_client::ThinClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let routing = select_one_shot_session_routing(Some(session_id.clone()), None, None);
+
+        {
+            let restore = super::admit_one_shot_session(routing, &api, Some("default"));
+            tokio::pin!(restore);
+            tokio::select! {
+                result = &mut restore => panic!("restore completed before cancellation: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(10), received.notified()) => {
+                    result.expect("restore request must reach the server");
+                }
+            }
+            assert!(matches!(
+                astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),
+                Err(astra_services::session_journal::SessionExecutionLeaseError::Conflict { .. })
+            ));
+        }
+        assert!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .is_ok(),
+            "cancelling restore must release the lease before stream admission"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn fresh_server_identity_resets_only_the_server_turn_sequence() {
+        let mut routing = OneShotSessionRouting {
+            history_source_session_id: Some("local-session".into()),
+            resume_metadata: OneShotSessionResumeMetadata {
+                completed_turn_count: 12,
+                model: Some("gpt-6.2".into()),
+                permission_mode: Some("plan".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        routing.bind_fresh_server_session("server-session".into());
+
+        assert_eq!(routing.server_session_id.as_deref(), Some("server-session"));
+        assert_eq!(
+            routing.history_source_session_id.as_deref(),
+            Some("server-session")
+        );
+        assert_eq!(routing.next_server_turn_index(), 1);
+        assert_eq!(routing.restored_model(), Some("gpt-6.2"));
+        assert_eq!(routing.restored_permission_mode(), Some("plan"));
     }
 
     #[serial_test::serial]
@@ -1310,10 +1440,32 @@ mod tests {
         .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let routing =
-            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id.clone()), true)
-                .await
-                .expect("explicit cloud resume should restore messages");
+        let identity = super::resolve_one_shot_session_identity(
+            &api,
+            Some("default"),
+            Some(session_id.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        let busy = astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+            .unwrap();
+        let conflict = super::admit_one_shot_session(identity.clone(), &api, Some("default")).await;
+        assert!(conflict.is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), format!("/sessions/{session_id}"));
+        drop(busy);
+
+        let (routing, _lease) = super::admit_one_shot_session(identity, &api, Some("default"))
+            .await
+            .expect("explicit cloud resume should restore messages");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].url.path(),
+            format!("/sessions/{session_id}/resume")
+        );
 
         assert_eq!(routing.restored_model(), Some("gpt-5-cloud"));
         assert_eq!(routing.restored_permission_mode(), Some("accept_edits"));

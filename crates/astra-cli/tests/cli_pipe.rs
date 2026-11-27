@@ -1582,3 +1582,212 @@ async fn device_login_does_not_fall_back_on_an_older_server() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("does not support MOI device code"));
     assert!(!auth.join("auth.json").exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_commands_restore_once_after_selecting_the_session() {
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    use serde_json::{Value, json};
+    use std::process::Stdio;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const SESSION: &str = "395d819b-81a7-4cc0-9aa8-3666ec1ac194";
+    const PROFILE: &str = "one-shot-route-test";
+
+    let messages = vec![
+        json!({"role": "user", "content": "prior question"}),
+        json!({"role": "assistant", "content": "prior answer"}),
+    ];
+    let cursor = astra_turn_types::SessionCursorV1 {
+        schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+        owner_id: astra_credentials::local_profile_owner_id(PROFILE, None).unwrap(),
+        session_id: SESSION.to_string(),
+        branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+        completed_turn: 2,
+        journal_event_seq: 2,
+        conversation_seq: 2,
+        canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+        projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+        compaction_generation: 0,
+        config_version_id: None,
+    };
+    let restored = astra_services::session_restore::RestoredSession {
+        session_id: SESSION.to_string(),
+        turn_count: 2,
+        model: Some("mock-model".to_string()),
+        permission_mode: Some("auto".to_string()),
+        restored_from_cloud: true,
+        resume_bundle: Some(astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor,
+            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+            conversation_messages: messages,
+            materialized_conversation_root_hash: None,
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        }),
+        ..Default::default()
+    };
+
+    let session_reads = Arc::new(AtomicUsize::new(0));
+    let resume_reads = Arc::new(AtomicUsize::new(0));
+    let stream_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new()
+        .route(
+            "/sessions/{session_id}",
+            get({
+                let session_reads = session_reads.clone();
+                move || {
+                    let session_reads = session_reads.clone();
+                    async move {
+                        session_reads.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"session_id": SESSION}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/sessions/{session_id}/resume",
+            post({
+                let resume_reads = resume_reads.clone();
+                let restored = restored.clone();
+                move || {
+                    let resume_reads = resume_reads.clone();
+                    let restored = restored.clone();
+                    async move {
+                        resume_reads.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(restored)
+                    }
+                }
+            }),
+        )
+        .route("/agents/edge", post(|| async { axum::Json(json!({"ok": true})) }))
+        .route(
+            "/skills",
+            get(|| async {
+                axum::Json(json!({
+                    "skills": [], "total": 0, "limit": 100, "next_cursor": null
+                }))
+            }),
+        )
+        .route("/models", get(|| async { pipe_model_catalog() }))
+        .route(
+            "/chat/stream",
+            post({
+                let stream_requests = stream_requests.clone();
+                move |axum::Json(request): axum::Json<Value>| {
+                    let stream_requests = stream_requests.clone();
+                    async move {
+                        stream_requests.lock().unwrap().push(request);
+                        let events = [
+                            json!({
+                                "type": "session_info",
+                                "session_id": SESSION,
+                                "run_id": "one-shot-run"
+                            }),
+                            json!({"type": "text_delta", "content": "ok"}),
+                            json!({"type": "text_done", "full_text": "ok"}),
+                            json!({"type": "usage", "input_tokens": 1, "output_tokens": 1}),
+                            json!({
+                                "type": "run_finished",
+                                "run_id": "one-shot-run",
+                                "status": "completed",
+                                "owner_generation": 1
+                            }),
+                            json!({
+                                "type": "turn_complete",
+                                "has_tool_calls": false,
+                                "continuation_owner": "server",
+                                "tool_calls_count": 0,
+                                "observation_tool_calls_count": 0,
+                                "tools_used": [],
+                                "llm_rounds": 1,
+                                "tool_ledger_receipt": astra_turn_types::tool_ledger_receipt::ToolLedgerReceipt::empty("one-shot-run", 1)
+                            }),
+                        ];
+                        let body = events
+                            .iter()
+                            .map(|event| format!("data: {event}\n\n"))
+                            .collect::<String>()
+                            + "data: [DONE]\n\n";
+                        (
+                            [
+                                ("content-type", "text/event-stream"),
+                                (
+                                    astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                                    astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                                ),
+                            ],
+                            body,
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    for (index, mode) in ["inline", "chat", "print"].into_iter().enumerate() {
+        let home = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+        command.args([
+            "--api-url",
+            &base_url,
+            "--profile",
+            PROFILE,
+            "--model",
+            "mock-model",
+            "--no-instructions",
+        ]);
+        match mode {
+            "inline" => command.args(["--session-id", SESSION, "resume one-shot route"]),
+            "chat" => command.args([
+                "chat",
+                "--session-id",
+                SESSION,
+                "--message",
+                "resume one-shot route",
+            ]),
+            "print" => command.args(["--session-id", SESSION, "--print", "resume one-shot route"]),
+            _ => unreachable!(),
+        };
+        command
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("ASTRA_LOCAL_STATE_ROOT", home.path().join(".astra"))
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("XDG_DATA_HOME", home.path().join(".local/share"))
+            .env("ASTRA_ACCESS_TOKEN", "one-shot-route-token")
+            .env("ASTRA_API_URL", &base_url)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session_reads.load(Ordering::SeqCst), index + 1, "{mode}");
+        assert_eq!(resume_reads.load(Ordering::SeqCst), index + 1, "{mode}");
+        assert!(
+            output.status.success(),
+            "{mode}: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = stream_requests.lock().unwrap();
+        assert_eq!(requests.len(), index + 1, "{mode}");
+        assert_eq!(requests[index]["session_id"], SESSION, "{mode}");
+    }
+
+    server.abort();
+}
