@@ -2877,20 +2877,65 @@ fn bedrock_cache_point_from_block(block: &Value) -> Option<Value> {
     bedrock_cache_point_from_cache_control(block.get("cache_control"))
 }
 
+fn bedrock_part_text(part: &Value) -> Option<&str> {
+    part.get("text")
+        .and_then(Value::as_str)
+        .or(part.as_str())
+        .filter(|text| is_nonblank_text(text))
+}
+
+/// Count standalone user text blocks in the selected provider's projection.
+/// Native message grouping preserves block order. Responses joins the text
+/// parts of each message into one block.
+pub(crate) fn projected_user_text_occurrences(
+    message: &Value,
+    protocol: LlmProviderProtocol,
+    expected: &str,
+) -> usize {
+    if message["role"] != "user" {
+        return 0;
+    }
+    let content = &message["content"];
+    match protocol {
+        LlmProviderProtocol::OpenAiResponses => usize::from(
+            astra_core::model_wire::responses::input_text_matches(content, expected),
+        ),
+        LlmProviderProtocol::TypeSafeSystemOne => 0, // This codec accepts typed judgments only.
+        LlmProviderProtocol::BedrockConverse => match content {
+            Value::Array(parts) => parts
+                .iter()
+                .filter(|part| bedrock_part_text(part) == Some(expected))
+                .count(),
+            part => usize::from(bedrock_part_text(part) == Some(expected)),
+        },
+        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
+            let is_text_part = |part: &Value| part["type"] == "text" && part["text"] == expected;
+            match content {
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter(|part| {
+                        is_text_part(part)
+                            || (protocol == LlmProviderProtocol::AnthropicMessages
+                                && part.as_str() == Some(expected))
+                    })
+                    .count(),
+                Value::Object(_) if protocol == LlmProviderProtocol::AnthropicMessages => {
+                    usize::from(is_text_part(content))
+                }
+                content => usize::from(content.as_str() == Some(expected)),
+            }
+        }
+    }
+}
+
 fn build_bedrock_text_content_blocks(content: Option<&Value>) -> Vec<Value> {
     match content {
         Some(Value::String(text)) if is_nonblank_text(text) => vec![json!({ "text": text })],
         Some(Value::Array(parts)) => {
             let mut blocks = Vec::new();
             for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if is_nonblank_text(text) {
-                        blocks.push(json!({ "text": text }));
-                    }
-                } else if let Some(text) = part.as_str() {
-                    if is_nonblank_text(text) {
-                        blocks.push(json!({ "text": text }));
-                    }
+                if let Some(text) = bedrock_part_text(part) {
+                    blocks.push(json!({ "text": text }));
                 }
                 if let Some(cache_point) = bedrock_cache_point_from_block(part) {
                     blocks.push(cache_point);
@@ -2900,10 +2945,8 @@ fn build_bedrock_text_content_blocks(content: Option<&Value>) -> Vec<Value> {
         }
         Some(Value::Object(obj)) => {
             let mut blocks = Vec::new();
-            if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                if is_nonblank_text(text) {
-                    blocks.push(json!({ "text": text }));
-                }
+            if let Some(text) = content.and_then(bedrock_part_text) {
+                blocks.push(json!({ "text": text }));
             }
             if let Some(cache_point) = bedrock_cache_point_from_block(&Value::Object(obj.clone())) {
                 blocks.push(cache_point);
@@ -3977,6 +4020,7 @@ fn build_provider_request_body_with_cache_capability(
                     })
                 })
             || [
+                astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
                 RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
@@ -4661,6 +4705,7 @@ fn strip_internal_runtime_markers_with_ids(
             object.remove(astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
             object.remove(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD);
             object.remove(super::model_origin::FOREIGN_GROUP);

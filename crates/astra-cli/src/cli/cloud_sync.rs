@@ -15,8 +15,8 @@ use astra_core::sync_poison::recover_mutex_lock;
 use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_services::{
-    SyncOutboxDeliverySettlement, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
-    SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
+    SyncOutboxDeliverySettlement, SyncOutboxJournalDeltaOutcome, SyncOutboxRecord,
+    SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
 use astra_sync_protocol::{
     MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
@@ -963,21 +963,16 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         let mut deltas = Vec::new();
         for session_id in current_sessions {
             let offset = offsets.get(&session_id).copied().unwrap_or(0);
-            let delta = session_journal::read_durable_journal_append_delta_for_owner(
+            let delta = astra_services::sync_outbox::prepare_journal_delta_for_owner(
                 owner_scope,
                 &session_id,
                 offset,
             );
             match delta {
-                Ok(delta) if delta.next_offset == offset => {
+                Ok(delta) if delta.next_offset() == offset => {
                     outcomes.insert(session_id, Ok(false));
                 }
-                Ok(delta) => deltas.push(SyncOutboxJournalDelta {
-                    source_session_id: session_id,
-                    expected_offset: offset,
-                    next_offset: delta.next_offset,
-                    events: delta.events,
-                }),
+                Ok(delta) => deltas.push(delta),
                 Err(error) => {
                     outcomes.insert(session_id, Err(error));
                 }
@@ -988,9 +983,9 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         }
         let delta_session_ids = deltas
             .iter()
-            .map(|delta| delta.source_session_id.clone())
+            .map(|delta| delta.source_session_id().to_owned())
             .collect::<Vec<_>>();
-        let batch_outcome = store.append_journal_deltas(&deltas);
+        let batch_outcome = store.append_journal_deltas(deltas);
         match batch_outcome {
             Ok(batch_outcome) => {
                 let mut newly_terminal = 0usize;
@@ -4693,7 +4688,7 @@ mod tests {
                 release_sync_outbox_retry_wake_schedule();
                 let guard = try_claim_sync_outbox_drain_schedule().unwrap();
                 let store = SyncOutboxStore::local();
-                store.enqueue_journal_event(&JournalEvent::config_change(Some("wake-session"), "model", "test")).unwrap();
+                store.enqueue_journal_event(JournalEvent::config_change(Some("wake-session"), "model", "test")).unwrap();
                 super::schedule_sync_outbox_drain();
                 assert!(super::recover_mutex_lock(&super::SYNC_OUTBOX_RETRY_WAKE).is_some());
                 tokio::task::yield_now().await;

@@ -64,6 +64,17 @@ impl FileDesc<'_> {
         }
     }
 
+    #[cfg(feature = "events")]
+    pub(crate) fn queued_input(&self) -> usize {
+        let mut count: libc::c_int = 0;
+        // SAFETY: this descriptor is live and FIONREAD writes one c_int.
+        let result = unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut count) };
+        if result < 0 {
+            return 0;
+        }
+        count.max(0) as usize
+    }
+
     /// Returns the underlying file descriptor.
     pub fn raw_fd(&self) -> RawFd {
         self.fd
@@ -79,6 +90,11 @@ impl FileDesc<'_> {
         };
         let result = rustix::io::read(fd, buffer)?;
         Ok(result)
+    }
+
+    #[cfg(feature = "events")]
+    pub(crate) fn queued_input(&self) -> usize {
+        rustix::io::ioctl_fionread(self).unwrap_or(0) as usize
     }
 
     pub fn raw_fd(&self) -> RawFd {

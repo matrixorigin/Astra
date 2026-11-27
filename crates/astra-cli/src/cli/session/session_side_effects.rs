@@ -85,11 +85,13 @@ pub(crate) fn append_one_shot_journal_events(
             "failed to create session journal for {session_id}: {error}"
         ))
     })?;
-    let existing_events = writer.complete_append_order_snapshot().map_err(|error| {
+    let snapshot = writer.validated_append_order_snapshot().map_err(|error| {
         OneShotJournalCommitError::CommitUnknown(format!(
             "failed to read complete append-order journal for {session_id}: {error}"
         ))
     })?;
+
+    let existing_events = snapshot.events();
 
     // A completed user turn is the primary durable fact. LLM request/response
     // snapshots are optional diagnostics, so their absence must not suppress
@@ -241,6 +243,7 @@ pub(crate) fn append_one_shot_journal_events(
             turn,
             &intended_commit,
             &turn_event,
+            Some(&snapshot),
         ) {
             session_journal::CanonicalCommitCasOutcome::ContentOmitted {
                 persistence_warning,
@@ -273,6 +276,7 @@ pub(crate) fn append_one_shot_journal_events(
         turn,
         &intended_commit,
         &append_events,
+        Some(&snapshot),
     ) {
         session_journal::CanonicalCommitCasOutcome::Committed {
             persistence_warning,

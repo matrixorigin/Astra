@@ -3429,7 +3429,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .execute(&mut *tx)
         .await
         .map_err(|source| database_error("activate_fork_pin", source))?;
-        insert_fork_event(&mut tx, &active, 1, "prepared", "active").await?;
         tx.commit()
             .await
             .map_err(|source| database_error("commit_activate_fork", source))?;
@@ -6585,34 +6584,6 @@ fn fork_child_head(manifest: &SessionForkManifestV1, writer_epoch: u64) -> Sessi
         total_message_count: manifest.parent_head.total_message_count,
         writer_epoch,
     }
-}
-
-async fn insert_fork_event(
-    tx: &mut Transaction<'_, MySql>,
-    manifest: &SessionForkManifestV1,
-    transition_seq: u64,
-    from_state: &str,
-    to_state: &str,
-) -> Result<(), SessionContextCoordinatorError> {
-    sqlx::query(
-        "INSERT IGNORE INTO session_fork_events
-         (isolation_domain, owner_user_id, fork_id, transition_seq,
-          parent_session_id, child_session_id, from_state, to_state, event_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&manifest.child_key.isolation_domain)
-    .bind(&manifest.child_key.owner_user_id)
-    .bind(&manifest.fork_id)
-    .bind(i64_from_u64("fork transition sequence", transition_seq)?)
-    .bind(&manifest.parent_key.session_id)
-    .bind(&manifest.child_key.session_id)
-    .bind(from_state)
-    .bind(to_state)
-    .bind(database_to_json("fork_event", manifest)?)
-    .execute(&mut **tx)
-    .await
-    .map_err(|source| database_error("insert_fork_event", source))?;
-    Ok(())
 }
 
 fn database_json<T: DeserializeOwned>(

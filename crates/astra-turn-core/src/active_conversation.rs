@@ -4,6 +4,8 @@ use astra_turn_types::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
+    canonical_conversation_append_identity, canonical_conversation_identity,
+    canonical_json_prefix_len,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -162,13 +164,41 @@ impl ActiveConversation {
         session_id: &str,
         commits: impl IntoIterator<Item = ConversationCommitV1>,
     ) -> Result<Option<Self>, ActiveConversationError> {
-        let mut active = Self::empty(owner_id, session_id)?;
+        let mut cursor = Self::empty(owner_id, session_id)?.cursor;
+        let mut messages = Vec::new();
+        let mut canonical_bytes = 2; // The empty canonical JSON array.
         let mut found = false;
         for commit in commits {
-            active = active.apply_commit(commit, ActiveConversationSource::Journal)?;
+            validate_commit_identity(&cursor, &commit)?;
+            if commit.base_root_hash != cursor.canonical_root_hash {
+                return Err(ActiveConversationError::BaseRootMismatch);
+            }
+            let (root, bytes) = match commit.delta {
+                ConversationDeltaV1::Append { messages: appended } => {
+                    let prefix_len = messages.len();
+                    messages.extend(appended);
+                    canonical_conversation_append_identity(&messages, prefix_len, canonical_bytes)
+                }
+                ConversationDeltaV1::Replace {
+                    messages: replacement,
+                    ..
+                } => {
+                    messages = replacement;
+                    canonical_conversation_identity(&messages)
+                }
+            };
+            if root != commit.cursor.canonical_root_hash {
+                return Err(ActiveConversationError::RootMismatch);
+            }
+            canonical_bytes = bytes;
+            cursor = commit.cursor;
             found = true;
         }
-        Ok(found.then_some(active))
+        Ok(found.then(|| Self {
+            cursor,
+            messages: messages.into(),
+            source: ActiveConversationSource::Journal,
+        }))
     }
 
     pub fn cursor(&self) -> &SessionCursorV1 {
@@ -202,7 +232,7 @@ impl ActiveConversation {
 
         let durable_base = self.source.is_durable_canonical();
         let common_prefix = if durable_base {
-            common_prefix_len(self.messages(), &messages)
+            canonical_json_prefix_len(self.messages(), &messages)
         } else {
             0
         };
@@ -276,33 +306,6 @@ impl ActiveConversation {
             },
         })
     }
-
-    fn apply_commit(
-        &self,
-        commit: ConversationCommitV1,
-        source: ActiveConversationSource,
-    ) -> Result<Self, ActiveConversationError> {
-        validate_commit_identity(&self.cursor, &commit)?;
-        if commit.base_root_hash != self.cursor.canonical_root_hash {
-            return Err(ActiveConversationError::BaseRootMismatch);
-        }
-        let messages = match commit.delta {
-            ConversationDeltaV1::Append { messages } => {
-                let mut materialized = self.materialize();
-                materialized.extend(messages);
-                materialized
-            }
-            ConversationDeltaV1::Replace { messages, .. } => messages,
-        };
-        if canonical_conversation_root(&messages) != commit.cursor.canonical_root_hash {
-            return Err(ActiveConversationError::RootMismatch);
-        }
-        Ok(Self {
-            cursor: commit.cursor,
-            messages: messages.into(),
-            source,
-        })
-    }
 }
 
 fn validate_commit_identity(
@@ -370,13 +373,6 @@ fn validate_commit_identity(
     Ok(())
 }
 
-fn common_prefix_len(left: &[Value], right: &[Value]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -425,6 +421,31 @@ mod tests {
         assert_eq!(replayed.cursor().completed_turn, 4);
         assert_eq!(replayed.cursor().conversation_seq, 4);
         assert_eq!(replayed.source(), ActiveConversationSource::Journal);
+    }
+
+    #[test]
+    fn changed_nested_number_is_preserved_by_commit_and_replay() {
+        let first = ActiveConversation::empty("owner", "session")
+            .unwrap()
+            .prepare_commit(1, None, vec![json!({"content": {"value": [0.0]}})])
+            .unwrap();
+        let messages = vec![json!({"content": {"value": [-0.0]}})];
+        let second = first
+            .next
+            .prepare_commit(2, None, messages.clone())
+            .unwrap();
+        assert!(matches!(
+            second.commit.delta,
+            ConversationDeltaV1::Replace { .. }
+        ));
+        let replayed =
+            ActiveConversation::replay("owner", "session", [first.commit, second.commit])
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            canonical_conversation_root(replayed.messages()),
+            canonical_conversation_root(&messages)
+        );
     }
 
     #[test]
@@ -485,6 +506,72 @@ mod tests {
         assert_eq!(
             canonical_conversation_root(&[json!({"role": "user", "content": "hi"})]),
             canonical_conversation_root(&[json!({"content": "hi", "role": "user"})])
+        );
+    }
+
+    #[test]
+    fn replay_checks_every_root_across_append_and_replacement() {
+        let initial = ActiveConversation::empty("owner", "session").unwrap();
+        let mut active = initial;
+        let mut commits = Vec::new();
+        let mut messages = Vec::new();
+        let mut snapshots = Vec::new();
+        for turn in 1..=7 {
+            match turn {
+                1 | 4 => messages.extend(tool_turn("工具\n")),
+                2 | 7 => messages.push(json!({"nested": {"b": [-1.25, null], "a": true}})),
+                3 | 6 => {} // Empty appends still advance the cursor.
+                5 => messages.clear(),
+                _ => unreachable!(),
+            }
+            let prepared = active.prepare_commit(turn, None, messages.clone()).unwrap();
+            commits.push(prepared.commit);
+            active = prepared.next;
+            snapshots.push(active.clone());
+        }
+        for (index, expected) in snapshots.iter().enumerate() {
+            let replayed =
+                ActiveConversation::replay("owner", "session", commits[..=index].iter().cloned())
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(replayed.messages(), expected.messages());
+            assert_eq!(replayed.cursor(), expected.cursor());
+        }
+        let ConversationDeltaV1::Append { messages } = &mut commits[1].delta else {
+            panic!("expected append");
+        };
+        messages[0] = json!({"nested": {"b": [-1.25, null], "a": null}});
+        assert_eq!(
+            ActiveConversation::replay("owner", "session", commits).unwrap_err(),
+            ActiveConversationError::RootMismatch
+        );
+    }
+
+    #[test]
+    fn replay_reuses_owned_message_payloads_across_appends() {
+        let first = ActiveConversation::empty("owner", "session")
+            .unwrap()
+            .prepare_commit(
+                1,
+                None,
+                vec![json!({"role": "user", "content": "first message"})],
+            )
+            .unwrap();
+        let mut messages = first.next.materialize();
+        messages.push(json!({"role": "assistant", "content": "answer"}));
+        let second = first.next.prepare_commit(2, None, messages).unwrap();
+        let ConversationDeltaV1::Append { messages } = &first.commit.delta else {
+            panic!("first commit must append");
+        };
+        let payload = messages[0]["content"].as_str().unwrap().as_ptr();
+        let replayed =
+            ActiveConversation::replay("owner", "session", [first.commit, second.commit])
+                .unwrap()
+                .unwrap();
+        assert_eq!(replayed.messages(), second.next.messages());
+        assert_eq!(
+            replayed.messages()[0]["content"].as_str().unwrap().as_ptr(),
+            payload
         );
     }
 

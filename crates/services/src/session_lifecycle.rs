@@ -94,9 +94,6 @@ const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
               AND descendants.state IN ('prepared', 'active')
         )";
 
-const SESSION_DELETE_CHILD_FORK_EVENTS_SQL: &str = "DELETE FROM session_fork_events
-         WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?";
-
 const SESSION_DELETE_CHILD_MANIFEST_PINS_SQL: &str = "DELETE FROM conversation_manifest_pins
          WHERE isolation_domain = ? AND owner_user_id = ? AND pin_id = ?";
 
@@ -605,16 +602,6 @@ async fn delete_child_fork_state(
         let parent_session_id: String = fork
             .try_get("parent_session_id")
             .map_err(|source| format!("delete_session.decode_child_fork.parent: {source}"))?;
-
-        let rows = query(SESSION_DELETE_CHILD_FORK_EVENTS_SQL)
-            .bind(&isolation_domain)
-            .bind(user_id)
-            .bind(&fork_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| format!("delete_session.session_fork_events: {source}"))?
-            .rows_affected();
-        record_table_delete(outcome, "session_fork_events", rows)?;
 
         let rows = query(SESSION_DELETE_CHILD_MANIFEST_PINS_SQL)
             .bind(&isolation_domain)

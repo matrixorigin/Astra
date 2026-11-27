@@ -5205,32 +5205,7 @@ fn handle_task_surface_refresh_shortcut(
     true
 }
 
-/// Edit the latest semantic user message as a fresh turn. Keep the prior
-/// transcript intact and leave overlays and in-flight drafts in control.
-fn handle_edit_last_shortcut(
-    key: &crossterm::event::KeyEvent,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-    frame_requester: &FrameRequester,
-) -> bool {
-    if key.code != crossterm::event::KeyCode::Char('r')
-        || !key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL)
-        || bottom_pane.has_active_view()
-        || !bottom_pane.composer.is_empty()
-    {
-        return false;
-    }
-    let Some(prev) = chat_widget.last_user_text() else {
-        return false;
-    };
-    bottom_pane
-        .composer
-        .set_text(&slash_dispatch::conversation_for_composer(&prev));
-    frame_requester.schedule_frame();
-    true
-}
+// Ctrl+R is owned by BottomPane's incremental history search.
 
 fn handle_agent_monitor_shortcut(
     key: &crossterm::event::KeyEvent,
@@ -11209,6 +11184,7 @@ pub(crate) async fn run_tui_session(
                             crossterm::event::KeyCode::Enter,
                             crossterm::event::KeyModifiers::NONE,
                         ),
+                        std::time::Instant::now(),
                     ),
                     event => event,
                 };
@@ -11219,7 +11195,7 @@ pub(crate) async fn run_tui_session(
                     && !state.background_persistence_errors.is_empty()
                     && state.session_id == background_registry_session_id
                     && *background_registry.owner_scope() == astra_services::local_owner_scope()
-                    && (matches!(&ev, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Enter)
+                    && (matches!(&ev, TuiEvent::Key(key, _) if key.code == crossterm::event::KeyCode::Enter)
                         || matches!(&ev, TuiEvent::QueuedSubmission(_)));
                 if retry_background_write {
                     persist_background_task_projections_if_changed(
@@ -11243,7 +11219,7 @@ pub(crate) async fn run_tui_session(
                         .await;
                 }
                 match ev {
-                    event @ (TuiEvent::Key(_) | TuiEvent::QueuedSubmission(_)) => {
+                    event @ (TuiEvent::Key(..) | TuiEvent::QueuedSubmission(_)) => {
                         let runtime_notification_submission =
                             runtime_notification_event && runtime_notification_turn_pending;
                         let queued_replay = matches!(event, TuiEvent::QueuedSubmission(_));
@@ -11267,7 +11243,7 @@ pub(crate) async fn run_tui_session(
                                     NextTurnSubmission::Conversation { target, content } => (Some(target), BottomPaneAction::SubmitInput(content)),
                                 }
                             }
-                            TuiEvent::Key(key) => {
+                            TuiEvent::Key(key, input_at) => {
                         if !model_setup_tasks.is_empty() {
                             use crossterm::event::{KeyCode, KeyModifiers};
                             if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
@@ -11392,14 +11368,8 @@ pub(crate) async fn run_tui_session(
                         ) {
                             continue;
                         }
-                        if handle_edit_last_shortcut(
-                            &key,
-                            &chat_widget,
-                            &mut bottom_pane,
-                            &frame_requester,
-                        ) {
-                            continue;
-                        }
+                        // Ctrl+R is routed by BottomPane so it works with a
+                        // non-empty draft and remains active inside history search.
                         if handle_agent_monitor_shortcut(
                             &key,
                             &mut chat_widget,
@@ -11411,7 +11381,7 @@ pub(crate) async fn run_tui_session(
                         let bottom_pane_action = if runtime_notification_submission {
                             BottomPaneAction::SubmitInput(String::new())
                         } else {
-                            bottom_pane.handle_key(key)
+                            bottom_pane.handle_session_key_at(key, input_at, chat_widget.history())
                         };
                                 (None, bottom_pane_action)
                             }
@@ -12580,7 +12550,7 @@ pub(crate) async fn run_tui_session(
                                                 // single owner that resolves any queued input.
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
-                                                        TuiEvent::Key(k) => {
+                                                        TuiEvent::Key(k, input_at) => {
                                                             match handle_global_key_action(
                                                                 k,
                                                                 &mut guard,
@@ -12691,8 +12661,7 @@ pub(crate) async fn run_tui_session(
                                                             // During turn: composer stays usable.
                                                             // Enter queues a user intent against the active run.
                                                             // Ctrl+C interrupts.
-                                                            bottom_pane.pre_draw_tick(std::time::Instant::now());
-                                                            let action = bottom_pane.handle_key(k);
+                                                            let action = bottom_pane.handle_session_key_at(k, input_at, chat_widget.history());
                                                             if queue_explicit_active_followup(
                                                                 &action,
                                                                 &mut bottom_pane,
@@ -13248,7 +13217,7 @@ pub(crate) async fn run_tui_session(
                                 }
                                                         }
                                                         TuiEvent::Paste(text) => {
-                                                            bottom_pane.handle_paste(&text);
+                                                            bottom_pane.handle_session_paste(&text, chat_widget.history());
                                                             frame_requester.schedule_frame();
                                                             {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -14860,7 +14829,7 @@ pub(crate) async fn run_tui_session(
                         // `[Pasted #N · M lines]` placeholder. The
                         // placeholder expands back to the original text
                         // on submit.
-                        bottom_pane.handle_paste(&text);
+                        bottom_pane.handle_session_paste(&text, chat_widget.history());
                         frame_requester.schedule_frame();
                     }
                     TuiEvent::RuntimeNotificationTurn => unreachable!(
@@ -15012,7 +14981,7 @@ pub(crate) async fn run_tui_session(
                         followup_release_gate(model_catalog_loading, slash_background_read_count),
                     );
                 }
-                if bottom_pane.pre_draw_tick(std::time::Instant::now()) {
+                if bottom_pane.pre_draw_session_tick(std::time::Instant::now(), chat_widget.history()) {
                     frame_requester.schedule_frame();
                 }
                 // Re-derive permission-mode chip from live state so
@@ -20542,7 +20511,7 @@ mod tests {
                     assert!(queue.is_empty(), "returned manual custody: {case}");
                     if case == "paste" {
                         pane.pre_draw_tick(std::time::Instant::now() + Duration::from_secs(1));
-                        // The still-active detector is not forced to flush by this synthetic tick.
+                        // The synthetic tick flushes the paste without losing the draft.
                         assert!(!pane.composer.is_empty());
                     } else {
                         if matches!(case, "newline" | "whitespace") {
@@ -31467,7 +31436,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_last_shortcut_resubmits_semantic_slash_text_without_local_actions() {
+    fn history_search_resubmits_semantic_slash_text_without_local_actions() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         for (raw, semantic) in [
@@ -31479,6 +31448,7 @@ mod tests {
             ("ordinary message", "ordinary message"),
         ] {
             let mut pane = BottomPane::new();
+            pane.composer = bottom_pane::chat_composer::ChatComposer::new_ephemeral();
             pane.set_slash_items(
                 crate::cli::command_registry::tui_commands()
                     .filter(|meta| !meta.name.contains(' '))
@@ -31486,9 +31456,7 @@ mod tests {
                     .collect(),
             );
             let mut widget = chat_widget::ChatWidget::new("edit-session");
-            for ch in raw.chars() {
-                pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-            }
+            crate::tui::testing::keys::type_into(&mut pane, raw);
             let BottomPaneAction::SubmitInput(text) =
                 pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             else {
@@ -31506,24 +31474,32 @@ mod tests {
                 chat_widget::WireEvent::TurnComplete(Box::default()),
             ));
 
-            // Repeated editing must not consume another slash or change the
-            // canonical transcript into composer syntax.
+            // Reverse search must return the exact history bytes, preserving
+            // slash escapes and ordinary conversation semantics.
             for _ in 0..2 {
-                assert!(handle_edit_last_shortcut(
-                    &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
-                    &widget,
-                    &mut pane,
-                    &FrameRequester::test_dummy(),
+                assert!(matches!(
+                    pane.handle_session_key_at(
+                        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                        std::time::Instant::now(),
+                        widget.history()
+                    ),
+                    BottomPaneAction::Consumed
+                ));
+                assert!(!pane.has_active_view());
+                crate::tui::testing::keys::type_into(&mut pane, raw);
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    BottomPaneAction::Consumed
                 ));
                 let BottomPaneAction::SubmitInput(retry) =
                     pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 else {
-                    panic!("edited conversation must submit: {raw}");
+                    panic!("selected conversation must submit: {raw}");
                 };
                 assert_eq!(
                     submission_projection(&retry),
                     SubmissionProjection::Conversation(semantic),
-                    "edit last must preserve conversation meaning: {raw}",
+                    "history search must preserve conversation meaning: {raw}",
                 );
                 assert!(slash_dispatch::immediate_control(&retry).is_none());
                 assert!(!slash_dispatch::parse_submission(&retry).is_command());
@@ -31543,41 +31519,42 @@ mod tests {
     }
 
     #[test]
-    fn edit_last_shortcut_preserves_drafts_overlays_and_empty_session() {
+    fn history_search_preserves_drafts_and_existing_overlays() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let edit = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        let frame = FrameRequester::test_dummy();
-        let mut widget = chat_widget::ChatWidget::new("edit-session");
-        commit_submission_projection(&mut widget, "//exit");
+        let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         let mut pane = BottomPane::new();
+        pane.composer = bottom_pane::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("previous prompt");
+        pane.composer.clear_and_submit();
         pane.composer.set_text("existing draft");
-        assert!(!handle_edit_last_shortcut(
-            &edit, &widget, &mut pane, &frame
+        assert_eq!(pane.composer.text(), "existing draft");
+
+        assert!(matches!(
+            pane.handle_key(search),
+            BottomPaneAction::Consumed
         ));
         assert_eq!(pane.composer.text(), "existing draft");
-        pane.composer.set_text("");
+        assert!(!pane.has_active_view());
+        assert!(pane.composer.is_browsing_history());
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ));
+        assert!(!pane.has_active_view());
+        assert!(!pane.composer.is_browsing_history());
+        assert_eq!(pane.composer.text(), "existing draft");
+
         pane.push_view(Box::new(bottom_pane::info_view::InfoView::from_plain(
             "Details",
             vec!["Keep this view".into()],
         )));
-        assert!(!handle_edit_last_shortcut(
-            &edit, &widget, &mut pane, &frame
+        assert!(matches!(
+            pane.handle_key(search),
+            BottomPaneAction::Consumed
         ));
         assert!(pane.has_active_view());
-        assert!(pane.composer.is_empty());
-
-        let mut pane = BottomPane::new();
-        let other = chat_widget::ChatWidget::new("empty-other-session");
-        assert!(!handle_edit_last_shortcut(&edit, &other, &mut pane, &frame));
-        assert!(pane.composer.is_empty());
-        assert!(!handle_edit_last_shortcut(
-            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
-            &widget,
-            &mut pane,
-            &frame,
-        ));
-        assert!(pane.composer.is_empty());
+        assert_eq!(pane.composer.text(), "existing draft");
     }
 
     #[tokio::test]
@@ -31792,9 +31769,7 @@ mod tests {
                     "/tmp/project inspect this",
                 )
                 .unwrap();
-                for ch in draft.chars() {
-                    pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-                }
+                crate::tui::testing::keys::type_into(&mut pane, draft);
                 assert!(pane.return_user_intent(
                     "returned-literal",
                     astra_turn_types::UserIntentStatus::Returned,
@@ -32787,16 +32762,8 @@ mod tests {
             );
             assert!(state.agent_spawner.is_none());
             assert!(widget.last_user_text().is_none());
-            let mut pane = BottomPane::new();
-            assert!(!handle_edit_last_shortcut(
-                &crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('r'),
-                    crossterm::event::KeyModifiers::CONTROL
-                ),
-                &widget,
-                &mut pane,
-                &FrameRequester::test_dummy(),
-            ));
+            // Composer history is independent of the retired session widget;
+            // the old empty-session Ctrl+R assertion no longer applies.
             let events =
                 astra_services::session_journal::read_journal_for_owner(&old_owner, sid).unwrap();
             assert!(events.iter().any(|event| event.event_type

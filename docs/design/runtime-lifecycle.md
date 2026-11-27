@@ -331,30 +331,36 @@ bundle. A local replica cannot override Server ownership, deletion, or a failed
 restore request. Local-only continuation remains available without Server
 authentication; clearing a stale remote pointer does not delete the replica.
 
-An interactive attachment explicitly restored from a Server canonical bundle
-refreshes that bundle through the authenticated resume API before each actual
-model turn, while holding the local execution lease. This adds one resume
-request per turn for those attachments. Its 30-second deadline and the current
-TUI cancellation token bound the wait while the local lease is held. The
-resume and model requests use the same admitted owner bearer, refreshed only
-through that captured owner's existing binding. An environment bearer remains
-an explicit bearer and cannot borrow profile refresh authority. A typed resume
-401 permits one refresh and retry through the captured owner within the same
-deadline; a repeated rejection, 403 or unowned bearer never retries.
-A failed or degraded refresh stops before execution; it cannot fall back to the
-local replica. The returned canonical messages refresh the client continuation
-mirror. Server admission independently restores its conversation and allocates
-its turn; no client message list or predicted Server turn crosses that boundary.
-Server feedback is validated against the accepted session, run, model and
-terminal receipt, never a local counter or a pre-admission prediction.
-The per-turn refresh uses `continuation_only=true` on the same resume endpoint.
-It returns only the owner-scoped canonical bundle and session identity; it does
-not hydrate diagnostic counts, workspace metadata or legacy checkpoints. It
-checks session status under the lifecycle fence and fails if no canonical head
-is available. An already active session is not rewritten or audited by this
-read; a non-active session uses the ordinary audited activation. Conversation
-commits continue to advance the activity used for session ordering. An explicit
-restore retains the full response and activation behavior.
+An interactive attachment restored from a Server canonical bundle sends its
+expected cursor with the model-turn admission request. The Server compares it
+with the head captured under the existing owned Session and Run-opening fence.
+A match adds no resume request or SQL statement. The Server still materializes
+and validates its canonical conversation before executing the Run. The CLI
+uses its leased local journal for its replica, and advances the attachment
+cursor from the accepted Run's committed terminal receipt.
+Explicit restore and stale recovery hydrate the visible transcript. Successful
+turns extend it with their streamed output. The Server remains the source of
+model context, including changes made from other surfaces.
+
+A background wake continues the latest human goal from the admitted Server
+history. The runtime delivers the update through required context, and the
+transport envelope does not become a conversation message.
+
+A typed pre-admission rejection for a stale cursor or an inactive owned Session
+allows one bounded continuation refresh and one retry under the same local
+lease and owner binding. Authentication is captured before acquiring the lease.
+Continuation and attached bearer recovery share a cancellable wait with a
+30-second deadline. A captured owner may refresh its own bearer after a 401. An
+explicit environment bearer has no profile refresh authority. An ambiguous
+send, failed authorization, missing or deleted Session, or invalid continuation
+does not authorize an execution retry. The CLI retains the draft on rejection.
+
+Explicit restore still returns the full resume response. Recovery uses
+`continuation_only=true` to hydrate the canonical bundle without diagnostics,
+workspace metadata or checkpoints. Server feedback is validated against the
+accepted Session, Run, model and terminal receipt. Local journal numbering is
+independent of the Server's canonical cursor.
+
 The local snapshot supplies one turn allocation for the local journal, tool
 mutation/rollback scopes, checkpoints and traces, plus the canonical commit
 base. Journal session-start/end markers describe attachments to the same session
@@ -431,6 +437,12 @@ When a current request supplies an empty `message` and a nonempty `user_intent`,
 the intent is its human prompt. Initial conversation history and the task profile
 use that same effective input. A nonempty `message` remains the prompt text.
 
+Run intent submission and status lookup accept the request-bound Provider
+authentication used by other Run control routes. Provider control requires
+the authenticated Provider and scope to match the immutable Run admission.
+The Session scope is checked separately. An unbound ordinary Session still
+requires a matching Run owner.
+
 Queued run intents use persisted event indices, including gaps, rather than
 positions within a filtered control page. A page with a missing or invalid
 durable index is rejected in full: no intent is delivered and its cursor stays
@@ -441,6 +453,34 @@ After durable acknowledgement, a guidance batch freezes semantic evidence on
 its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
+
+After guidance is applied, the normal model request projects one boundary before
+the active Run's first retained guidance. Its runtime frame identifies the
+boundary by its one-based occurrence among matching user text blocks, including
+literal copies in human inputs and blocks grouped by the provider. The runtime
+counts those occurrences using the selected wire protocol. Responses joins the
+text parts of each message into a single block. The preceding
+human input is the opening when retained. Canonical Run provenance survives
+compaction and recovery, and missing inputs use compacted context.
+
+The boundary and frame are wire-only and count toward the active request budget.
+Append-only requests place the frame after the first retained guidance. The
+first guidance extends the sent prefix, and subsequent guidance in the same
+Run keeps that projection stable. When the Run ends, the next request omits
+both blocks. This can lose exact prefix reuse at the former boundary, while
+retaining the original conversation and avoiding context growth from completed
+Runs.
+
+The model uses the canonical conversation and tool results. It can answer a
+follow-up in an interim update while continuing with tools, and honors the
+user's latest scope, replacement, or stop instruction. Guidance remains a
+human-authored message. The primary model and existing runtime settlement
+checks decide when the Run finishes.
+
+Signed provider guidance requires the Run's Session to have an authenticated
+provider scope proof or fork manifest. The control lookup reads the Session ID
+from the Run row and verifies the existing Session binding. Legacy unbound
+Sessions retain ordinary conversation and existing control behavior.
 
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The

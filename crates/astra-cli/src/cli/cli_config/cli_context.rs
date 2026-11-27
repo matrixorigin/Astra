@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+pub(crate) const NO_TOOLS_POLICY_MARKER: &str = "__astra_internal_no_tools__";
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CliContext {
     /// Caller intent, distinct from the resolved/default model used for UI and budgets.
@@ -15,6 +17,27 @@ pub(crate) struct CliContext {
 }
 
 impl CliContext {
+    /// Return a request context whose effective tool allowlist is empty.
+    ///
+    /// An empty `allowed_tools` vector means "no restriction", so use a
+    /// reserved name that cannot match a public tool. This keeps no-tool
+    /// one-shot entrypoints on the same allowlist path as every other CLI
+    /// request instead of adding a second tool-surface policy.
+    pub(crate) fn without_tools(mut self) -> Self {
+        self.allowed_tools = vec![NO_TOOLS_POLICY_MARKER.to_string()];
+        // Carry the policy through payload assembly too: `invoke_tool` is a
+        // protocol carrier assembled outside the runtime registry.
+        if !self
+            .disallowed_tools
+            .iter()
+            .any(|name| name == NO_TOOLS_POLICY_MARKER)
+        {
+            self.disallowed_tools
+                .push(NO_TOOLS_POLICY_MARKER.to_string());
+        }
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_launch_options(
         no_journal_content: bool,
@@ -136,7 +159,7 @@ fn canonicalize_dirs(values: &[String]) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliContext, canonicalize_dirs};
+    use super::{CliContext, NO_TOOLS_POLICY_MARKER, canonicalize_dirs};
     use std::path::PathBuf;
 
     #[test]
@@ -159,6 +182,18 @@ mod tests {
             context.requested_model_policy,
             Some(RequestedModelPolicy::Inherit)
         );
+    }
+
+    #[test]
+    fn without_tools_overrides_a_caller_allowlist() {
+        let context = CliContext {
+            allowed_tools: vec!["read_file".into(), "bash".into()],
+            ..Default::default()
+        }
+        .without_tools();
+
+        assert_eq!(context.allowed_tools, [NO_TOOLS_POLICY_MARKER]);
+        assert_eq!(context.disallowed_tools, [NO_TOOLS_POLICY_MARKER]);
     }
 
     #[test]

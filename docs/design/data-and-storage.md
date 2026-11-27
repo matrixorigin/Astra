@@ -184,9 +184,9 @@ continuation uses canonical Context and Run checkpoints; CLI continuation uses
 its file CSL. Fresh schemas omit the database CSL table.
 
 When CLI continuation loads its file CSL, it reads the latest complete snapshot
-and replays later records. Corruption in that replay range fails the read, with
-the existing exception for a malformed final JSON line. Explicit history reads
-still inspect the older records superseded by the snapshot.
+and replays later records. Corruption in that replay range, including a torn
+final record, fails the read instead of presenting an older prefix as complete.
+Explicit history reads still inspect the older records superseded by the snapshot.
 
 Bootstrap supports a fresh database or the current schema contract. Canonical
 CREATE declarations define the complete table shape; startup validates it
@@ -561,6 +561,60 @@ Process failure can discard in-flight model output and diagnostics. An absent
 usage observation remains unknown and cannot authorize a side effect or establish
 a billing fact. Standalone accounting uses its existing ledger boundary.
 
+### Run and provider usage queries
+
+CLI+Server and Edge+Server keep device diagnostics such as CLI startup timing
+and workspace execution evidence at the device. Server-owned turns use the same
+Run completion in all three profiles, including Server Only. Hosted trace and
+audit use the existing Run, tool and model evidence.
+
+The terminal receipt stores qualified token usage and the logical model-round
+count in the same commit as the Run outcome. A finished round can report an
+error and may contain multiple physical attempts. For a cohort of completed root
+Runs, bind the authorized user and a half-open UTC settlement interval. For
+Work-specific cohorts, filter on `work_id` or `work_item_id` in the inner
+query. The sample unit remains one Run, including distinct completed retries.
+Deploy one Server version per database. The
+[Helm upgrade and rollback procedure](../../deployment/kubernetes/README.md#upgrade-and-rollback)
+covers changes to the strict receipt format.
+
+```sql
+SELECT COUNT(*) AS runs,
+       COUNT(tokens) AS runs_with_tokens, SUM(tokens) AS tokens,
+       AVG(tokens) AS mean_tokens,
+       COUNT(rounds) AS runs_with_rounds, AVG(rounds) AS mean_rounds
+FROM (
+    SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(
+               terminal_receipt_json, '$.receipt.usage.total_tokens')) AS SIGNED) AS tokens,
+           CAST(JSON_UNQUOTE(JSON_EXTRACT(
+               terminal_receipt_json, '$.receipt.llm_rounds')) AS SIGNED) AS rounds
+    FROM agent_runs
+    WHERE user_id = ? AND parent_run_id IS NULL AND status = 'completed'
+      AND terminal_at >= ? AND terminal_at < ?
+) AS completed_runs;
+```
+
+This cohort attributes usage to Run settlement time and reports the coverage
+denominator alongside each mean. Provider-attempt time windows have a
+different scope. The following query reports the complete reports in the
+standalone/background inference ledger, including failed and cancelled attempts,
+attributed by attempt start time. Partial and unavailable reports contribute
+to the denominator. Ordinary agent-loop calls can lie outside this ledger.
+
+```sql
+SELECT COUNT(*) AS attempts,
+       COUNT(CASE WHEN usage_status = 'provider_exact' THEN 1 END) AS exact_attempts,
+       SUM(CASE WHEN usage_status = 'provider_exact'
+                THEN input_tokens + cache_read_tokens
+                     + cache_creation_tokens + output_tokens END) AS tokens
+FROM inference_provider_attempts
+WHERE user_id = ? AND started_at >= ? AND started_at < ?;
+```
+
+Query these sources independently. The same invocation can contribute to
+multiple evidence surfaces. For TaaS operations, use its committed
+[`token_usage_operational_facts`](model-access-and-inference.md) projection.
+These queries run on demand outside the conversation hot path.
 
 Schema contract `2026-10-24-v107` retires `run_display_projections`. Fresh schema
 creation and Session deletion do not reference it. Bootstrap never drops an
@@ -758,6 +812,15 @@ Unknown effects remain hot. Archive key ranges are candidate indexes: a late
 settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
+
+Fresh schema contract `2026-11-27-v127` keeps a fork's prepare reason and
+terminal status in its owner-scoped `session_forks` manifest. Creation and
+terminal transition times remain on that row. Forks have at most one terminal
+transition, so the separate full-manifest transition copies and their writes
+are retired. This retains the fork facts needed for recovery and inspection,
+but not an independent historical copy for diagnosing later row corruption.
+The previous schema is rejected without rewriting it; deploy against a fresh
+schema.
 
 Fresh schema contract `2026-11-20-v126` records the validated Run owner, tool
 name and exact request digest in the Edge dispatch row. A new admission

@@ -66,17 +66,9 @@ pub(crate) fn cursor_is_exact_for_attached_account(
 fn select_single_resume_descriptor(
     canonical_head: Option<&astra_turn_types::SessionCursorV1>,
     descriptor: astra_turn_types::ResumeDescriptorV1,
-    messages: &[Value],
 ) -> Option<astra_turn_types::ResumeDescriptorV1> {
-    if astra_turn_types::canonical_conversation_root(messages)
-        != descriptor.cursor.canonical_root_hash
-    {
-        tracing::warn!(
-            source = ?descriptor.source,
-            "resume candidate payload does not materialize its declared canonical root"
-        );
-        return None;
-    }
+    // Callers construct an ActiveConversation before selecting a descriptor.
+    // Its constructors and replay have already verified the materialized root.
     astra_turn_types::select_resume_candidate_index(
         canonical_head,
         std::slice::from_ref(&descriptor),
@@ -92,6 +84,14 @@ fn select_single_resume_descriptor(
 pub(crate) fn continuation_from_resume_bundle(
     bundle: astra_turn_types::ResumeBundleV1,
 ) -> Option<SessionContinuation> {
+    let materialized_root_hash = bundle.validated_materialized_root_hash()?;
+    continuation_from_validated_resume_bundle(bundle, &materialized_root_hash)
+}
+
+pub(crate) fn continuation_from_validated_resume_bundle(
+    bundle: astra_turn_types::ResumeBundleV1,
+    materialized_root_hash: &str,
+) -> Option<SessionContinuation> {
     if bundle.schema_version != astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION {
         tracing::warn!(
             schema_version = bundle.schema_version,
@@ -104,10 +104,6 @@ pub(crate) fn continuation_from_resume_bundle(
             cursor_owner = %bundle.cursor.owner_id,
             "resume bundle does not belong to the active account"
         );
-        return None;
-    }
-    if !bundle.validates_root() {
-        tracing::warn!("resume bundle payload does not materialize its declared canonical root");
         return None;
     }
     let astra_turn_types::ResumeBundleV1 {
@@ -149,8 +145,7 @@ pub(crate) fn continuation_from_resume_bundle(
     {
         projection_cursor.projection_schema =
             astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION;
-        projection_cursor.canonical_root_hash =
-            astra_turn_types::canonical_conversation_root(&messages);
+        projection_cursor.canonical_root_hash = materialized_root_hash.to_string();
     }
     let active_conversation =
         astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
@@ -231,26 +226,59 @@ pub(crate) fn local_journal_privacy_allows_resume(session_id: &str) -> Result<bo
 pub(crate) fn load_session_continuation_for_recovery(
     session_id: &str,
 ) -> Option<SessionContinuation> {
+    match try_load_session_continuation_for_recovery(session_id) {
+        Ok(continuation) => continuation,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "local continuation is unavailable");
+            None
+        }
+    }
+}
+
+pub(crate) fn try_load_session_continuation_for_recovery(
+    session_id: &str,
+) -> Result<Option<SessionContinuation>, String> {
     // Privacy omission is terminal for every local recovery source, including
     // old CSL/checkpoint projections. It must not fall back to stale content.
-    let canonical = match astra_services::session_journal::read_complete_journal_append_order(
-        session_id,
-    ) {
-        Ok(events) => {
-            if !journal_privacy_allows_resume(session_id, &events).unwrap_or(false) {
-                return None;
-            }
-            if astra_services::session_journal::journal_file_path(session_id).is_file() {
-                active_conversation_from_append_order_events(session_id, &events)
-            } else {
-                Ok(None)
-            }
+    let privacy_error =
+        |error| format!("cannot verify local continuation privacy boundary: {error}");
+    let canonical = {
+        let events =
+            astra_services::session_journal::read_complete_journal_append_order(session_id)
+                .map_err(|error| privacy_error(error.to_string()))?;
+        if !journal_privacy_allows_resume(session_id, &events).map_err(privacy_error)? {
+            return Err("local continuation was omitted by privacy policy; select a new session or an explicitly authorized Server canonical resume".into());
         }
-        Err(error) => {
-            tracing::warn!(%session_id, %error, "cannot verify local continuation privacy boundary");
-            return None;
+        if astra_services::session_journal::journal_file_path(session_id).is_file() {
+            active_conversation_from_append_order_events(session_id, &events)
+        } else {
+            Ok(None)
         }
     };
+    // Release the parsed journal before materializing its message vector and
+    // loading the independent CSL/checkpoint recovery projections.
+    if let Err(error) = &canonical {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "failed to replay canonical journal conversation; using a recovery source"
+        );
+    }
+    if !matches!(&canonical, Ok(Some(_))) {
+        let csl = load_csl_continuation(session_id).map_err(|error| {
+            format!("cannot restore session {session_id}: local conversation history is unreadable: {error}")
+        })?;
+        if csl.is_some() {
+            return Ok(csl);
+        }
+    }
+    Ok(restore_local_continuation(session_id, canonical))
+}
+
+fn restore_local_continuation(
+    session_id: &str,
+    canonical: Result<Option<astra_turn_core::active_conversation::ActiveConversation>, String>,
+) -> Option<SessionContinuation> {
     match canonical {
         Ok(Some(active_conversation)) => {
             let messages = active_conversation.materialize();
@@ -300,7 +328,6 @@ pub(crate) fn load_session_continuation_for_recovery(
                     Vec::new(),
                     Vec::new(),
                 ),
-                &messages,
             )?;
             return Some(SessionContinuation {
                 completed_turn_count: Some(active_conversation.cursor().completed_turn),
@@ -310,26 +337,7 @@ pub(crate) fn load_session_continuation_for_recovery(
                 resume,
             });
         }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to replay canonical journal conversation; using an explicitly degraded recovery source"
-            );
-        }
-    }
-
-    match load_csl_continuation(session_id) {
-        Ok(Some(continuation)) => return Some(continuation),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to read CSL continuation projection; falling back to durable journal"
-            );
-        }
+        Ok(None) | Err(_) => {}
     }
 
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
@@ -389,7 +397,6 @@ pub(crate) fn load_session_continuation_for_recovery(
                             astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
                         ],
                     ),
-                    &messages,
                 )?;
                 Some(SessionContinuation {
                     completed_turn_count: Some(cursor.completed_turn),
@@ -557,11 +564,13 @@ pub(crate) fn load_csl_continuation(
     let Some(materialized) = materialized else {
         return Ok(None);
     };
-    let cursor = materialized
-        .session_state
-        .source_cursor
-        .as_ref()
-        .ok_or_else(|| format!("CSL continuation has no versioned cursor: {session_id}"))?;
+    let Some(cursor) = materialized.session_state.source_cursor.as_ref() else {
+        tracing::warn!(
+            session_id,
+            "ignoring CSL continuation without a versioned cursor"
+        );
+        return Ok(None);
+    };
     validate_flat_projection_cursor(session_id, cursor)?;
     let cursor = cursor.clone();
     record_session_restore_hydration(&materialized.messages);
@@ -588,7 +597,6 @@ pub(crate) fn load_csl_continuation(
             Vec::new(),
             Vec::new(),
         ),
-        &messages,
     )
     .ok_or_else(|| format!("failed to select CSL continuation for session {session_id}"))?;
     Ok((!messages.is_empty()).then_some(SessionContinuation {
@@ -797,18 +805,22 @@ mod tests {
             compaction_generation: 0,
             config_version_id: None,
         };
+        let bundle = astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor: cursor.clone(),
+            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+            conversation_messages: messages,
+            materialized_conversation_root_hash: Some(materialized_root.clone()),
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        };
+        let materialized_root_hash = bundle
+            .validated_materialized_root_hash()
+            .expect("test bundle materializes its declared root");
         let continuation =
-            super::continuation_from_resume_bundle(astra_turn_types::ResumeBundleV1 {
-                schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
-                cursor: cursor.clone(),
-                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
-                conversation_messages: messages,
-                materialized_conversation_root_hash: Some(materialized_root.clone()),
-                degraded_reasons: Vec::new(),
-                repair_actions: Vec::new(),
-                projections: Default::default(),
-            })
-            .expect("segmented canonical resume must create a local continuation");
+            super::continuation_from_validated_resume_bundle(bundle, &materialized_root_hash)
+                .expect("segmented canonical resume must create a local continuation");
 
         assert_eq!(continuation.resume.cursor, cursor);
         assert_eq!(
@@ -1323,21 +1335,22 @@ mod tests {
     fn csl_continuation_reports_corrupt_typed_metadata() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": "canonical current",
+                (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                    "schema_version": "invalid",
+                    "objective_relation": "replace"
+                }
+            }),
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             1,
-            &[
-                json!({
-                    "role": "user",
-                    "content": "canonical current",
-                    (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
-                        "schema_version": "invalid",
-                        "objective_relation": "replace"
-                    }
-                }),
-                json!({"role": "assistant", "content": "current answer"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            &messages,
+            &exact_csl_state(&session_id, 1, &messages),
         )
         .unwrap();
 

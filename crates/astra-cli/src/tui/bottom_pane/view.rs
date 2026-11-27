@@ -274,6 +274,10 @@ pub(crate) trait BottomPaneView: Send {
     fn render(&self, area: Rect, buf: &mut Buffer);
     fn desired_height(&self, width: u16) -> u16;
     fn handle_key(&mut self, key: KeyEvent);
+
+    fn handle_key_at(&mut self, key: KeyEvent, _now: std::time::Instant) {
+        self.handle_key(key);
+    }
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
 
     fn visible_in_attachment(&self, _session_id: Option<&str>, _epoch: u64) -> bool {
@@ -357,6 +361,13 @@ pub(crate) trait BottomPaneView: Send {
 
     fn is_in_paste_burst(&self) -> bool {
         false
+    }
+
+    fn pending_paste_tail_at(
+        &mut self,
+        _now: std::time::Instant,
+    ) -> Option<super::paste_burst::PasteTail> {
+        None
     }
 
     /// Route bracketed paste to the focused view. Returning `true` means the

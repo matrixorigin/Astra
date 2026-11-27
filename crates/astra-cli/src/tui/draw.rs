@@ -752,7 +752,7 @@ pub(crate) fn do_draw(
     if let Some((board, expanded)) = task_board {
         sync_task_footer(&mut bottom_pane.footer, board, expanded);
     }
-    bottom_pane.pre_draw_tick(std::time::Instant::now());
+    bottom_pane.pre_draw_session_tick(std::time::Instant::now(), chat_widget.history());
 
     let terminal_size = guard.terminal.size().unwrap_or(ratatui::layout::Size {
         width: 80,
@@ -825,7 +825,38 @@ fn compact_view<'a>(
         task_board_compact,
         ..
     } = viewport;
-    let available = height.saturating_sub(bottom_pane.desired_height(width));
+    // The composer frame is optional chrome. Reserve the rows needed by live
+    // content before allowing it to consume an extra row on a short terminal.
+    let required_rows = u16::from(status.is_some() && !bottom_pane.has_active_view())
+        .saturating_add(u16::from(!matches!(active, ActiveView::Empty)))
+        .saturating_add(
+            task_board
+                .as_ref()
+                .map(Vec::len)
+                .or_else(|| task_board_compact.as_ref().map(Vec::len))
+                .unwrap_or(0) as u16,
+        )
+        .saturating_add(u16::from(multi_agent.is_some()))
+        .saturating_add(explain_analyze.as_ref().map(Vec::len).unwrap_or(0) as u16);
+    let history_rows = bottom_pane.history_suggestions_height();
+    bottom_pane.set_composer_frame_allowed(true);
+    let framed_bottom_h = bottom_pane
+        .desired_height(width)
+        .saturating_sub(history_rows);
+    // Keep part of the candidate list ahead of optional frame chrome.
+    let minimum_history_rows = history_rows.saturating_sub(1).min(2);
+    bottom_pane.set_composer_frame_allowed(
+        height
+            >= framed_bottom_h
+                .saturating_add(required_rows)
+                .saturating_add(minimum_history_rows),
+    );
+
+    let desired = bottom_pane.desired_height(width);
+    let bottom_h = height
+        .saturating_sub(required_rows)
+        .clamp(desired.saturating_sub(history_rows), desired);
+    let available = height.saturating_sub(bottom_h);
     let status = status
         .filter(|_| available > 0 && !bottom_pane.has_active_view())
         .and_then(|indicator| {
@@ -922,7 +953,10 @@ fn compact_view<'a>(
     }
     flex.push(
         0,
-        RenderableItem::Owned(Box::new(BottomPaneRenderable(bottom_pane))),
+        RenderableItem::Owned(Box::new(BottomPaneRenderable {
+            pane: bottom_pane,
+            height: bottom_h,
+        })),
     );
     flex
 }
@@ -964,17 +998,20 @@ fn fit_live_lines(
     lines
 }
 
-struct BottomPaneRenderable<'a>(&'a mut BottomPane);
+struct BottomPaneRenderable<'a> {
+    pane: &'a BottomPane,
+    height: u16,
+}
 
 impl<'a> Renderable for BottomPaneRenderable<'a> {
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        self.0.render(area, buf);
+        self.pane.render(area, buf);
     }
-    fn desired_height(&self, width: u16) -> u16 {
-        self.0.desired_height(width)
+    fn desired_height(&self, _width: u16) -> u16 {
+        self.height
     }
     fn cursor_pos(&self, area: ratatui::layout::Rect) -> Option<(u16, u16)> {
-        self.0.cursor_position(area)
+        self.pane.cursor_position(area)
     }
 }
 
@@ -1171,6 +1208,90 @@ mod compact_surface_tests {
             }
             let cursor = flex.cursor_pos(area).expect("composer remains usable");
             assert!(cursor.0 < area.right() && cursor.1 < area.bottom());
+        }
+    }
+
+    #[test]
+    fn history_suggestions_fit_below_input_without_hiding_live_output() {
+        use crate::tui::history_cell::{HistoryCell, user::UserCell};
+        use std::sync::Arc;
+
+        let history: Vec<Arc<dyn HistoryCell>> = vec![
+            Arc::new(UserCell::new("ship staging")),
+            Arc::new(UserCell::new("ship production")),
+        ];
+        for height in [6, 8] {
+            let area = Rect::new(0, 0, 40, height);
+            let mut pane = BottomPane::new();
+            pane.handle_session_paste("shi", &history);
+            let flex = compact_view(frame(area.width), &mut pane, area.width, area.height);
+            let mut buffer = Buffer::empty(area);
+            flex.render(area, &mut buffer);
+            let text = buffer_to_string(&buffer);
+            assert!(
+                text.contains("Working") && text.contains("latest reply"),
+                "{text}"
+            );
+            let (x, y) = flex.cursor_pos(area).expect("input cursor");
+            assert_eq!(buffer[(x - 1, y)].symbol(), "i");
+            if height == 8 {
+                assert!(
+                    text.contains("ship staging") && text.contains("> ship production"),
+                    "{text}"
+                );
+            } else {
+                assert!(text.contains("ship production"), "{text}");
+                assert!(!text.contains("ship staging"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn history_tab_only_accepts_a_match_visible_in_the_last_frame() {
+        use crate::tui::history_cell::{HistoryCell, user::UserCell};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::sync::Arc;
+
+        let draw = |pane: &mut BottomPane, height| {
+            let area = Rect::new(0, 0, 40, height);
+            let mut buffer = Buffer::empty(area);
+            compact_view(frame(area.width), pane, area.width, area.height)
+                .render(area, &mut buffer);
+            buffer_to_string(&buffer)
+        };
+        for (query, candidate) in [
+            (
+                "deploy production canary before frame",
+                "deploy production canary _before frame",
+            ),
+            (
+                "deploy production canary before fr",
+                "deploy production canary _before fr",
+            ),
+        ] {
+            let history: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(UserCell::new(candidate))];
+            let mut pane = BottomPane::new();
+            pane.handle_session_paste(query, &history);
+            let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+            pane.handle_session_key_at(tab, Instant::now(), &history);
+            assert_eq!(pane.composer.text(), query);
+
+            assert!(draw(&mut pane, 8).contains(candidate));
+            let short = draw(&mut pane, 6);
+            assert!(
+                short.contains(query) && short.contains("Working"),
+                "{short}"
+            );
+            assert!(
+                !short.contains("_before") && !short.contains(" → …"),
+                "{short}"
+            );
+            pane.handle_session_key_at(tab, Instant::now(), &history);
+            assert_eq!(pane.composer.text(), query);
+
+            assert!(draw(&mut pane, 8).contains(candidate));
+            pane.handle_session_key_at(tab, Instant::now(), &history);
+            assert_eq!(pane.composer.text(), candidate);
         }
     }
 
@@ -2538,7 +2659,10 @@ mod multi_agent_strip_tests {
             live_buffer[(0, 0)].symbol(),
             crate::tui::glyphs::current().live_gutter.to_string()
         );
-        assert_eq!(frozen_buffer[(0, 0)].symbol(), "●");
+        assert_eq!(
+            frozen_buffer[(0, 0)].symbol(),
+            crate::tui::glyphs::current().agent_completed
+        );
         assert_eq!(title_column(&live_buffer), title_column(&frozen_buffer));
     }
 

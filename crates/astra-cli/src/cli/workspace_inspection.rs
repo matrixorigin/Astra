@@ -389,6 +389,7 @@ pub(crate) async fn handle_review_command(
     let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
     let turn_start = std::time::Instant::now();
     let sr = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api,
         token: tok,
         auth_owner,

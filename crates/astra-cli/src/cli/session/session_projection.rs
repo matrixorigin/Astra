@@ -997,7 +997,6 @@ mod tests {
             .unwrap();
         let seq_after_t1 = mgr.last_seq();
 
-        mgr.mark_turn_start(t1_msgs.len());
         let t2_full = vec![
             serde_json::json!({"role": "user", "content": "q1"}),
             serde_json::json!({"role": "assistant", "content": "a1"}),
@@ -1048,7 +1047,6 @@ mod tests {
             let full: Vec<serde_json::Value> = (1..=t)
                 .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
                 .collect();
-            mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
             mgr.persist_turn(t, &full, &SessionStateCompact::default())
                 .await
                 .unwrap();
@@ -1101,7 +1099,6 @@ mod tests {
                     ]
                 })
                 .collect();
-            mgr.mark_turn_start(if t == 1 { 0 } else { ((t - 1) * 2) as usize });
             mgr.persist_turn(t, &full, &session_state).await.unwrap();
         }
 
@@ -1140,7 +1137,6 @@ mod tests {
             let full: Vec<serde_json::Value> = (1..=t)
                 .map(|i| serde_json::json!({"role": "user", "content": format!("q{i}")}))
                 .collect();
-            mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
             mgr.persist_turn(t, &full, &SessionStateCompact::default())
                 .await
                 .unwrap();

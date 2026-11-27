@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug)]
 pub(crate) enum TuiEvent {
-    Key(KeyEvent),
+    Key(KeyEvent, Instant),
     Paste(String),
     Resize {
         cursor: Option<(u16, u16)>,
@@ -94,7 +94,7 @@ impl TuiEventStream {
             let Some(stream) = self.crossterm_stream.as_mut() else {
                 return Poll::Ready(None);
             };
-            let event = Pin::new(stream).poll_next(cx);
+            let event = stream.poll_next_timed(cx);
             #[cfg(unix)]
             if let Some(params) = crossterm::event::cached_primary_device_attributes() {
                 astra_tools::display_sixel::set_sixel_supported(
@@ -102,18 +102,16 @@ impl TuiEventStream {
                 );
             }
             match event {
-                Poll::Ready(Some(Ok(event))) => {
+                Poll::Ready(Some(Ok((event, received_at)))) => {
                     if let Event::Resize(width, height) = event {
                         let size = crossterm::terminal::size().unwrap_or((width, height));
                         return self.start_resize_query(size);
                     }
-                    if let Some(mapped) = map_crossterm_event(event) {
+                    if let Some(mapped) = map_crossterm_event(event, received_at) {
                         return Poll::Ready(Some(mapped));
                     }
                 }
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    return Poll::Ready(None);
-                }
+                Poll::Ready(_) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -163,14 +161,19 @@ impl TuiEventStream {
     }
 }
 
-fn map_crossterm_event(event: Event) -> Option<TuiEvent> {
+pub(super) fn is_text_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(c)
+        if !c.is_control() && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+}
+
+fn map_crossterm_event(event: Event, received_at: Instant) -> Option<TuiEvent> {
     match event {
         // Only forward Press events. Some terminals (kitty keyboard protocol,
         // Windows console, certain multiplexers) emit Repeat/Release for the
         // same physical keypress, which would otherwise cause a single ↑ to
         // trigger HistoryPrev multiple times.
         Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-            Some(TuiEvent::Key(normalize_key_event(key_event)))
+            Some(TuiEvent::Key(normalize_key_event(key_event), received_at))
         }
         Event::Key(_) => None,
         Event::Resize(width, height) => Some(TuiEvent::Resize {
@@ -246,14 +249,14 @@ impl Stream for TuiEventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiEvent, map_crossterm_event};
+    use super::{Instant, TuiEvent, map_crossterm_event};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn raw_ctrl_c_char_is_normalized_to_ctrl_c_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE));
 
-        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+        let Some(TuiEvent::Key(mapped, _)) = map_crossterm_event(event, Instant::now()) else {
             panic!("expected mapped key event");
         };
 
@@ -265,7 +268,7 @@ mod tests {
     fn raw_ctrl_o_char_is_normalized_to_ctrl_o_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{f}'), KeyModifiers::NONE));
 
-        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+        let Some(TuiEvent::Key(mapped, _)) = map_crossterm_event(event, Instant::now()) else {
             panic!("expected mapped key event");
         };
 
@@ -277,7 +280,7 @@ mod tests {
     fn raw_escape_char_is_normalized_to_escape_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{1b}'), KeyModifiers::NONE));
 
-        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+        let Some(TuiEvent::Key(mapped, _)) = map_crossterm_event(event, Instant::now()) else {
             panic!("expected mapped key event");
         };
 

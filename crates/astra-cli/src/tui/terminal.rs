@@ -23,7 +23,7 @@ use std::io::Write;
 use super::custom_terminal;
 use super::frame_requester::FrameRequester;
 use super::history_cell::{HistoryCell, assistant::AssistantCell};
-use super::render::line_utils::{history_cell_lines_for_terminal, sanitize_lines_for_terminal};
+use super::render::line_utils::{history_cell_rows_for_terminal, sanitize_lines_for_terminal};
 
 pub(crate) type CustomTerminal = custom_terminal::Terminal<CrosstermBackend<Stdout>>;
 
@@ -268,11 +268,14 @@ impl TerminalGuard {
             let trusted_links = cell
                 .as_any_ref()
                 .is::<super::history_cell::system::SystemCell>();
-            let mut lines = history_cell_lines_for_terminal(cell.as_ref(), width);
-            lines.extend(std::iter::repeat_n(Line::default(), separators));
+            let mut lines = history_cell_rows_for_terminal(cell.as_ref(), width);
+            lines.extend(std::iter::repeat_n(
+                MarkdownRow::from(Line::default()),
+                separators,
+            ));
             if !lines.is_empty() {
                 self.pending_history.push_back(PendingHistory::Lines {
-                    lines: lines.into_iter().map(MarkdownRow::from).collect(),
+                    lines: lines.into(),
                     trusted_links,
                 });
             }
@@ -989,6 +992,50 @@ mod tests {
                     assert_eq!(parser.screen().cursor_position(), (0, 0));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn user_scrollback_preserves_long_links_and_source_line_breaks() {
+        let url = "https://example.com/this-is-a-long-path-that-crosses-the-terminal-edge";
+        let user = crate::tui::history_cell::user::UserCell::new(format!("{url}\nsecond line"));
+        let rows = crate::tui::render::line_utils::history_cell_rows_for_terminal(&user, 40);
+        for zellij in [false, true] {
+            let mut terminal = recording_terminal(40, 12);
+            crate::tui::insert_history::insert_history_lines_with_terminal(
+                &mut terminal,
+                &rows,
+                false,
+                zellij,
+            )
+            .unwrap();
+            let raw = String::from_utf8(terminal.backend().bytes.clone()).unwrap();
+            let plain = crate::cli::terminal_region::strip_ansi_codes(&raw);
+            assert!(plain.contains(url), "URL was broken: {plain:?}");
+            assert!(
+                plain.contains("\r\n  second line"),
+                "source newline was lost: {plain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_scrollback_counts_a_tab_at_the_wrap_boundary() {
+        let user = crate::tui::history_cell::user::UserCell::new("0123456789\tX");
+        let rows = crate::tui::render::line_utils::history_cell_rows_for_terminal(&user, 12);
+        for zellij in [false, true] {
+            let mut terminal = recording_terminal(12, 12);
+            crate::tui::insert_history::insert_history_lines_with_terminal(
+                &mut terminal,
+                &rows,
+                false,
+                zellij,
+            )
+            .unwrap();
+            assert_eq!(terminal.visible_history_rows(), 4);
+            let mut parser = vt100::Parser::new(40, 12, 0);
+            parser.process(&terminal.backend().bytes);
+            assert!(parser.screen().contents().contains('X'));
         }
     }
 

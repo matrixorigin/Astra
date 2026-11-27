@@ -102,6 +102,9 @@ pub struct CanonicalRunTerminalReceipt {
     pub transcript: CanonicalTerminalTranscript,
     /// None means unavailable evidence. Never manufacture measured zeros.
     pub usage: Option<CanonicalTokenUsage>,
+    /// Logical model rounds finished by the execution owner, including errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request_context: Option<TerminalRequestContext>,
     pub tool_ledger: Option<ToolLedgerReceipt>,
@@ -208,7 +211,12 @@ impl CanonicalRunTerminalReceipt {
             }
             match &self.context {
                 CanonicalTerminalContext::Revoked => data["context_not_saved"] = true.into(),
-                CanonicalTerminalContext::Advanced { .. } | CanonicalTerminalContext::Unchanged => {
+                CanonicalTerminalContext::Advanced { cursor, .. } => {
+                    data["context_not_saved"] = false.into();
+                    data["canonical_context_cursor"] =
+                        serde_json::to_value(cursor).map_err(|error| error.to_string())?;
+                }
+                CanonicalTerminalContext::Unchanged => {
                     data["context_not_saved"] = false.into();
                 }
                 CanonicalTerminalContext::Unowned => {}
@@ -225,6 +233,9 @@ impl CanonicalRunTerminalReceipt {
                 ] {
                     data[key] = serde_json::to_value(value).map_err(|error| error.to_string())?;
                 }
+            }
+            if let Some(rounds) = self.llm_rounds {
+                data["llm_rounds"] = rounds.into();
             }
             if let Some(ledger) = &self.tool_ledger {
                 data["tool_call_count"] = ledger.attempted.into();
@@ -1288,6 +1299,7 @@ mod tests {
                     assistant_source_event_id: None,
                 },
                 usage: None,
+                llm_rounds: None,
                 last_request_context: None,
                 tool_ledger: None,
             },

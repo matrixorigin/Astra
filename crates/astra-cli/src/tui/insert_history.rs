@@ -182,8 +182,11 @@ fn soft_wrapped_rows(line: &Line<'_>, width: usize) -> usize {
         for grapheme in visible.graphemes(true) {
             if grapheme == "\t" {
                 // Default terminal tab stops advance without wrapping and
-                // clamp to the last column. No application changes tab stops.
-                column = ((column / 8 + 1) * 8).min(width - 1);
+                // clamp to the last column. A tab at a pending-wrap boundary
+                // leaves that boundary armed for the next printable glyph.
+                if column < width {
+                    column = ((column / 8 + 1) * 8).min(width - 1);
+                }
                 continue;
             }
             let cells = grapheme.width().min(width);

@@ -80,6 +80,7 @@ use astra_services::runs::{
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_services::{AdmittedModelExecution, SessionArtifactStore};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudgeError};
+use astra_tools::execution_outcome::execution_error_kind;
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
@@ -5372,17 +5373,23 @@ impl ToolRouteObserver for ExplainAnalyzeToolRouteObserver {
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        span.terminal_event = context.event(
+        let outcome = if result.is_error {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+        } else {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+        };
+        let detail = execution_error_kind(result.metadata.as_ref()).and_then(|kind| {
+            astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(kind, outcome)
+        });
+        span.terminal_event = context.event_with_context(
             &span.node,
             astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
             finished_at,
             Some(duration_ms),
-            Some(if result.is_error {
-                astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
-            } else {
-                astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
-            }),
+            Some(outcome),
             None,
+            None,
+            detail,
         );
         // If the start was lost to bounded delivery, retain both facts for
         // host reconciliation so consumers never observe finish-before-start.
@@ -5493,13 +5500,22 @@ impl crate::turn::llm::client::ProviderAttemptObserver
                         .as_millis(),
                 )
                 .unwrap_or(u64::MAX);
-                span.terminal_event = context.event(
+                let detail = terminal
+                    .error_kind
+                    .as_deref()
+                    .and_then(astra_core::ErrorKind::parse_tag)
+                    .and_then(|kind| {
+                        astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(kind, outcome)
+                    });
+                span.terminal_event = context.event_with_context(
                     &span.node,
                     astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
                     finished_at,
                     Some(duration_ms),
                     Some(outcome),
                     explain_analyze_token_usage(terminal, span.usage_presence),
+                    None,
+                    detail,
                 );
                 // If the start was lost to backpressure, the terminal event
                 // still reconstructs the interval. Publish the pair together
@@ -13057,12 +13073,22 @@ impl ServerAgenticLoopHost {
     }
 
     fn finish_explain_analyze_tool_call(&mut self, event: &Value) {
-        if event.get("type").and_then(Value::as_str) != Some("tool_call_end") {
+        if self.explain_analyze_context.is_none()
+            || event.get("type").and_then(Value::as_str) != Some("tool_call_end")
+        {
             return;
         }
-        let Some(call_id) = explain_analyze_call_id(event).map(str::to_string) else {
+        let Some(call_id) = explain_analyze_call_id(event) else {
             return;
         };
+        let admission_node = self.explain_analyze_admission_nodes.remove(call_id);
+        let tool_node = self.explain_analyze_tool_nodes.remove(call_id);
+        let decision_detail = self
+            .explain_analyze_admission_decision_details
+            .remove(call_id);
+        if admission_node.is_none() && tool_node.is_none() {
+            return;
+        }
         let status = event
             .get("status")
             .and_then(Value::as_str)
@@ -13090,22 +13116,27 @@ impl ServerAgenticLoopHost {
             },
         };
         let finished_at = Instant::now();
-        let decision_detail = self
-            .explain_analyze_admission_decision_details
-            .remove(&call_id);
-        if let Some(node_id) = self.explain_analyze_admission_nodes.remove(&call_id) {
+        let failure = execution_error_kind(event.as_object()).and_then(|kind| {
+            astra_turn_types::ExplainAnalyzeDecisionDetailV1::failure(kind, outcome)
+        });
+        if let Some(node_id) = admission_node {
             if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
-                parents.remove(&call_id);
+                parents.remove(call_id);
             }
             self.finish_explain_analyze_timed_node_with_decision_detail(
                 &node_id,
                 outcome,
                 finished_at,
-                decision_detail,
+                decision_detail.or_else(|| failure.clone()),
             );
         }
-        if let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) {
-            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        if let Some(node_id) = tool_node {
+            self.finish_explain_analyze_timed_node_with_decision_detail(
+                &node_id,
+                outcome,
+                finished_at,
+                failure,
+            );
         }
     }
 
@@ -18333,6 +18364,9 @@ impl ServerAgenticLoopHost {
     > {
         let drained = crate::turn::llm::context::lease_wire_runtime_context(state)?;
         let thinking = state.thinking.clone();
+        let protocol = llm_cfg
+            .inference_protocol
+            .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider));
         let mut history = compacted_messages;
         let mut assembly = None;
         let mut selected_output_tokens = requested_output_tokens;
@@ -18362,6 +18396,7 @@ impl ServerAgenticLoopHost {
                     cache_cfg,
                 },
                 &drained,
+                protocol,
             )
             .inspect_err(|_| {
                 state.restore_volatile_attempt_lease();
@@ -18373,9 +18408,7 @@ impl ServerAgenticLoopHost {
                 budget_source.as_deref().unwrap_or(&candidate.messages),
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
-                llm_cfg.inference_protocol.unwrap_or_else(|| {
-                    astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider)
-                }),
+                protocol,
             );
             let candidate_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
                 &wire_messages,
@@ -39349,6 +39382,80 @@ mod tests {
                 && event["transition"] == "finished"
                 && event["outcome"] == "completed"
         }));
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_normalizes_dispatched_and_blocked_tool_failures() {
+        let mut host = test_host_builder("u-explain-errors", "s-explain-errors").build();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "u-explain-errors".into(),
+            "s-explain-errors".into(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::cloud_workspace("/checkout/repo", WorkspaceAuthority::ReadOnly),
+            ExecutorBinding::orchestrator_managed(
+                "orchestrator:workspace-1",
+                "Orchestrator-managed executor",
+                ExecutorStatus::Online,
+            ),
+        );
+        let executor = Arc::new(executor);
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-explain-errors".into());
+        state.runtime_tool_executor = Some(executor.clone());
+        host.on_turn_started(&state);
+        host.emit_admitted_tool_call_events(
+            0,
+            &[
+                json!({"id": "blocked", "function": {"name": "bash"}}),
+                json!({"id": "unavailable", "function": {"name": "bash"}}),
+            ],
+        );
+        host.try_emit_progress_event(json!({
+            "type": "tool_call_end", "call_id": "blocked", "status": "blocked",
+            "error_kind": "approval_denied",
+        }))
+        .unwrap();
+        let result = executor
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command": "printf should-not-run",
+                    "_tool_call_id": "unavailable", "_run_id": "run-explain-errors",
+                }),
+            )
+            .await;
+        assert!(result.is_error);
+        assert_eq!(
+            result.metadata.unwrap()["error_kind"],
+            "transport_unavailable"
+        );
+
+        host.on_turn_terminal(&mut state, &Ok(AgenticLoopOutcome::Completed))
+            .await;
+        let events = host.take_emitted_events();
+        for (kind, outcome, error_kind) in [
+            ("admission", "blocked", "policy_denied"),
+            ("tool_call", "failed", "tool_unavailable"),
+        ] {
+            let terminal = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["kind"] == kind
+                        && event["transition"] == "finished"
+                        && event["outcome"] == outcome
+                })
+                .expect("tool terminal Explain evidence");
+            assert_eq!(
+                terminal["decision_detail"],
+                json!({"kind": "failure", "error_kind": error_kind})
+            );
+        }
     }
 
     #[tokio::test]

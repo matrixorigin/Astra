@@ -362,7 +362,8 @@ with terminal status; a client querying an incomplete run may receive
 `POST /sessions/{session_id}/forks` accepts
 `{idempotency_key, expected_parent_cursor, reason}` and returns the prepared
 `SessionForkManifestV1`. The key identifies the immutable request; changing the
-request under the same key conflicts.
+request under the same key conflicts. `prepare_reason` retains the original
+reason; `status_detail` describes a subsequent abort when present.
 
 `POST /sessions/{session_id}/forks/{fork_id}/activate-for-continuation` accepts
 `{}` and returns `{manifest, child_head}`. It activates the shared conversation
@@ -579,6 +580,20 @@ use `/live` and `/ready` for orchestrator probes.
 | 500 | Server error |
 
 ### Server chat execution authority
+
+An explicitly restored CLI attachment can send `attached_session_cursor`
+with its `session_id`. Both chat endpoints validate the attachment identity
+before allocating a Session. During Run admission the Server checks the cursor
+against the owned canonical head. A stale cursor on `POST /chat/stream` emits
+`session_continuation_stale` with `metadata.admission_state: rejected` and the
+current cursor. A cancelled, paused, ended, or closed attached Session emits
+`session_resume_required` with `metadata.admission_state: rejected`. The client can
+resume the Session and retry once. A committed Context advance exposes
+`canonical_context_cursor` on the Run's `run_finished` event, including replay.
+If an admitted Run cannot load its attached Context, its terminal replay retains
+`session_context_needs_repair` and the Run identity.
+For Provider `context.task_ref` retries, the expected cursor is part of the
+request identity. Changing it returns `provider_task_ref_request_mismatch`.
 
 `POST /chat` and `POST /chat/stream` own their Server execution. The request
 field `conversation_authority` is unsupported and rejected as

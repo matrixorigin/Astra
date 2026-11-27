@@ -31,6 +31,7 @@ pub(crate) type BackgroundTaskStatus = WorkUnitStatus;
 
 pub(crate) trait BackgroundTaskStatusExt {
     fn label(self) -> &'static str;
+    fn presentation(self) -> crate::tui::style::StatusKind;
     fn color(self) -> Color;
     fn can_kill(self) -> bool;
     fn empty_output_state(self) -> &'static str;
@@ -52,18 +53,24 @@ impl BackgroundTaskStatusExt for WorkUnitStatus {
         }
     }
 
-    fn color(self) -> Color {
-        let theme = crate::tui::theme::current();
+    fn presentation(self) -> crate::tui::style::StatusKind {
+        use crate::tui::style::StatusKind;
         match self {
-            Self::Pending => theme.accent,
-            Self::WaitingForInput => theme.warn,
-            Self::Interrupted => theme.warn,
-            Self::Failed => theme.error,
-            Self::Running => theme.gutter,
-            Self::Stopping => theme.accent,
-            Self::Completed | Self::CompletedWithIssues => theme.success,
-            Self::Cancelled | Self::Unavailable => theme.dim,
+            Self::Pending | Self::WaitingForInput => StatusKind::Waiting,
+            Self::Interrupted => StatusKind::Interrupted,
+            Self::Failed => StatusKind::Failure,
+            Self::Running | Self::Stopping => StatusKind::Running,
+            Self::Cancelled => StatusKind::Cancelled,
+            Self::Completed => StatusKind::Success,
+            Self::CompletedWithIssues => StatusKind::Warning,
+            Self::Unavailable => StatusKind::Unknown,
         }
+    }
+
+    fn color(self) -> Color {
+        crate::tui::style::status_style(self.presentation())
+            .fg
+            .unwrap_or(Color::Reset)
     }
 
     fn can_kill(self) -> bool {

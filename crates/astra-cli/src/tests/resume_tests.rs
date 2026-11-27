@@ -385,11 +385,22 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
             }),
             ..Default::default()
         };
+        let mut head = remote;
+        let mut cursors = vec![head.cursor().clone()];
+        for turn in [server_turn + 2, server_turn + 3] {
+            let mut messages = head.materialize();
+            messages.extend([
+                serde_json::json!({"role":"user", "content":"write then undo only this turn"}),
+                serde_json::json!({"role":"assistant", "content":"Rolled back this turn"}),
+            ]);
+            head = head.prepare_commit(turn, None, messages).unwrap().next;
+            cursors.push(head.cursor().clone());
+        }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!("/sessions/{sid}/resume")))
             .respond_with(ResponseTemplate::new(200).set_body_json(&restored))
-            .expect(3)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -417,12 +428,15 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
         let calls = std::sync::atomic::AtomicU32::new(0);
         let stream_sid = sid.clone();
         let written_file = new_file.clone();
+        let stream_cursors = cursors.clone();
         Mock::given(method("POST")).and(path("/chat/stream"))
             .respond_with(move |request: &wiremock::Request| {
                 let admission: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 assert!(admission.get("session_turn").is_none());
                 assert!(admission.get("messages").is_none());
                 let round = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (expected, successor) = (&stream_cursors[round as usize], &stream_cursors[round as usize + 1]);
+                assert_eq!(admission["attached_session_cursor"], serde_json::json!(expected));
                 let run = format!("run-{stream_sid}-{round}");
                 let mut body = format!("data: {}\n\n", serde_json::json!({"type":"session_info", "session_id":stream_sid, "run_id":run}));
                 for (index, tool, args) in [
@@ -441,10 +455,22 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
                 // feedback remains valid even when it matches neither local
                 // allocation nor the earlier Server head plus one.
                 let prefix_len = body.len();
-                body.push_str(&super::chat_stream_tests::sse_text_response_with_execution_summary(
+                let suffix = super::chat_stream_tests::sse_text_response_with_execution_summary(
                     "Rolled back this turn", &stream_sid, 2, 0, &["write_file", "rollback_file_edits"], 1,
                     (&run, server_turn + round + 2),
-                ));
+                );
+                for block in suffix.split_terminator("\n\n") {
+                    let data = block.strip_prefix("data: ").unwrap();
+                    if data == "[DONE]" {
+                        body.push_str("data: [DONE]\n\n");
+                        continue;
+                    }
+                    let mut event: serde_json::Value = serde_json::from_str(data).unwrap();
+                    if event["type"] == "run_finished" {
+                        event["canonical_context_cursor"] = serde_json::json!(successor);
+                    }
+                    body.push_str(&format!("data: {event}\n\n"));
+                }
                 ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
                     .insert_header("x-test-sse-prefix-len", prefix_len.to_string())
                     .insert_header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR)
@@ -577,6 +603,10 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
             );
             let expected = local_turn + round + 1;
             assert_eq!(state.turn, expected);
+            assert_eq!(
+                state.server_resume_attachment.as_ref().unwrap().0,
+                cursors[round as usize + 1]
+            );
             assert!(
                 state.session_persistence_error.is_none(),
                 "{:?}",

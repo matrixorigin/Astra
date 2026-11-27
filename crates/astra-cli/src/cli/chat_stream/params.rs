@@ -689,6 +689,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Restored tool replay guard rebuilt from step events on resume.
     pub(crate) idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// When present, these are used instead of converting history pairs.
+    pub(crate) attached_session_cursor: Option<(
+        &'a mut astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
@@ -832,6 +836,7 @@ impl<'a> ChatTurnParams<'a> {
             consecutive_context_window_errors: 0,
             workspace_observation_quarantine: None,
             idempotency_cache: None,
+            attached_session_cursor: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
             #[cfg(feature = "harness")]

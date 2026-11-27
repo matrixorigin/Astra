@@ -1497,6 +1497,22 @@ pub(crate) enum InternalEvent {
     OscResponse(String),
 }
 
+/// Keep the input timestamp through terminal buffering and filtered reads.
+#[derive(Debug)]
+pub(crate) struct TimedEvent {
+    event: InternalEvent,
+    received_at: std::time::Instant,
+}
+
+impl From<InternalEvent> for TimedEvent {
+    fn from(event: InternalEvent) -> Self {
+        Self {
+            event,
+            received_at: std::time::Instant::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;

@@ -4,7 +4,7 @@
 //! `{base_dir}/{session_id}/conversation_log.jsonl`.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -18,6 +18,43 @@ use super::{
 const TAIL_CHUNK_BYTES: usize = 64 * 1024;
 const LOG_FILENAME: &str = "conversation_log.jsonl";
 static APPEND_LOCKS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
+
+/// Retain a path lock only while an appender or waiter uses it. Removal is
+/// serialized with lookup in the map, so a waiter cannot end up on a second
+/// lock for the same path.
+struct AppendLock {
+    path: PathBuf,
+    mutex: Option<Arc<Mutex<()>>>,
+}
+
+impl AppendLock {
+    fn for_path(path: &Path) -> Self {
+        let mutex = APPEND_LOCKS
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone();
+        Self {
+            path: path.to_path_buf(),
+            mutex: Some(mutex),
+        }
+    }
+}
+
+impl Drop for AppendLock {
+    fn drop(&mut self) {
+        let Some(mutex) = self.mutex.take() else {
+            return;
+        };
+        APPEND_LOCKS.remove_if(&self.path, |_, registered| {
+            let same = Arc::ptr_eq(registered, &mutex);
+            // All holders release under this map entry's lock. Concurrent
+            // last drops therefore cannot both miss removing an idle entry.
+            drop(mutex);
+            same && Arc::strong_count(registered) == 1
+        });
+    }
+}
 
 /// File-backed CSL store. Each session gets a JSONL file under `base_dir`.
 #[derive(Debug, Clone)]
@@ -58,13 +95,12 @@ impl FileCslStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        read_snapshot_suffix(file, path)
+        read_snapshot_suffix(file)
     }
 
-    /// Read all entries from the JSONL file. Returns empty vec if file doesn't exist.
-    /// Gracefully skips a corrupted trailing line (e.g. from a crash mid-write).
+    /// Read all entries without treating a damaged suffix as complete history.
     fn read_all_entries(path: &Path) -> Result<Vec<CslEntry>, CslStoreError> {
-        let content = match std::fs::read_to_string(path) {
+        let content = match std::fs::read(path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -76,22 +112,13 @@ impl FileCslStore {
             );
         }
         let mut entries = Vec::new();
-        let lines: Vec<&str> = content.lines().collect();
-        let total = lines.len();
-        for (idx, line) in lines.into_iter().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<CslEntry>(line) {
-                Ok(entry) => entries.push(entry),
-                Err(e) if idx == total - 1 => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "skipping corrupted trailing JSONL line: {e}"
-                    );
-                }
-                Err(e) => return Err(e.into()),
+        let lines = content
+            .strip_suffix(b"\n")
+            .unwrap_or(&content)
+            .split(|byte| *byte == b'\n');
+        for line in lines {
+            if let Some(entry) = decode_entry(line)? {
+                entries.push(entry);
             }
         }
         Ok(entries)
@@ -102,22 +129,24 @@ impl FileCslStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let lock = APPEND_LOCKS
-            .entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .value()
-            .clone();
+        let lock = AppendLock::for_path(path);
         let _guard = lock
+            .mutex
+            .as_ref()
+            .expect("an active append lock has a mutex")
             .lock()
             .map_err(|_| CslStoreError::Other("conversation log append lock poisoned".into()))?;
-        let entries = Self::read_all_entries(path)?;
-        validate_append_sequence(&entries, entry)?;
+        let (last_seq, needs_newline) = scan_append_boundary(path)?;
+        validate_append_sequence(last_seq, entry)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
         let mut line = serde_json::to_string(entry)?;
         line.push('\n');
+        if needs_newline {
+            line.insert(0, '\n');
+        }
         if astra_core::history_work::instrumentation_enabled() {
             astra_core::history_work::record_bytes(
                 astra_core::history_work::HistoryWorkSite::CslFileAppendSerialization,
@@ -167,16 +196,12 @@ impl FileCslStore {
 /// Read backward from a fixed EOF, stopping at the latest snapshot. Replay
 /// only depends on that snapshot and its suffix. Full-history operations
 /// continue to check every row, including records superseded by the snapshot.
-fn read_snapshot_suffix(
-    mut file: impl Read + Seek,
-    path: &Path,
-) -> Result<Vec<CslEntry>, CslStoreError> {
+fn read_snapshot_suffix(mut file: impl Read + Seek) -> Result<Vec<CslEntry>, CslStoreError> {
     let end = file.seek(SeekFrom::End(0))?;
     let mut offset = end;
     let mut chunk = vec![0; end.min(TAIL_CHUNK_BYTES as u64) as usize];
     let mut reversed_line = Vec::new();
     let mut entries = Vec::new();
-    let mut last_line = true;
     let result = (|| {
         while offset > 0 {
             let size = offset.min(TAIL_CHUNK_BYTES as u64) as usize;
@@ -195,28 +220,14 @@ fn read_snapshot_suffix(
                 // A separator at EOF does not create another physical line.
                 if offset + start as u64 != end {
                     reversed_line.reverse();
-                    let line = std::str::from_utf8(&reversed_line)
-                        .map_err(|error| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                        })?
-                        .trim();
-                    if !line.is_empty() {
-                        match serde_json::from_str::<CslEntry>(line) {
-                            Ok(entry) => {
-                                let is_snapshot = entry.is_snapshot();
-                                entries.push(entry);
-                                if is_snapshot {
-                                    entries.reverse();
-                                    return Ok(entries);
-                                }
-                            }
-                            Err(error) if last_line => {
-                                tracing::warn!(path = %path.display(), "skipping corrupted trailing JSONL line: {error}");
-                            }
-                            Err(error) => return Err(error.into()),
+                    if let Some(entry) = decode_entry(&reversed_line)? {
+                        let is_snapshot = entry.is_snapshot();
+                        entries.push(entry);
+                        if is_snapshot {
+                            entries.reverse();
+                            return Ok(entries);
                         }
                     }
-                    last_line = false;
                 }
                 reversed_line.clear();
                 let Some(pos) = newline else { break };
@@ -235,8 +246,59 @@ fn read_snapshot_suffix(
     result
 }
 
-fn validate_append_sequence(entries: &[CslEntry], entry: &CslEntry) -> Result<(), CslStoreError> {
-    let Some(current_seq) = entries.iter().map(CslEntry::seq).max() else {
+/// Validate all existing records before appending, retaining only one row at
+/// a time. Never append over a damaged final row.
+fn scan_append_boundary(path: &Path) -> Result<(Option<u64>, bool), CslStoreError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut max_seq: Option<u64> = None;
+    let mut needs_newline = false;
+    let mut bytes_read = 0_u64;
+    let result = (|| {
+        loop {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            bytes_read = bytes_read.saturating_add(bytes as u64);
+            needs_newline = !line.ends_with(b"\n");
+            if let Some(entry) = decode_entry(&line)? {
+                max_seq = Some(max_seq.map_or(entry.seq(), |current| current.max(entry.seq())));
+            }
+        }
+        Ok((max_seq, needs_newline))
+    })();
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::CslFileRead,
+            bytes_read,
+        );
+    }
+    result
+}
+
+fn decode_entry(line: &[u8]) -> Result<Option<CslEntry>, CslStoreError> {
+    let line = std::str::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        .trim();
+    if line.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::from_str(line).map(Some).map_err(Into::into)
+    }
+}
+
+fn validate_append_sequence(
+    current_seq: Option<u64>,
+    entry: &CslEntry,
+) -> Result<(), CslStoreError> {
+    let Some(current_seq) = current_seq else {
         if entry.is_snapshot() {
             return Ok(());
         }
@@ -433,6 +495,89 @@ mod tests {
         assert_eq!(state.messages.len(), 3);
         assert_eq!(state.messages[0]["content"], "hello");
         assert_eq!(state.messages[2]["content"], "resp2");
+    }
+
+    #[tokio::test]
+    async fn append_handles_unterminated_valid_record_and_preserves_damaged_tail() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let snapshot = make_snapshot(1, 1, vec![user_msg("first")]);
+        let delta = make_delta(2, 2, vec![assistant_msg("second")]);
+
+        store.append("valid", &snapshot).await.unwrap();
+        let path = store.log_path("valid");
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, bytes).unwrap();
+        store.append("valid", &delta).await.unwrap();
+        let recovered = store.load_materialized_blocking("valid").unwrap().unwrap();
+        assert_eq!(
+            recovered.messages,
+            vec![user_msg("first"), assistant_msg("second")]
+        );
+
+        for (sid, damaged) in [
+            ("torn", b"{\"type\":".as_slice()),
+            ("bad-line", b"{bad}\n".as_slice()),
+            ("torn-utf8", b"{\"value\":\"\xe4\xb8".as_slice()),
+        ] {
+            store.append(sid, &snapshot).await.unwrap();
+            let path = store.log_path(sid);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend_from_slice(damaged);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(store.append(sid, &delta).await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(store.load_materialized_blocking(sid).is_err());
+            assert!(store.load_after(sid, 0).await.is_err());
+            let child = format!("fork-{sid}");
+            assert!(store.fork(sid, &child, 2).await.is_err());
+            assert!(!store.log_path(&child).exists());
+            assert!(store.truncate_before(sid, 2).await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+
+        let sid = "invalid-interior";
+        store.append(sid, &snapshot).await.unwrap();
+        let path = store.log_path(sid);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\xe4\xb8\n");
+        bytes.extend_from_slice(serde_json::to_string(&delta).unwrap().as_bytes());
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(store.load_materialized_blocking(sid).is_err());
+        assert!(store.load_after(sid, 0).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_share_a_lock_and_release_it_afterward() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let sid = "concurrent";
+        store
+            .append(sid, &make_snapshot(1, 1, vec![]))
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(33));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .append(sid, &make_delta(2, 2, vec![user_msg("one")]))
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        let mut successes = 0;
+        for task in tasks {
+            successes += usize::from(task.await.unwrap().is_ok());
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(store.load_after(sid, 0).await.unwrap().len(), 2);
+        assert!(!APPEND_LOCKS.contains_key(&store.log_path(sid)));
     }
 
     #[test]
@@ -1035,10 +1180,7 @@ mod tests {
                 file: File::open(&path).unwrap(),
                 bytes_read: 0,
             };
-            assert_eq!(
-                read_snapshot_suffix(&mut reader, &path).unwrap(),
-                vec![snapshot]
-            );
+            assert_eq!(read_snapshot_suffix(&mut reader).unwrap(), vec![snapshot]);
             assert_eq!(
                 reader.bytes_read, TAIL_CHUNK_BYTES,
                 "history length {count}"
@@ -1047,31 +1189,6 @@ mod tests {
     }
 
     // ── Corrupted trailing JSONL line ──────────────────────────────────
-
-    #[tokio::test]
-    async fn corrupted_trailing_line_is_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let store = FileCslStore::new(tmp.path());
-        let sid = "corrupt-trailing";
-
-        store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]))
-            .await
-            .unwrap();
-
-        // Manually append a corrupted line to the JSONL file.
-        let path = tmp.path().join(sid).join("conversation_log.jsonl");
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        writeln!(f, "{{truncated garbage").unwrap();
-
-        let entries = store.load_from_latest_snapshot(sid).await.unwrap();
-        assert_eq!(entries.len(), 1, "should skip corrupted trailing line");
-        assert!(entries[0].is_snapshot());
-    }
 
     #[tokio::test]
     async fn corrupted_middle_line_is_error() {

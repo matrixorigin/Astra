@@ -3152,10 +3152,14 @@ pub(crate) fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
             .map(|input| input.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        state.push_prompt_history_message(serde_json::json!({
+        let mut message = serde_json::json!({
             "role": "user",
             "content": combined,
-        }));
+        });
+        if let Some(run_id) = state.current_run_id.as_deref() {
+            astra_turn_types::mark_run_user_input(&mut message, run_id, false);
+        }
+        state.push_prompt_history_message(message);
         // Freeze the exact acknowledged canonical message, including every
         // input in this batch. The prior turn's frozen source and the last
         // individual input cannot own observations of this combined message.

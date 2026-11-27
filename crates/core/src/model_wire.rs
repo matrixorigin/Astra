@@ -7,6 +7,10 @@ pub mod responses;
 pub mod thinking;
 pub mod token_estimate;
 
+/// Canonical run-input attribution. This field is stored with history and
+/// is never part of a provider message.
+pub const RUN_USER_INPUT_PROVENANCE_FIELD: &str = "_astra_run_user_input";
+
 /// Append an API path without placing it after the base URL's query.
 pub fn endpoint_url(base_url: &str, endpoint: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(base_url) else {

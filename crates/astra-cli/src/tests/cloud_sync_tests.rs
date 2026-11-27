@@ -515,7 +515,7 @@ async fn historical_rejections_are_quiet_at_startup_and_across_drains() {
         .await;
     for model in ["new-model-a", "new-model-b"] {
         store
-            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            .enqueue_journal_event(session_journal::JournalEvent::config_change(
                 Some("healthy-session"),
                 "model",
                 model,
@@ -554,7 +554,7 @@ async fn newly_rejected_record_in_mixed_batch_warns_once_and_stays_in_doctor() {
     let store = SyncOutboxStore::local();
     for model in ["accepted", "rejected"] {
         store
-            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            .enqueue_journal_event(session_journal::JournalEvent::config_change(
                 Some("mixed-batch"),
                 "model",
                 model,
@@ -673,7 +673,7 @@ async fn post_login_retry_warning_rearms_only_after_confirmed_delivery() {
     let store = SyncOutboxStore::local();
     let enqueue = |kind| {
         store
-            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            .enqueue_journal_event(session_journal::JournalEvent::config_change(
                 Some("retry-login"),
                 "model",
                 kind,
@@ -738,7 +738,7 @@ async fn rate_limit_pauses_newly_queued_sessions_until_the_server_deadline() {
     let store = SyncOutboxStore::local();
     for index in 0..20 {
         store
-            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            .enqueue_journal_event(session_journal::JournalEvent::config_change(
                 Some(&format!("rate-limit-{index}")),
                 "model",
                 "test",
@@ -751,7 +751,7 @@ async fn rate_limit_pauses_newly_queued_sessions_until_the_server_deadline() {
     let first_requests = server.received_requests().await.unwrap().len();
     assert!((1..=8).contains(&first_requests));
     store
-        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+        .enqueue_journal_event(session_journal::JournalEvent::config_change(
             Some("rate-limit-new"),
             "model",
             "test",
@@ -783,7 +783,8 @@ async fn background_sync_uses_a_full_protocol_batch() {
             )
         })
         .collect::<Vec<_>>();
-    store.enqueue_journal_events(&events).unwrap();
+    let event_count = events.len();
+    store.enqueue_journal_events(events).unwrap();
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
         .respond_with(|request: &wiremock::Request| {
@@ -810,7 +811,7 @@ async fn background_sync_uses_a_full_protocol_batch() {
     cloud_sync::schedule_sync_outbox_drain();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if store.status().unwrap().acked == events.len() as u64 {
+            if store.status().unwrap().acked == event_count as u64 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -821,7 +822,7 @@ async fn background_sync_uses_a_full_protocol_batch() {
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["events"].as_array().unwrap().len(), events.len());
+    assert_eq!(body["events"].as_array().unwrap().len(), event_count);
     server.verify().await;
 }
 
@@ -837,7 +838,7 @@ async fn temporary_local_outbox_failure_warns_and_retries_automatically() {
     let _auth = install_test_cloud_auth(Some("token"));
     let store = SyncOutboxStore::local();
     store
-        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+        .enqueue_journal_event(session_journal::JournalEvent::config_change(
             Some("lock-recovery"),
             "model",
             "test",
@@ -1083,7 +1084,7 @@ async fn post_auth_reports_late_projection_failure_and_drains_other_sessions() {
     std::fs::create_dir_all(state.journal.as_ref().unwrap().path()).unwrap();
     let store = SyncOutboxStore::local();
     store
-        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+        .enqueue_journal_event(session_journal::JournalEvent::config_change(
             Some("other-session"),
             "model",
             "test-model",
@@ -1428,7 +1429,7 @@ async fn post_auth_reports_in_flight_records_as_unconfirmed() {
     let _auth = install_test_cloud_auth(Some("token"));
     let store = SyncOutboxStore::local();
     store
-        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+        .enqueue_journal_event(session_journal::JournalEvent::config_change(
             Some("in-flight-session"),
             "model",
             "test-model",
@@ -1467,7 +1468,7 @@ async fn post_auth_with_history_treats_in_flight_work_as_unconfirmed() {
     let store = SyncOutboxStore::local();
     for sid in ["rejected-session", "in-flight-session"] {
         store
-            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+            .enqueue_journal_event(session_journal::JournalEvent::config_change(
                 Some(sid),
                 "model",
                 "test-model",
@@ -2129,7 +2130,8 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
             ));
         }
     }
-    store.enqueue_journal_events(&journal_events).unwrap();
+    let event_count = journal_events.len();
+    store.enqueue_journal_events(journal_events).unwrap();
     if !scale && turns == 2 && drain_limit == 64 {
         let record = store.ready_records(1).unwrap().remove(0);
         let valid = json!({
@@ -2162,7 +2164,7 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
     }
     let start = std::time::Instant::now();
     let mut acked = 0;
-    while acked < journal_events.len() {
+    while acked < event_count {
         let report = cloud_sync::try_drain_sync_outbox(drain_limit).await;
         assert!(
             report.attempted > 0,
@@ -2222,11 +2224,8 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
         }
         acked += report.acked as usize;
     }
-    assert_eq!(acked, journal_events.len());
-    assert_eq!(
-        store.status().unwrap().ack_watermark,
-        journal_events.len() as u64
-    );
+    assert_eq!(acked, event_count);
+    assert_eq!(store.status().unwrap().ack_watermark, event_count as u64);
     if sessions == 1 || turns == 1 {
         let batch_size = drain_limit.min(astra_sync_protocol::MAX_SYNC_OUTBOX_BATCH_EVENTS);
         let expected_requests = sessions * (turns as usize).div_ceil(batch_size);
@@ -2240,7 +2239,7 @@ async fn real_sync_batch_recovers_lost_ack_through_http_and_matrixone() {
         .fetch_one(pool.get())
         .await
         .unwrap();
-    assert_eq!(count, journal_events.len() as i64);
+    assert_eq!(count, event_count as i64);
     if scale || turns != 2 || drain_limit != 64 {
         eprintln!(
             "lost-ACK workload: {sessions} sessions, {turns} turns, drain limit {drain_limit}, {}ms, {} writes, {} reconciliations, peak {} concurrent",

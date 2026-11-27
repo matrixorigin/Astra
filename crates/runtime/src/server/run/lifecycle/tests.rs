@@ -13564,13 +13564,74 @@ async fn db_run_start_generation_controls_survive_a_fresh_reader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: guidance before binding and through an independent controller"]
 async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
+    use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
+
+    const OPENING: &str = "Complete this conversation.";
+    const GUIDANCE: &str = "Use the focused verification before answering.";
+    const GUIDED_ANSWER: &str = "Focused verification completed.";
+
+    fn has_user_message(body: &Value, text: &str) -> bool {
+        body["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "user" && message["content"] == text)
+        })
+    }
+
     let pool = setup_lifecycle_run_db_it().await;
     for before_binding in [true, false] {
         let suffix = Uuid::new_v4();
         let user = format!("opening-wake-owner-{suffix}");
         let session = format!("opening-wake-session-{suffix}");
         crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
-        let llm = spawn_gated_terminal_test_llm().await;
+        let opening_entered = Arc::new(tokio::sync::Notify::new());
+        let guided_entered = Arc::new(tokio::sync::Notify::new());
+        let release_opening = Arc::new(tokio::sync::Notify::new());
+        let answer = |text| {
+            ProviderResponse::OpenAi(json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            }))
+        };
+        let mut scripts = vec![ProviderScript::new(
+            "guided conversation request",
+            {
+                let guided_entered = guided_entered.clone();
+                move |request| {
+                    let matches = request.body["stream"] == true
+                        && has_user_message(&request.body, OPENING)
+                        && has_user_message(&request.body, GUIDANCE);
+                    if matches {
+                        guided_entered.notify_one();
+                    }
+                    matches
+                }
+            },
+            vec![answer(GUIDED_ANSWER)],
+        )];
+        if !before_binding {
+            scripts.push(ProviderScript::new("held opening before remote guidance", {
+                let opening_entered = opening_entered.clone();
+                move |request| {
+                    let matches = request.body["stream"] == true
+                        && has_user_message(&request.body, OPENING)
+                        && !has_user_message(&request.body, GUIDANCE);
+                    if matches {
+                        opening_entered.notify_one();
+                    }
+                    matches
+                }
+            }, vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"Opening answer.\"}}]}\n\n".to_vec(),
+                    b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec(),
+                ],
+                release_before_chunk: Some((1, release_opening.clone())),
+            }]));
+        }
+        let gateway = ProviderGateway::start(scripts).await;
         let owner = db_backed_test_service(&pool, &format!("opening-owner-{suffix}"))
             .with_run_concurrency_limit(1);
         let controller = db_backed_test_service(&pool, &format!("opening-controller-{suffix}"));
@@ -13579,7 +13640,7 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
         } else {
             None
         };
-        let mut request = prepared_test_request("Complete this conversation.");
+        let mut request = prepared_test_request(OPENING);
         request.session_id = Some(session.clone());
         request.provider_runtime_authorized = true;
         request.admitted_model_execution = None;
@@ -13591,7 +13652,7 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
                 model_gateway: Some(test_runtime_descriptor(
                     "opening-wake-gateway",
                     "model_gateway",
-                    &format!("{}/chat/completions", llm.base_url),
+                    &format!("{}/v1/chat/completions", gateway.base_url),
                 )),
                 ..Default::default()
             });
@@ -13600,7 +13661,7 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
         let stream = ok(owner.stream_chat(user.clone(), request).await);
         let run_id = stream.run_id.clone();
         if !before_binding {
-            tokio::time::timeout(Duration::from_secs(5), llm.blocked_entered.notified())
+            tokio::time::timeout(Duration::from_secs(5), opening_entered.notified())
                 .await
                 .expect("provider proves the opening readers are already bound");
             assert!(
@@ -13616,7 +13677,7 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
                 RunUserIntentData {
                     intent_id: format!("opening-guidance-{suffix}"),
                     delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                    input: json!({"content":"Use the focused verification before answering."}),
+                    input: json!({"content":GUIDANCE}),
                 },
             )
             .await);
@@ -13643,18 +13704,14 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
             })
             .await
             .expect("the owning Server observes remotely committed guidance");
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while llm.requests.load(Ordering::SeqCst) < 2 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+            tokio::time::timeout(Duration::from_secs(10), guided_entered.notified())
             .await
             .expect(
                 "new guidance must reach a second provider request before the first is released",
             );
         }
         drop(permit);
-        llm.release_blocked.notify_one();
+        release_opening.notify_one();
         let events = tokio::time::timeout(Duration::from_secs(15), collect_chat_stream(stream))
             .await
             .expect("guided execution reaches its real terminal");
@@ -13681,18 +13738,8 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
             1,
             "the exact accepted guidance must receive its durable application ACK"
         );
-        if before_binding {
-            assert_eq!(
-                llm.requests.load(Ordering::SeqCst),
-                1,
-                "guidance accepted before binding belongs in the first provider request"
-            );
-        } else {
-            assert!(
-                llm.requests.load(Ordering::SeqCst) >= 2,
-                "remote guidance during a held answer must reach another provider boundary"
-            );
-        }
+        // Finite scripts reject any inference outside the normal conversation.
+        gateway.assert_complete();
         assert!(owner.drain_background_tasks(Duration::from_secs(5)).await);
         cleanup_lifecycle_run_fixture(&pool, &user, &run_id).await;
         crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
@@ -14470,6 +14517,7 @@ fn test_request(message: &str) -> ChatRequestData {
         session_id: None,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,
@@ -23952,6 +24000,41 @@ fn provider_task_ref_fingerprint_tracks_semantic_routing_but_not_credential_rota
         rotated_credentials.request_fingerprint()
     );
 
+    let session_id = "session-provider-routing";
+    request.session_id = Some(session_id.to_owned());
+    let conversation =
+        astra_turn_core::active_conversation::ActiveConversation::empty("user-1", session_id)
+            .unwrap();
+    request.attached_session_cursor = Some(conversation.cursor().clone());
+    let attached = svc
+        .provider_idempotency_identity("user-1", &request)
+        .unwrap()
+        .unwrap();
+    let advanced = conversation
+        .prepare_commit(
+            1,
+            None,
+            vec![json!({"role":"user", "content":"latest context"})],
+        )
+        .unwrap();
+    request.attached_session_cursor = Some(advanced.next.cursor().clone());
+    let changed_cursor = svc
+        .provider_idempotency_identity("user-1", &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attached.run_id(), changed_cursor.run_id());
+    let error = AgenticRunLifecycleService::validate_start_request_fingerprint(
+        &changed_cursor,
+        Some(attached.request_fingerprint()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("provider_task_ref_request_mismatch")
+    );
+    request.session_id = None;
+    request.attached_session_cursor = None;
+
     request
         .forward_headers
         .insert("x-workspace-id".to_string(), "workspace-2".to_string());
@@ -31550,6 +31633,7 @@ fn extract_edge_tools_from_context() {
         session_id: None,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,
@@ -31644,6 +31728,7 @@ fn extract_edge_profile_from_context() {
         session_id: None,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,

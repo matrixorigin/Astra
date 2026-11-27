@@ -8339,7 +8339,7 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             event.cache_creation_tokens = None;
             event.metadata.as_mut().unwrap()["qualified_usage"] = serde_json::json!({});
         }
-        outbox.enqueue_journal_event(&event).unwrap();
+        outbox.enqueue_journal_event(event.clone()).unwrap();
         let projected = outbox.ready_records(10).unwrap().pop().unwrap();
         let payload = projected.payload.clone();
         let id = projected.record_id.clone();

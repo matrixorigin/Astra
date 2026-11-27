@@ -266,10 +266,12 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
     let not_started = match &attempt {
         TurnAttempt::NotStarted(_) => true,
-        TurnAttempt::Interrupted(result) => result
-            .as_ref()
-            .as_ref()
-            .is_err_and(|failure| failure.partial.server_admission_not_dispatched),
+        TurnAttempt::Interrupted(result) => result.as_ref().as_ref().is_err_and(|failure| {
+            super::turn_stream_runner::failure_before_turn_start(
+                failure,
+                input.admitted_server_turn,
+            )
+        }),
         TurnAttempt::Completed(_) => false,
     };
     if not_started {
@@ -514,7 +516,7 @@ pub(crate) async fn handle_chat_input_with_ui(
 
     // Bind refresh authority before session creation or any other asynchronous
     // preflight can race a refresh from a concurrent request.
-    let initial_auth_owner = match capture_turn_auth_owner(
+    let auth_owner = match capture_turn_auth_owner(
         ctx.api,
         ctx.profile,
         token,
@@ -559,19 +561,13 @@ pub(crate) async fn handle_chat_input_with_ui(
     // Admission is per actual model turn, not per TUI lifetime. Keep this
     // token in scope through retry and Turn/TurnError settlement, then release
     // it so the next interactive turn (or another surface) can proceed.
-    let admission =
-        match acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await {
-            Ok(lease) => lease,
-            Err(error) => {
-                let _ = ui.restore_input(restore_line, state.session_id.as_deref());
-                return Err(error);
-            }
-        };
-
-    let token = admission
-        .as_ref()
-        .and_then(|admission| admission.server_turn.as_ref())
-        .map_or(token, |turn| turn.bearer.as_str());
+    let admission = match acquire_interactive_turn_admission(state, ctx.api, auth_owner.as_ref()) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = ui.restore_input(restore_line, state.session_id.as_deref());
+            return Err(error);
+        }
+    };
 
     let ctx = TurnContext {
         api: admission
@@ -593,13 +589,6 @@ pub(crate) async fn handle_chat_input_with_ui(
 
     let local_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
-    let auth_owner = match admission
-        .as_ref()
-        .and_then(|admission| admission.server_turn.as_ref())
-    {
-        Some(turn) => turn.auth_owner.clone(),
-        None => initial_auth_owner,
-    };
     if auth_owner.as_ref().is_some_and(|owner| !owner.is_current()) || !ctx.permits_admission(state)
     {
         ui.show_warning("The account or conversation changed. This instruction was not sent.");
@@ -709,7 +698,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         }
     };
 
-    let initial_auth_owner = match capture_turn_auth_owner(
+    let auth_owner = match capture_turn_auth_owner(
         ctx.api,
         ctx.profile,
         token,
@@ -734,12 +723,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     )
     .await?;
 
-    let admission = acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await?;
-
-    let token = admission
-        .as_ref()
-        .and_then(|admission| admission.server_turn.as_ref())
-        .map_or(token, |turn| turn.bearer.as_str());
+    let admission = acquire_interactive_turn_admission(state, ctx.api, auth_owner.as_ref())?;
 
     let ctx = TurnContext {
         api: admission
@@ -761,14 +745,20 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         "Background task updates since the last model boundary:\n{notifications}\n\
          Reconcile these facts with the latest user goal. Newer user steering always has priority."
     )];
-    let user_intent = state
-        .history
-        .iter()
-        .rev()
-        .map(|(user, _)| user.trim())
-        .find(|user| !user.is_empty())
-        .unwrap_or("Continue the current goal after reconciling background task updates.")
-        .to_string();
+    let fallback_intent = "Continue the current goal after reconciling background task updates.";
+    let user_intent = if state.server_resume_attachment.is_some() {
+        // The attached wake gets its latest human goal from the Server head.
+        fallback_intent
+    } else {
+        state
+            .history
+            .iter()
+            .rev()
+            .map(|(user, _)| user.trim())
+            .find(|user| !user.is_empty())
+            .unwrap_or(fallback_intent)
+    }
+    .to_owned();
     let logical_user_line = String::new();
     let runtime_envelope =
         astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE.to_string();
@@ -777,13 +767,6 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
     ui.blank_line();
 
-    let auth_owner = match admission
-        .as_ref()
-        .and_then(|admission| admission.server_turn.as_ref())
-    {
-        Some(turn) => turn.auth_owner.clone(),
-        None => initial_auth_owner,
-    };
     if auth_owner.as_ref().is_some_and(|owner| !owner.is_current()) || !ctx.permits_admission(state)
     {
         ui.show_warning("The account or conversation changed. The background update was not sent.");
@@ -854,15 +837,10 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     Ok(interactive_outcome(settlement, usage))
 }
 
-pub(crate) const INTERACTIVE_SERVER_RESUME_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30);
-
 pub(crate) struct AdmittedServerTurn {
     pub(crate) attachment_owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
-    pub(crate) bearer: String,
     pub(crate) api: astra_thin_client::ThinClient,
-    pub(crate) continuation: crate::cli::session::session_continuation::SessionContinuation,
 }
 
 pub(super) struct InteractiveTurnAdmission {
@@ -870,11 +848,10 @@ pub(super) struct InteractiveTurnAdmission {
     pub(super) server_turn: Option<AdmittedServerTurn>,
 }
 
-pub(super) async fn acquire_interactive_turn_admission(
+pub(super) fn acquire_interactive_turn_admission(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    token: &str,
+    auth_owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
 ) -> Result<Option<InteractiveTurnAdmission>, String> {
     let Some(session_id) = state.session_id.clone() else {
         return Ok(None);
@@ -894,58 +871,30 @@ pub(super) async fn acquire_interactive_turn_admission(
     // Server authority is attached explicitly at restore and is never inferred
     // from local journal numbers or a display history. Reject an obsolete binding
     // rather than falling back to a replica after an account/session change.
-    if let Some((cursor, epoch)) = state.server_resume_attachment.as_ref()
-        && (cursor.session_id != session_id
-            || cursor.owner_id != crate::cli::cli_config::cli_utils::cli_user_id()
-            || *epoch != state.session_attachment_epoch)
-    {
-        return Err("Server resume attachment no longer matches the current account/session; restore the session again".into());
-    }
-    let server_turn = if state.server_resume_attachment.is_some() {
-        let attachment_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-        let request_api = api.clone().without_bearer_provider();
-        eprintln!("  Restoring authoritative Server continuation…");
-        let refresh = tokio::time::timeout(INTERACTIVE_SERVER_RESUME_TIMEOUT, async {
-            let auth_owner =
-                session_runtime::capture_admitted_auth_owner(&request_api, profile, token).await;
-            let (bundle, bearer) =
-                crate::cli::session::session_restore_client::fetch_cloud_continuation_with_bearer(
-                    &request_api,
-                    &session_id,
-                    token,
-                    auth_owner.as_ref(),
-                )
-                .await?;
-            let bundle = bundle.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
-            Ok::<_, String>((bundle, bearer, auth_owner))
-        });
-        let cancelled = async {
-            match state.tui_cancel_token.as_ref() {
-                Some(token) => token.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-        let (bundle, bearer, auth_owner) = tokio::select! {
-            biased;
-            _ = cancelled => return Err("Server continuation refresh cancelled before execution".into()),
-            result = refresh => result.map_err(|_| "Server continuation refresh timed out before execution".to_string())??,
-        };
-        if !attachment_owner.is_current()
-            || auth_owner.as_ref().is_some_and(|owner| !owner.is_current())
+    let server_turn = if let Some((cursor, epoch)) = state.server_resume_attachment.as_ref() {
+        let attachment_owner = auth_owner
+            .cloned()
+            .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot);
+        let owner_id = attachment_owner
+            .server_account_id
+            .as_deref()
+            .unwrap_or_else(|| attachment_owner.owner_scope.id());
+        if cursor.session_id != session_id
+            || cursor.owner_id != owner_id
+            || *epoch != state.session_attachment_epoch
         {
+            return Err("Server resume attachment no longer matches the current account/session; restore the session again".into());
+        }
+        if !attachment_owner.is_current() {
             return Err(
-                "Server resume account changed during restore; restore the session again".into(),
+                "Server attachment account changed before admission; restore the session again"
+                    .into(),
             );
         }
-        let continuation =
-            crate::cli::session::session_continuation::continuation_from_resume_bundle(bundle)
-                .ok_or_else(|| "Server continuation failed causal validation".to_string())?;
         Some(AdmittedServerTurn {
             attachment_owner,
-            auth_owner,
-            bearer,
-            api: request_api,
-            continuation,
+            auth_owner: auth_owner.cloned(),
+            api: api.clone().without_bearer_provider(),
         })
     } else {
         None
@@ -966,9 +915,14 @@ pub(super) async fn acquire_interactive_turn_admission(
             &session_id,
             &events,
         )?;
-        let restored =
-            session_runtime::restored_journal_state_from_append_order_events(true, &events);
-        state.history = restored.session.history;
+        let restored = session_runtime::restored_journal_state_from_append_order_events(
+            true,
+            &events,
+            server_turn.is_none(),
+        );
+        if server_turn.is_none() {
+            state.history = restored.session.history;
+        }
         state.turn = restored.session.turn;
         state.recent_tools = restored.session.recent_tools;
         state.total_prompt_tokens = restored.session.total_prompt_tokens;
@@ -994,13 +948,6 @@ pub(super) async fn acquire_interactive_turn_admission(
             )
             .map_err(|error| error.to_string())?,
         );
-    }
-    if let Some(server_turn) = server_turn.as_ref() {
-        state.history = crate::cli::session::session_continuation::history_pairs_from_messages(
-            &server_turn.continuation.messages,
-        );
-        state.deferred_tool_activations =
-            server_turn.continuation.deferred_tool_activations.clone();
     }
     Ok(Some(InteractiveTurnAdmission {
         _lease: lease,
@@ -1776,6 +1723,17 @@ mod tests {
             state.resume_guidance.as_deref(),
             Some("verify the unfinished result")
         );
+        let envelope =
+            astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE;
+        assert!(
+            state
+                .active_conversation
+                .as_ref()
+                .unwrap()
+                .messages()
+                .iter()
+                .all(|message| { message["content"] != envelope })
+        );
         assert_eq!(
             state.diagnostics_context.as_deref(),
             Some("existing diagnostic")
@@ -2098,8 +2056,7 @@ mod tests {
             state.turn = 99;
             state.history = vec![("stale".into(), "state".into())];
             let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-            let lease = acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
-                .await
+            let lease = acquire_interactive_turn_admission(&mut state, &api, None)
                 .unwrap()
                 .expect("known session lease");
             assert_eq!(state.turn, failed_turn);
@@ -2172,11 +2129,9 @@ mod tests {
             writer
                 .append(&JournalEvent::session_start(Some(&session_id), None))
                 .unwrap();
-            let next_lease =
-                acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
-                    .await
-                    .unwrap()
-                    .expect("the lease is per turn");
+            let next_lease = acquire_interactive_turn_admission(&mut state, &api, None)
+                .unwrap()
+                .expect("the lease is per turn");
             assert_eq!(state.turn, failed_turn + 1);
             assert_eq!(state.history.len(), (failed_turn + 1) as usize);
             assert_eq!(

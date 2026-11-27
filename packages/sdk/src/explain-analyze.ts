@@ -1,3 +1,4 @@
+import errorKinds from "./explain-analyze-error-kinds.json";
 import { EXPLAIN_ANALYZE_HTML_STYLE } from "./explain-analyze-html-style";
 import { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
 import {
@@ -99,6 +100,8 @@ const outcomes = new Set([
   "unavailable",
   "delegated",
 ]);
+// Rust ErrorKind tags. The Explain wire contract test checks the snapshot.
+const reportableErrorKinds = new Set(errorKinds);
 const allowedEventKeys = new Set([
   "type",
   "index",
@@ -167,9 +170,7 @@ export function isExplainAnalyzeEventV1(
   if (value.auxiliary_details !== undefined &&
       (value.kind !== "turn" || value.transition !== "finished" || !isExplainAnalyzeAuxiliaryDetails(value.auxiliary_details, value.elapsed_ms))) return false;
   if (value.decision_detail !== undefined &&
-      (value.kind !== "admission" || value.transition !== "finished" ||
-        (value.outcome !== "blocked" && value.outcome !== "rejected") ||
-        !isExplainAnalyzeDecisionDetail(value.decision_detail))) return false;
+      (value.transition !== "finished" || !isExplainAnalyzeDecisionDetail(value))) return false;
   if (value.coverage_gaps !== undefined &&
     (value.kind !== "turn" || value.transition !== "finished" ||
       !isCoverageGapList(value.coverage_gaps))) {
@@ -292,13 +293,23 @@ function isExplainAnalyzeAuxiliaryCall(value: unknown, terminalElapsedMs: number
 }
 
 function isExplainAnalyzeDecisionDetail(
-  value: unknown,
-): value is ExplainAnalyzeDecisionDetailV1 {
-  return isRecord(value) &&
-    Object.keys(value).length === 3 &&
-    value.kind === "delegation_catalog_resolution" &&
-    isNonNegativeInteger(value.requirement_index) && value.requirement_index < 16 &&
-    isNonNegativeInteger(value.match_count) && value.match_count !== 1;
+  event: Record<string, unknown>,
+): boolean {
+  const detail = event.decision_detail;
+  if (!isRecord(detail)) return false;
+  if (detail.kind === "failure") {
+    return Object.keys(detail).length === 2 &&
+      (event.kind === "provider_attempt" || event.kind === "tool_call" || event.kind === "admission") &&
+      (event.outcome === "failed" || event.outcome === "blocked" ||
+        event.outcome === "rejected" || event.outcome === "interrupted" || event.outcome === "cancelled") &&
+      typeof detail.error_kind === "string" && reportableErrorKinds.has(detail.error_kind);
+  }
+  return event.kind === "admission" &&
+    (event.outcome === "blocked" || event.outcome === "rejected") &&
+    Object.keys(detail).length === 3 &&
+    detail.kind === "delegation_catalog_resolution" &&
+    isNonNegativeInteger(detail.requirement_index) && detail.requirement_index < 16 &&
+    isNonNegativeInteger(detail.match_count) && detail.match_count !== 1;
 }
 
 function isExplainId(value: unknown): value is string {
@@ -738,7 +749,10 @@ export function reduceExplainAnalyzeEvents(
     .filter((node) => node.kind === "turn" && node.terminalObserved)
     .map((node) => JSON.stringify([node.runId, node.turnId, node.clockDomainId])));
   for (const node of orderedNodes) {
-    if (conflictedNodeIds.has(node.nodeId)) node.conflicted = true;
+    if (conflictedNodeIds.has(node.nodeId)) {
+      node.conflicted = true;
+      delete node.decisionDetail;
+    }
     if (node.parentNodeId && !nodeById.has(node.parentNodeId)) {
       diagnostics.push({ code: "missing_parent", nodeId: node.nodeId, relatedNodeId: node.parentNodeId });
     }

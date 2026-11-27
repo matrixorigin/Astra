@@ -2438,6 +2438,7 @@ mod edge_callback_insert_tests {
             user_id: String,
             run_id: String,
             owner: astra_services::runs::ProviderRunOwner,
+            _requirement: astra_services::session_fork_coordinator::ProviderSessionScopeRequirement,
         ) -> Result<(), (StatusCode, Json<crate::ErrorResponse>)> {
             if user_id == "u-approval"
                 && run_id == self.run_id
