@@ -302,7 +302,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_cancel.clone(),
     ));
     if let Some(ref pool) = state.shared_pool {
-        bg_handles.push(session_memory_runtime::spawn_session_memory_recovery(
+        bg_handles.extend(session_memory_runtime::spawn_session_memory_recovery(
             state.clone(),
             bg_cancel.clone(),
         ));
@@ -314,11 +314,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_handles.push(spawn_edge_dispatch_backlog_metrics_refresh(
             pool.clone(),
             state.multi_agent_metrics.clone(),
-            bg_cancel.clone(),
-        ));
-        bg_handles.push(spawn_model_request_metrics_refresh(
-            pool.clone(),
-            state.metrics_registry(),
             bg_cancel.clone(),
         ));
         bg_handles.push(astra_services::work::spawn_work_runtime_event_projector(
@@ -681,47 +676,6 @@ fn spawn_edge_dispatch_backlog_metrics_refresh(
             target: "astra_runtime::metrics",
             "edge dispatch backlog metrics refresh received cancellation; exiting"
         );
-    })
-}
-
-fn spawn_model_request_metrics_refresh(
-    shared_pool: astra_core::SharedPool,
-    registry: std::sync::Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let interval = std::time::Duration::from_secs(15);
-        let timeout = std::time::Duration::from_secs(5);
-        loop {
-            let refresh = astra_services::aggregate_model_request_metrics(&shared_pool);
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(timeout, refresh) => {
-                    match result {
-                        Ok(Ok(rows)) => {
-                            meta_handlers::publish_model_request_metrics(&registry, &rows);
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                target: "astra_runtime::metrics",
-                                %error,
-                                "failed to refresh model request metrics"
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "astra_runtime::metrics",
-                                "timed out refreshing model request metrics"
-                            );
-                        }
-                    }
-                }
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(interval) => {}
-            }
-        }
     })
 }
 

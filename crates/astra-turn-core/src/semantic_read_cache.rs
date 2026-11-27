@@ -1,6 +1,5 @@
-//! Bounded semantic read-observation cache state machine.
+//! Bounded executor-local cache for successful semantic read observations.
 //!
-//! This is the executable contract shared by ephemeral and durable adapters.
 //! It owns fill fencing and resource limits; it does not resolve provider
 //! policy, freshness, permission, or presentation hooks.
 
@@ -31,14 +30,14 @@ enum CacheEntry {
 #[derive(Clone, Debug)]
 struct SemanticReadCacheFillLease {
     owner_id: String,
-    expires_at_epoch_ms: u64,
+    expires_at_ms: u64,
 }
 
 impl SemanticReadCacheFillLease {
     fn new(
         owner_id: &str,
-        expires_at_epoch_ms: u64,
-        now_epoch_ms: u64,
+        expires_at_ms: u64,
+        now_ms: u64,
     ) -> Result<Self, SemanticReadObservationStoreError> {
         if owner_id.trim().is_empty() {
             return Err(SemanticReadObservationStoreError::EmptyFillOwner);
@@ -49,17 +48,17 @@ impl SemanticReadCacheFillLease {
                 max_bytes: MAX_FILL_OWNER_BYTES,
             });
         }
-        if expires_at_epoch_ms <= now_epoch_ms {
+        if expires_at_ms <= now_ms {
             return Err(SemanticReadObservationStoreError::InvalidFillLeaseDeadline);
         }
         Ok(Self {
             owner_id: owner_id.to_string(),
-            expires_at_epoch_ms,
+            expires_at_ms,
         })
     }
 
-    fn is_expired_at(&self, now_epoch_ms: u64) -> bool {
-        self.expires_at_epoch_ms <= now_epoch_ms
+    fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.expires_at_ms <= now_ms
     }
 }
 
@@ -84,13 +83,13 @@ impl InMemorySemanticReadObservationStore {
         &mut self,
         key: &SemanticReadCacheKey,
         fill_owner: &str,
-        lease_expires_at_epoch_ms: u64,
-        now_epoch_ms: u64,
+        lease_expires_at_ms: u64,
+        now_ms: u64,
     ) -> Result<SemanticReadCacheLookup, SemanticReadObservationStoreError> {
         key.validate()?;
         let proposed_lease =
-            SemanticReadCacheFillLease::new(fill_owner, lease_expires_at_epoch_ms, now_epoch_ms)?;
-        self.remove_expired_fills(now_epoch_ms);
+            SemanticReadCacheFillLease::new(fill_owner, lease_expires_at_ms, now_ms)?;
+        self.remove_expired_fills(now_ms);
         let next_access = self.next_access_sequence();
         if let Some(entry) = self.entries.get_mut(&key.key_id) {
             match entry {
@@ -110,7 +109,7 @@ impl InMemorySemanticReadObservationStore {
                 } => {
                     ensure_same_key(stored_key, key)?;
                     return Ok(SemanticReadCacheLookup::FillInProgress {
-                        lease_expires_at_epoch_ms: lease.expires_at_epoch_ms,
+                        lease_expires_at_ms: lease.expires_at_ms,
                     });
                 }
             }
@@ -133,7 +132,7 @@ impl InMemorySemanticReadObservationStore {
         &mut self,
         key: &SemanticReadCacheKey,
         fill_owner: &str,
-        now_epoch_ms: u64,
+        now_ms: u64,
         observation: SemanticReadObservation,
     ) -> Result<(), SemanticReadObservationStoreError> {
         key.validate()?;
@@ -157,7 +156,7 @@ impl InMemorySemanticReadObservationStore {
         if lease.owner_id != fill_owner {
             return Err(SemanticReadObservationStoreError::FillOwnerMismatch);
         }
-        if lease.is_expired_at(now_epoch_ms) {
+        if lease.is_expired_at(now_ms) {
             return Err(SemanticReadObservationStoreError::FillLeaseExpired);
         }
         if encoded_bytes > self.limits.max_ready_bytes {
@@ -188,38 +187,6 @@ impl InMemorySemanticReadObservationStore {
             },
         );
         self.ready_bytes = self.ready_bytes.saturating_add(encoded_bytes);
-        Ok(())
-    }
-
-    pub fn renew_fill(
-        &mut self,
-        key: &SemanticReadCacheKey,
-        fill_owner: &str,
-        lease_expires_at_epoch_ms: u64,
-        now_epoch_ms: u64,
-    ) -> Result<(), SemanticReadObservationStoreError> {
-        key.validate()?;
-        let renewed =
-            SemanticReadCacheFillLease::new(fill_owner, lease_expires_at_epoch_ms, now_epoch_ms)?;
-        let entry = self
-            .entries
-            .get_mut(&key.key_id)
-            .ok_or(SemanticReadObservationStoreError::MissingFill)?;
-        let CacheEntry::Filling {
-            key: stored_key,
-            lease,
-        } = entry
-        else {
-            return Err(SemanticReadObservationStoreError::FillAlreadyCompleted);
-        };
-        ensure_same_key(stored_key, key)?;
-        if lease.owner_id != fill_owner {
-            return Err(SemanticReadObservationStoreError::FillOwnerMismatch);
-        }
-        if lease.is_expired_at(now_epoch_ms) {
-            return Err(SemanticReadObservationStoreError::FillLeaseExpired);
-        }
-        *lease = renewed;
         Ok(())
     }
 
@@ -288,9 +255,9 @@ impl InMemorySemanticReadObservationStore {
         true
     }
 
-    fn remove_expired_fills(&mut self, now_epoch_ms: u64) {
+    fn remove_expired_fills(&mut self, now_ms: u64) {
         self.entries.retain(|_, entry| match entry {
-            CacheEntry::Filling { lease, .. } => !lease.is_expired_at(now_epoch_ms),
+            CacheEntry::Filling { lease, .. } => !lease.is_expired_at(now_ms),
             CacheEntry::Ready { .. } => true,
         });
     }
@@ -438,7 +405,7 @@ mod tests {
         assert_eq!(
             store.lookup_or_claim(&key, "owner-b", 101, 2).unwrap(),
             SemanticReadCacheLookup::FillInProgress {
-                lease_expires_at_epoch_ms: 100,
+                lease_expires_at_ms: 100,
             }
         );
         store
@@ -471,29 +438,6 @@ mod tests {
         assert!(matches!(
             store.lookup_or_claim(&key, "owner-c", 30, 12).unwrap(),
             SemanticReadCacheLookup::Hit(observation) if observation.result.output == "current"
-        ));
-    }
-
-    #[test]
-    fn fill_renewal_extends_only_the_live_exact_owner_lease() {
-        let mut store = store(SemanticReadCacheLimits::default());
-        let key = key("renew");
-        store.lookup_or_claim(&key, "owner-a", 10, 1).unwrap();
-
-        store.renew_fill(&key, "owner-a", 20, 5).unwrap();
-        assert_eq!(
-            store.lookup_or_claim(&key, "owner-b", 30, 10).unwrap(),
-            SemanticReadCacheLookup::FillInProgress {
-                lease_expires_at_epoch_ms: 20,
-            }
-        );
-        assert!(matches!(
-            store.renew_fill(&key, "owner-b", 30, 11),
-            Err(SemanticReadObservationStoreError::FillOwnerMismatch)
-        ));
-        assert!(matches!(
-            store.renew_fill(&key, "owner-a", 30, 20),
-            Err(SemanticReadObservationStoreError::FillLeaseExpired)
         ));
     }
 

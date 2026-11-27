@@ -11,6 +11,15 @@ use astra_server_types::{
 };
 use std::time::Duration;
 
+const METRIC_STANDALONE_COMPLETIONS_TOTAL: &str = "astra_llm_standalone_completions_total";
+
+pub(super) fn register_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
+    registry.register_counter(
+        METRIC_STANDALONE_COMPLETIONS_TOTAL,
+        "Standalone completion requests after provider admission by outcome.",
+    );
+}
+
 fn completion_response_id(response_id: Option<&str>) -> String {
     response_id
         .map(|s| s.to_string())
@@ -279,13 +288,19 @@ pub(super) async fn completions_handler(
             provider_timeout,
         )
         .await;
-    let parsed = match parsed.into_result() {
-        Ok(parsed) => parsed,
+    let (outcome, response) = match parsed.into_result() {
+        Ok(parsed) => ("succeeded", Ok(parsed)),
         Err(error) if crate::turn::llm::durable::is_ledger_error(&error) => {
-            return Err(inference_ledger_http_error(error));
+            ("ledger_error", Err(inference_ledger_http_error(error)))
         }
-        Err(error) => return Err(provider_request_http_error(error)),
+        Err(error) => ("provider_error", Err(provider_request_http_error(error))),
     };
+    state.metrics_registry.increment_counter(
+        METRIC_STANDALONE_COMPLETIONS_TOTAL,
+        &[("outcome", outcome)],
+        1,
+    );
+    let parsed = response?;
 
     // 5. Build the stable OpenAI-compatible response surface.
 

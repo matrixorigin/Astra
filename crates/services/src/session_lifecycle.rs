@@ -243,14 +243,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         label: "tool_invocation_ledger",
         sql: "DELETE FROM tool_invocation_ledger WHERE session_id = ? AND user_id = ?",
     },
-    SessionDeleteStatement {
-        label: "semantic_read_observations",
-        sql: "DELETE FROM semantic_read_observations WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "semantic_read_observation_budgets",
-        sql: "DELETE FROM semantic_read_observation_budgets WHERE session_id = ? AND user_id = ?",
-    },
 ];
 
 // Artifact projections (state items and context manifests) update their

@@ -161,7 +161,6 @@ async fn insert_model_request_fixture(
     event: &astra_services::ModelRequestContextEvent,
     created_at: &str,
 ) {
-    let usage = event.usage.as_ref();
     // Consumer fixture for the current stored contract, not a writer simulation.
     let payload = match event.stage {
         astra_services::ModelRequestEventStage::Accepted => serde_json::to_value(event).unwrap(),
@@ -178,9 +177,8 @@ async fn insert_model_request_fixture(
     sqlx::query(
         "INSERT INTO model_request_context_events \
          (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, \
-          terminal_status, topology, provider, model_family, purpose, input_tokens, \
-          output_tokens, cache_read_tokens, cache_creation_tokens, event_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          terminal_status, event_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(user_id)
     .bind(session_id)
@@ -190,14 +188,6 @@ async fn insert_model_request_fixture(
     .bind(format!("invocation-{attempt_id}"))
     .bind(event.stage.as_str())
     .bind(event.terminal_status.as_deref())
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(&event.identity.model)
-    .bind(&event.identity.inference_purpose)
-    .bind(usage.map(|usage| usage.input.total_input_tokens() as i64))
-    .bind(usage.map(|usage| usage.output_tokens as i64))
-    .bind(usage.map(|usage| usage.input.cache_read_tokens as i64))
-    .bind(usage.map(|usage| usage.input.cache_creation_tokens as i64))
     .bind(serde_json::to_string(&payload).expect("serialize model request fixture"))
     .bind(created_at)
     .execute(pool)
