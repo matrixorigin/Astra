@@ -598,6 +598,20 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
         },
     );
     astra.record_frame("Background task output");
+    astra.write(b"v");
+    astra.wait_for_screen("private shell streams", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Shell output")
+            && screen.contains("private")
+            && screen.contains("stdout")
+            && screen.contains("Esc back · R refresh")
+    });
+    astra.record_frame("Private shell streams");
+    astra.write(b"\x1b");
+    astra.wait_for_screen(
+        "return from shell streams to task details",
+        UI_TRANSITION_TIMEOUT,
+        |screen| screen.contains("Latest output") && screen.contains("Esc list"),
+    );
     astra.write(b"\x1b");
     astra.wait_for_screen(
         "completed task remains selectable",

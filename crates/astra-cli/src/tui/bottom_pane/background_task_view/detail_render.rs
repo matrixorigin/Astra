@@ -52,13 +52,15 @@ pub(crate) fn render_detail(
     } else {
         &row.title
     };
-    let title_width = usize::from(area.width);
-    let title_width = title_width.saturating_sub(5 + status.width());
+    let width = usize::from(area.width);
+    let status = crate::tui::history_cell::truncate_by_width(&status, width.saturating_sub(5) / 2);
+    let separator = if status.is_empty() { "" } else { " · " };
+    let title_width = width.saturating_sub(2 + separator.width() + status.width());
     let title = super::super::chat_composer::input_preview(title, title_width);
     let title_line = Line::from(vec![
         Span::raw("  "),
         Span::styled(title, title_style),
-        Span::styled(if title_width > 0 { " · " } else { "" }, dim),
+        Span::styled(separator, dim),
         Span::styled(status, Style::default().fg(status_color)),
     ]);
     let context_lines = vec![
