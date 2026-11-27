@@ -194,6 +194,10 @@ impl TranscriptItem {
         Self::rendered_kind(id, TranscriptItemKind::System, lines, separator_rows)
     }
 
+    pub(crate) fn notice(id: TranscriptItemId, text: impl AsRef<str>) -> Self {
+        Self::rendered(id, vec![notice_line(text)], 0)
+    }
+
     /// Recorded activity keeps full text for expansion, search, and export;
     /// the normal view renders a bounded preview.
     pub(crate) fn activity(id: TranscriptItemId, kind: TranscriptItemKind, text: String) -> Self {
@@ -477,7 +481,7 @@ impl TranscriptItem {
                 } else if !cell.is_live() {
                     history_cell_lines_for_buffer(&*cell, width)
                 } else {
-                    cell.live_viewport_lines(width, 48)
+                    cell.live_transcript_lines(width)
                 }
             }
             TranscriptContent::LiveReasoning(cell) => {
@@ -544,7 +548,8 @@ fn render_detail(
     if !expanded {
         source.truncate(5);
     }
-    let mut lines = crate::tui::wrapping::word_wrap_lines(source, width.max(1) as usize);
+    let inner = detail_content_width(width);
+    let mut lines = crate::tui::wrapping::word_wrap_lines(source, inner);
     let wrapped_truncated = !expanded && lines.len() > 5;
     if wrapped_truncated {
         lines.truncate(5);
@@ -555,7 +560,16 @@ fn render_detail(
     if let Some((heading, name)) = heading {
         lines.insert(0, Line::from(format!("{name} · {heading}")));
     }
+    if inner < usize::from(width) {
+        for line in &mut lines {
+            line.spans.insert(0, Span::raw("  "));
+        }
+    }
     lines
+}
+
+fn detail_content_width(width: u16) -> usize {
+    usize::from(if width > 3 { width - 2 } else { width.max(1) })
 }
 
 fn committed_cell_kind(cell: &dyn HistoryCell) -> TranscriptItemKind {
@@ -1593,7 +1607,7 @@ impl TranscriptView {
                     record(index, 0);
                 }
                 for (line, lower_line) in text.lines().zip(lower.lines()) {
-                    let width = usize::from(self.width.max(1));
+                    let width = detail_content_width(self.width);
                     if UnicodeWidthStr::width(line) <= width && !line.contains('\t') {
                         if lower_line.contains(&needle) {
                             record(index, offset);
@@ -1750,6 +1764,13 @@ impl TranscriptView {
     }
 }
 
+pub(super) fn notice_line(text: impl AsRef<str>) -> Line<'static> {
+    Line::styled(
+        format!("  {}", text.as_ref()),
+        Style::default().fg(crate::tui::theme::current().dim),
+    )
+}
+
 fn line_plain_text(line: &Line<'_>) -> String {
     line.spans
         .iter()
@@ -1783,12 +1804,12 @@ impl BottomPaneView for TranscriptView {
         let count = self.snapshot.items.len();
         let noun = if count == 1 { "item" } else { "items" };
         let mut title = vec![Span::styled(format!("  {}", self.title), bold)];
-        let position = format!("  · {count} {noun}");
+        let position = format!(" · {count} {noun}");
         if !self.report && title[0].width() + position.width() <= usize::from(area.width) {
             title.push(Span::styled(position, dim));
         }
         if self.filter != TranscriptFilter::All {
-            title.push(Span::styled(format!("  · {}", self.filter.label()), dim));
+            title.push(Span::styled(format!(" · {}", self.filter.label()), dim));
         }
         Widget::render(Line::from(title), Rect::new(area.x, y, area.width, 1), buf);
         y = next_y(y);
@@ -1837,9 +1858,9 @@ impl BottomPaneView for TranscriptView {
             }
             let mut line = self.lines[i].as_ref().clone();
             if self.is_selected_row(i) {
-                line.style = selection_style;
+                line.style = line.style.patch(selection_style);
             } else if i == self.cursor {
-                line.style = cursor_style;
+                line.style = line.style.patch(cursor_style);
             }
             Widget::render(
                 crate::tui::render::line_utils::FullRowParagraph::new(vec![line]),
@@ -1884,7 +1905,7 @@ impl BottomPaneView for TranscriptView {
                 ]);
                 Widget::render(prompt, row, buf);
             } else if let Some(status) = &self.status {
-                Widget::render(Line::styled(status.clone(), dim), row, buf);
+                Widget::render(notice_line(status), row, buf);
             }
         }
     }

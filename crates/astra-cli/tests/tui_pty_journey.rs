@@ -3881,6 +3881,34 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
                 })
         },
     );
+    for (i, ch) in b"delgt".iter().copied().enumerate() {
+        astra.write(&[ch]);
+        let query = &"delgt"[..=i];
+        astra.wait_for_screen(
+            "prompt history while working",
+            UI_TRANSITION_TIMEOUT,
+            |screen| {
+                screen.contains(&format!("│› {query}"))
+                    && screen.contains("History · ↑↓ select · Tab insert")
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    astra.write(b"\x1b[D\x7f"); // Move inside the query and erase the g.
+    astra.wait_for_screen(
+        "history list with an interior cursor",
+        UI_TRANSITION_TIMEOUT,
+        |screen| screen.contains("│› delt") && screen.contains("History · ↑↓ select · Tab insert"),
+    );
+    astra.record_frame("Live history search");
+    astra.write(b"\t");
+    astra.wait_for(
+        "│› delegate_one_child_and_keep_it_observable",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
     astra.write(&[0x07]);
     astra.wait_for_screen("run navigator", UI_TRANSITION_TIMEOUT, |screen| {
         (screen.contains("Agent runs") || screen.contains("Conversations"))
@@ -3905,6 +3933,22 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
             })
     });
     astra.record_frame("Live run transcript");
+    astra.write(b"/child_evidence_visible");
+    astra.wait_for("Search: /child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for_screen(
+        "aligned transcript search result",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.starts_with("  child_evidence_visible"))
+                && screen.lines().any(|line| {
+                    line.starts_with("  Match ") && line.ends_with("/child_evidence_visible")
+                })
+        },
+    );
+    astra.record_frame("Transcript search result");
     astra.write(b"\x1b");
     astra.wait_for_screen("return to selected run", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("Last activity")
@@ -3915,7 +3959,15 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x0f]); // Open the root transcript as a retained tab.
-    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen("aligned root transcript", UI_TRANSITION_TIMEOUT, |screen| {
+        screen
+            .lines()
+            .any(|line| line.starts_with("  Transcript · Root · mock-session"))
+            && screen
+                .lines()
+                .any(|line| line.starts_with("  Parent acknowledged"))
+    });
+    astra.record_frame("Aligned live root transcript");
     astra.write(b"\x1b[1;2C"); // Shift+Right follows the retained tab order.
     astra.wait_for_screen(
         "switch back to the same child run",

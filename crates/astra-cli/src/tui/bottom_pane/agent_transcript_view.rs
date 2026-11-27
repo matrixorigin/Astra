@@ -9,6 +9,7 @@ use ratatui::{buffer::Buffer, layout::Rect, text::Line};
 
 use super::transcript_view::{
     TranscriptItem, TranscriptItemId, TranscriptItemKind, TranscriptSnapshot, TranscriptView,
+    notice_line,
 };
 use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ConversationTabId,
@@ -1027,44 +1028,37 @@ impl AgentTranscriptView {
                     | None => "No canonical conversation items have synced for this agent yet.",
                 }
             };
-            return TranscriptSnapshot::new(vec![TranscriptItem::rendered(
+            return TranscriptSnapshot::new(vec![TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(0),
-                vec![Line::from(message.to_string())],
-                0,
+                message,
             )]);
         }
 
         let mut projected = self.canonical.items.clone();
         if let Some(activity) = &self.activity {
-            projected.push(TranscriptItem::rendered(
+            let coverage = if activity.events.is_empty() {
+                "No tool activity recorded in this range"
+            } else {
+                "Recorded tool activity · partial coverage"
+            };
+            let older = activity.next_before_event_idx.map_or("", |_| " · A older");
+            projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(1 << 61),
-                vec![Line::from(
-                    "Recorded tool activity (partial coverage) · A older · R refresh",
-                )],
-                0,
+                format!("{coverage}{older}"),
             ));
-            if activity.events.is_empty() {
-                projected.push(TranscriptItem::rendered(
-                    TranscriptItemId::from_widget_id((1 << 61) + 2),
-                    vec![Line::from("No recorded activity in this range. Live-only or dropped events may be unavailable.")], 0));
-            }
             projected.extend(self.activity_items.iter().cloned());
         }
         if let Some(error) = &self.activity_error {
-            projected.push(TranscriptItem::rendered(
+            projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id((1 << 61) + 1),
-                vec![Line::from(error.clone())],
-                0,
+                error,
             ));
         }
         self.append_live_projection(&mut projected);
         if let Some(live) = &self.local_root_live {
-            projected.push(TranscriptItem::rendered(
+            projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(u64::MAX - 1),
-                vec![Line::from(
-                    "Live local projection · awaiting durable reconciliation",
-                )],
-                0,
+                "Live activity · history pending",
             ));
             projected.push(live.item.clone());
         }
@@ -1247,7 +1241,7 @@ impl AgentTranscriptView {
                 } else {
                     TranscriptItemKind::System
                 },
-                vec![Line::from("Live activity · not in loaded history")],
+                vec![notice_line("Live activity · not in loaded history")],
                 0,
             ));
         }
@@ -1923,7 +1917,7 @@ fn project_durable_transcript(
                                 format!("{component}:partial"),
                             ),
                             TranscriptItemKind::Tool,
-                            vec![Line::from("Partial retained output")],
+                            vec![notice_line("Partial retained output")],
                             0,
                         ));
                     }
@@ -2022,7 +2016,7 @@ fn project_durable_transcript(
                     projected.push(TranscriptItem::rendered_kind(
                         TranscriptItemId::from_canonical(canonical_id, "partial"),
                         TranscriptItemKind::Tool,
-                        vec![Line::from("Partial retained output")],
+                        vec![notice_line("Partial retained output")],
                         0,
                     ));
                 }

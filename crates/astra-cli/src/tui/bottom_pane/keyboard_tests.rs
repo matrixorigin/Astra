@@ -1986,6 +1986,20 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         assert_eq!(text.matches("› ship").count(), 1, "{text}");
     }
 
+    for (at, code, query) in [
+        (103, KeyCode::Left, "shi"),
+        (105, KeyCode::Backspace, "si"),
+        (108, KeyCode::Char('h'), "shi"),
+    ] {
+        pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
+        assert_eq!(pane.composer.text(), query);
+        let text = render(&pane);
+        assert!(
+            text.contains("ship canary build") && text.contains("ship staging build"),
+            "{text}"
+        );
+    }
+
     assert!(matches!(
         pane.handle_session_key_at(
             key(KeyCode::Tab),

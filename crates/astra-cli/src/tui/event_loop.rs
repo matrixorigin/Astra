@@ -4852,7 +4852,7 @@ fn transcript_item_for_cell(
         return TranscriptItem::rendered_cell(
             id,
             cell,
-            sanitize_lines_for_buffer(assistant.live_viewport_lines(width, 48)),
+            assistant.live_transcript_lines(width),
             separator_rows,
         );
     }
@@ -29133,7 +29133,7 @@ mod tests {
         ));
         assert!(pane.take_projection_action().is_none());
         assert!(
-            render_bottom_pane_text(&pane, 100, 24).contains("awaiting durable reconciliation"),
+            render_bottom_pane_text(&pane, 100, 24).contains("Live activity · history pending"),
             "equal content from another call cannot retire the real local tool"
         );
         pane.refresh_agent_transcript(

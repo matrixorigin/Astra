@@ -759,12 +759,11 @@ impl ChatComposer {
             return;
         }
         let query = input.trim();
-        self.history_search = if self.draft.is_none()
-            && self.pasted_blobs.is_empty()
-            && self.textarea.cursor_byte() == input.len()
+        self.history_search = if self.pasted_blobs.is_empty()
             && !query.is_empty()
             && !query.starts_with(['/', '!', '$'])
             && !input.contains(['\n', '\r', '\t'])
+            && !(self.draft.is_some() && self.matches_recalled_entry(input))
         {
             let entries = self.suggestion_entries(history, query);
             (!entries.is_empty()).then_some(HistorySearch {
@@ -808,8 +807,13 @@ impl ChatComposer {
             self.textarea.swap_paste_burst(&mut query);
             self.take_recoverable_drafts()
         } else {
-            // A suggestion completes what is already in the input box.
-            Vec::new()
+            // Complete the visible query and keep any draft suspended by
+            // Up/Down history navigation available for later editing.
+            self.draft
+                .take()
+                .filter(|draft| !draft.is_empty())
+                .into_iter()
+                .collect()
         };
         self.textarea.set_text(&text);
         self.history_entry = Some(entry);
@@ -1267,6 +1271,9 @@ impl ChatComposer {
 
     /// Preserve a preview when the terminal has no row for the list.
     pub(super) fn render_compact_history_suggestion(&self, area: Rect, buf: &mut Buffer) {
+        if self.textarea.cursor_byte() != self.textarea.text().len() {
+            return;
+        }
         let Some((search, selected)) = self.history_suggestions() else {
             return;
         };

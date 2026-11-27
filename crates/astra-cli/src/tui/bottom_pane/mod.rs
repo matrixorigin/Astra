@@ -2568,7 +2568,7 @@ impl BottomPane {
         if let Some(p) = &self.skill_popup {
             return p.height();
         }
-        0
+        self.composer.history_suggestions_height()
     }
 
     pub(super) fn has_composer_hints(&self, width: u16) -> bool {
@@ -2975,18 +2975,11 @@ impl BottomPane {
         self.composer.set_frame_allowed(allowed);
     }
 
-    pub(crate) fn history_suggestions_height(&self) -> u16 {
-        if self.has_active_view() {
-            return 0;
-        }
-        self.composer.history_suggestions_height()
-    }
-
     pub(crate) fn extra_picker_rows(&self) -> u16 {
         if self.has_active_view() {
             0
         } else {
-            self.popup_height().saturating_sub(1) + self.history_suggestions_height()
+            self.popup_height().saturating_sub(1)
         }
     }
 
@@ -3023,7 +3016,6 @@ impl BottomPane {
             + queue_h
             + next_turn_queue_h
             + popup_h
-            + self.history_suggestions_height()
             + 2
             + u16::from(self.has_composer_hints(width))
             + self.notice_lines(width).len() as u16
@@ -3054,10 +3046,7 @@ impl BottomPane {
         let next_turn_queue = take(self.next_turn_submission_height());
         let context = take(1);
         let footer = take(1);
-        // Ordinary history suggestions yield to the queue and status rows.
-        let popup = popup
-            + take(popup_rows.saturating_sub(popup))
-            + take(self.history_suggestions_height());
+        let popup = popup + take(popup_rows.saturating_sub(popup));
         let hints = take(u16::from(self.has_composer_hints(area.width)));
         let mut y = area.y;
         let mut row = |height| {

@@ -5,7 +5,7 @@
 //! read scope and its pagination; it does not manufacture a second renderer.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{buffer::Buffer, layout::Rect, text::Line};
+use ratatui::{buffer::Buffer, layout::Rect};
 
 use super::agent_transcript_view::durable_transcript_items;
 use super::transcript_view::{
@@ -358,34 +358,29 @@ impl RootTranscriptView {
                     | None => "No canonical conversation items have synced for this session yet.",
                 }
             };
-            vec![TranscriptItem::rendered(
+            vec![TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(0),
-                vec![Line::from(message.to_string())],
-                0,
+                message,
             )]
         } else {
             durable_transcript_items(&self.items)
         };
         if let Some(local_live) = &self.local_live {
             let state = if local_live.settled {
-                "Local turn result · awaiting durable reconciliation"
+                "Local result · history pending"
             } else {
-                "Live local projection · awaiting durable reconciliation"
+                "Live activity · history pending"
             };
-            items.push(TranscriptItem::rendered(
+            items.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(u64::MAX - 1),
-                vec![Line::from(state)],
-                0,
+                state,
             ));
             items.push(local_live.item.clone());
         }
         if !self.local_context.is_empty() {
-            items.push(TranscriptItem::rendered(
+            items.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(u64::MAX - 2),
-                vec![Line::from(
-                    "Live runtime context · awaiting user action".to_string(),
-                )],
-                0,
+                "Live runtime context · awaiting user action",
             ));
             items.extend(self.local_context.iter().cloned());
         }
@@ -776,7 +771,8 @@ mod tests {
         view.render(area, &mut buffer);
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(
-            text.contains("Live local projection · awaiting durable reconciliation"),
+            text.lines()
+                .any(|line| line.starts_with("  Live activity · history pending")),
             "{text}"
         );
         assert!(text.contains("live model output"), "{text}");
@@ -786,7 +782,9 @@ mod tests {
         view.render(area, &mut settled);
         let settled_text = crate::tui::testing::render::buffer_to_string(&settled);
         assert!(
-            settled_text.contains("Local turn result · awaiting durable reconciliation"),
+            settled_text
+                .lines()
+                .any(|line| line.starts_with("  Local result · history pending")),
             "{settled_text}"
         );
         assert!(settled_text.contains("live model output"), "{settled_text}");

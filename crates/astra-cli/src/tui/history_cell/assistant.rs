@@ -512,6 +512,18 @@ impl AssistantCell {
         out
     }
 
+    pub(crate) fn live_transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // Reserve one of the 48 preview rows for the speaker heading.
+        let mut lines = self.live_viewport_lines(width.saturating_sub(2), 47);
+        if lines.iter().any(|line| !line.spans.is_empty()) {
+            for line in &mut lines {
+                line.spans.insert(0, Span::raw("  "));
+            }
+            lines.insert(0, self.settled_speaker_line(width));
+        }
+        lines
+    }
+
     /// Render a bounded rich Markdown suffix for a mutable reply. The cache
     /// refreshes at most once per short interval during token bursts, so the
     /// live view never exposes raw Markdown and never reparses an unbounded
