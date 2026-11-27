@@ -15913,9 +15913,19 @@ impl AgenticRunLifecycleService {
     async fn authorize_fork_session_request(
         &self,
         user_id: &str,
-        request: &ChatRequestData,
+        request: &mut ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         if let Some(session_id) = &request.session_id {
+            if let Some(result) = request.session_admission_facts.as_mut().and_then(|facts| {
+                facts.take_chat_scope_authorization(
+                    user_id,
+                    session_id,
+                    request.provider_run_owner.as_ref(),
+                    &self.encryptor,
+                )
+            }) {
+                return result.map_err(Self::chat_scope_error);
+            }
             self.authorize_fork_session_id(
                 user_id,
                 session_id,
@@ -15925,6 +15935,19 @@ impl AgenticRunLifecycleService {
             .await?;
         }
         Ok(())
+    }
+
+    fn chat_scope_error(
+        error: astra_services::SessionForkCoordinatorError,
+    ) -> (StatusCode, Json<ErrorResponse>) {
+        match error {
+            astra_services::SessionForkCoordinatorError::Forbidden => error_response_coded(
+                StatusCode::FORBIDDEN,
+                "Session fork is outside the authorized scope",
+                "session_fork_forbidden",
+            ),
+            error => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
     }
 
     async fn authorize_fork_session_id(
@@ -15944,14 +15967,7 @@ impl AgenticRunLifecycleService {
                 requirement,
             )
             .await
-            .map_err(|error| match error {
-                astra_services::SessionForkCoordinatorError::Forbidden => error_response_coded(
-                    StatusCode::FORBIDDEN,
-                    "Session fork is outside the authorized scope",
-                    "session_fork_forbidden",
-                ),
-                error => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            })?;
+            .map_err(Self::chat_scope_error)?;
         } else if provider_owner.is_some() {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -16019,11 +16035,11 @@ impl AgenticRunLifecycleService {
     async fn stream_chat_with_session_impl(
         &self,
         user_id: String,
-        request: ChatRequestData,
+        mut request: ChatRequestData,
         create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
-        self.authorize_fork_session_request(&user_id, &request)
+        self.authorize_fork_session_request(&user_id, &mut request)
             .await?;
         self.validate_attached_session_cursor(&user_id, &request)?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
@@ -16129,14 +16145,14 @@ impl AgenticRunLifecycleService {
     async fn prepare_new_owned_execution(
         &self,
         user_id: String,
-        request: ChatRequestData,
+        mut request: ChatRequestData,
         mut start_identity: Option<RunStartIdempotency>,
         streaming: bool,
         create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
     ) -> Result<NewRunPreparation, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
         if !streaming {
-            self.authorize_fork_session_request(&user_id, &request)
+            self.authorize_fork_session_request(&user_id, &mut request)
                 .await?;
         }
         // Provider task fingerprints describe the original request, not the

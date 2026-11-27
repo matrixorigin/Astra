@@ -1862,39 +1862,35 @@ async fn session_lifecycle_user(
         )
         .await?;
     let user = auth.principal.user.clone();
-    // Exact ownership is checked for every mechanism, before provider scope.
-    state
-        .session_service
-        .get_session(session_id.to_owned(), user.user_id.clone())
-        .await?;
     if let Some(owner) = fork_provider_scope(&auth, true)? {
-        authorize_session_lifecycle_scope(state, &user.user_id, session_id, &owner).await?;
+        let pool = state.shared_pool.as_ref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider session authority is unavailable",
+            )
+        })?;
+        astra_services::session_fork_coordinator::authorize_existing_provider_session(
+            pool.get(),
+            &user.user_id,
+            session_id,
+            &owner,
+            Some(&state.fernet_encryptor),
+        )
+        .await
+        .map_err(|error| match error {
+            astra_services::SessionForkCoordinatorError::NotFound => error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            ),
+            error => session_fork_http_error(error),
+        })?;
+    } else {
+        state
+            .session_service
+            .get_session(session_id.to_owned(), user.user_id.clone())
+            .await?;
     }
     Ok(user)
-}
-
-async fn authorize_session_lifecycle_scope(
-    state: &AppState,
-    user_id: &str,
-    session_id: &str,
-    owner: &astra_services::runs::ProviderRunOwner,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let pool = state.shared_pool.as_ref().ok_or_else(|| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "provider session authority is unavailable",
-        )
-    })?;
-    astra_services::session_fork_coordinator::authorize_provider_fork_session(
-        pool.get(),
-        user_id,
-        session_id,
-        Some(owner),
-        Some(&state.fernet_encryptor),
-        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::BoundConversation,
-    )
-    .await
-    .map_err(session_fork_http_error)
 }
 
 pub(crate) async fn close_session_handler(

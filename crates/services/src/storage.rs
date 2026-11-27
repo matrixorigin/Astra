@@ -1319,7 +1319,10 @@ impl SessionExecutionActivity {
 }
 
 pub(crate) enum IndependentRunSessionAdmission {
-    Active(Option<bool>),
+    Active(
+        Option<bool>,
+        Option<crate::session_fork_coordinator::ProviderSessionScopeFacts>,
+    ),
     Busy,
     Inactive,
 }
@@ -1352,6 +1355,13 @@ where
           WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE -1 END \
          ELSE NULL END AS SIGNED) AS full_llm_capture_override, ",
     );
+    let include_scope = crate::session_fork_coordinator::legacy_moi_session_namespace(user_id);
+    if include_scope {
+        crate::session_fork_coordinator::push_provider_session_scope(
+            &mut query, user_id, session_id,
+        );
+        query.push(", ");
+    }
     push_session_active_runs(&mut query, user_id, session_id, Some(run_id));
     query
         .push(" FROM agent_sessions session WHERE session.user_id = ")
@@ -1385,7 +1395,14 @@ where
             ));
         }
     };
-    Ok(IndependentRunSessionAdmission::Active(capture))
+    let scope = include_scope
+        .then(|| {
+            crate::session_fork_coordinator::ProviderSessionScopeFacts::from_row(
+                &row, user_id, session_id,
+            )
+        })
+        .transpose()?;
+    Ok(IndependentRunSessionAdmission::Active(capture, scope))
 }
 
 /// Read live Run owners under an existing Session fence. Old unknown tool

@@ -704,12 +704,11 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
     .fetch_one(pool.get())
     .await
     .unwrap();
-    // Model the persisted data from before scope binding was recorded.
+    // Historical Sessions predate both the conversation and memory bindings.
     let mut metadata: Value = serde_json::from_str(&raw).unwrap();
-    metadata
-        .as_object_mut()
-        .unwrap()
-        .remove("__astra_provider_scope_proof_v1");
+    for key in astra_services::auth::session::PROVIDER_SCOPE_METADATA_KEYS {
+        metadata.as_object_mut().unwrap().remove(key);
+    }
     sqlx::query("UPDATE agent_sessions SET `metadata` = ? WHERE user_id = ? AND session_id = ?")
         .bind(metadata.to_string())
         .bind(&owner)
@@ -1791,6 +1790,51 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         .unwrap();
 }
 
+// A request may execute SQL in a spawned task. Each Tokio test has its own
+// runtime, so filter by that runtime to exclude concurrent tests.
+fn capture_lifecycle_sql() -> super::sql_capture::SqlCapture {
+    use tracing_subscriber::prelude::*;
+    let runtime = tokio::runtime::Handle::current().id();
+    let capture = super::sql_capture::SqlCapture::default();
+    let layer = capture
+        .clone()
+        .with_filter(tracing_subscriber::filter::dynamic_filter_fn(
+            move |_, _| {
+                tokio::runtime::Handle::try_current().is_ok_and(|handle| handle.id() == runtime)
+            },
+        ));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+        .expect("the lifecycle test owns the SQL subscriber in this test binary");
+    capture
+}
+
+async fn request_sql<F: std::future::Future>(
+    capture: &super::sql_capture::SqlCapture,
+    request: F,
+) -> (F::Output, Vec<super::sql_capture::ObservedSql>) {
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    let output = request.await;
+    let samples = capture.0.lock().unwrap().take().unwrap();
+    (output, samples)
+}
+
+async fn edge_chat_scope_reads(
+    app: &Router,
+    request: Request<Body>,
+    capture: &super::sql_capture::SqlCapture,
+) -> (Vec<Value>, Vec<String>) {
+    let (response, samples) = request_sql(capture, app.clone().oneshot(request)).await;
+    let body = to_bytes(response.unwrap().into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let reads = samples
+        .into_iter()
+        .map(|s| s.sql)
+        .filter(|sql| sql.contains("AS scope_manifest"))
+        .collect();
+    (super::events(std::str::from_utf8(&body).unwrap()), reads)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real disposable MatrixOne; signed Session memory lifecycle"]
 async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
@@ -1802,6 +1846,7 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    let capture = capture_lifecycle_sql();
     let fixture = ReviewFixture::new().await;
     let read_only = Arc::new(AtomicBool::new(true));
     let write_only = Arc::new(AtomicBool::new(false));
@@ -1816,13 +1861,25 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     let revoked_grant = revoked.clone();
     let calls = identity_calls.clone();
     let reflect_calls = reflection_calls.clone();
+    let model_endpoint = fixture.moi.model_endpoint.clone().unwrap();
     let bridge = Router::new()
         .route("/callback", route_post(move |headers: HeaderMap, Json(body): Json<Value>| {
             let issuer = callback_issuer.clone(); let grant = grant.clone(); let write_grant = write_grant.clone();
             let revoked_grant = revoked_grant.clone();
-            calls.fetch_add(1, Ordering::SeqCst);
+            let model_endpoint = model_endpoint.clone();
+            let calls = calls.clone();
             async move {
                 assert_eq!(headers["authorization"], "Bearer lifecycle-callback-key");
+                if body["action"] == "issue_runtime_context_by_scope" {
+                    return Json(json!({"code":0,"data":{
+                        "selected_model":{"id":"moi-contract-offering","model":"moi-contract-model"},
+                        "runtime_auth":{"type":"moi_runtime_grant","authorization":"Bearer scope-budget","expires_at":"2099-01-01T00:00:00Z"},
+                        "capability_descriptors":{"model_gateway":{"id":"moi-model-gateway","type":"model_gateway","transport":"http","endpoint_url":model_endpoint,"protocol":"openai_chat_completions","model_context_window":32768,"metadata":{}}},
+                        "runtime_scope":{"allowed_model_id":"moi-contract-offering","allowed_tools":[],"allowed_skills":[],"allowed_knowledge_bases":[]},
+                        "task_id":"budget","manifest_id":"budget","provider_scope_id":body["provider_scope_id"],
+                    }}));
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(body["action"], "resolve_memory_identity");
                 Json(json!({"code":0,"data":{"external_subject":body["external_subject"],"provider_scope_id":body["provider_scope_id"],
                     "issuer":issuer,"uc_subject":"lifecycle-uc-owner",
@@ -2023,6 +2080,59 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
             .unwrap()
             .owner_user_id
     );
+    // A fresh Run in an existing Edge Session pays for the owned Session read
+    // and the locked admission, with zero standalone scope queries. Exercise
+    // both historical unbound Sessions and newly workspace-bound Sessions.
+    let old_session = fixture
+        .sessions
+        .create_session(
+            edge_owner.clone(),
+            astra_services::SessionCreateRequestData {
+                agent_id: None,
+                title: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+    let chat_request = |session: &str, workspace: &str| {
+        let payload = json!({"message":"Reply briefly.","session_id":session,
+            "model_selection":{"offering_id":"moi-contract-offering"}});
+        edge_request("POST", "/chat/stream", &payload.to_string(), workspace)
+    };
+    for session in [old_session.session_id.as_str(), edge_session_id] {
+        let (events, reads) = edge_chat_scope_reads(
+            &app,
+            chat_request(session, "moi-contract-workspace"),
+            &capture,
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "run_finished" && e["status"] == "completed")
+        );
+        assert_eq!(
+            reads.len(),
+            2,
+            "scope must be checked only in the existing reads"
+        );
+        assert!(reads[0].contains("AS metadata_json"));
+        assert!(reads[1].contains("full_llm_capture_override") && reads[1].ends_with("FOR UPDATE"));
+    }
+    let (events, reads) = edge_chat_scope_reads(
+        &app,
+        chat_request(edge_session_id, "other-workspace"),
+        &capture,
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["error_code"] == "session_fork_forbidden")
+    );
+    assert_eq!(reads.len(), 1, "wrong workspace must stop at preflight");
+    assert!(reads[0].contains("AS metadata_json"));
     let edge_status_path = format!("/sessions/{edge_session_id}/memory/status");
     let (status, result) = response(
         &app,
@@ -2030,12 +2140,32 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{result}");
-    let (status, _) = response(
-        &app,
-        edge_request("GET", &edge_status_path, "", "other-workspace"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    for (method, suffix) in [("GET", "status"), ("POST", "finalize")] {
+        let path = format!("/sessions/{}/memory/{suffix}", Uuid::new_v4());
+        let (status, _) = response(
+            &app,
+            edge_request(method, &path, "", "moi-contract-workspace"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let path = format!("/sessions/{edge_session_id}/memory/{suffix}");
+        let ((status, _), sql) = request_sql(
+            &capture,
+            response(&app, edge_request(method, &path, "", "other-workspace")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let session_reads = sql
+            .iter()
+            .filter(|s| s.sql.contains("FROM agent_sessions"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            session_reads.len(),
+            1,
+            "{method} {suffix} must check ownership and scope in one read"
+        );
+        assert!(session_reads[0].sql.contains("AS scope_manifest"));
+    }
     let edit_path = format!("/sessions/{edge_session_id}");
     let mut metadata = edge_session["metadata"].clone();
     metadata["label"] = json!("updated by the client");

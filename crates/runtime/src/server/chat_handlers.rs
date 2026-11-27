@@ -65,9 +65,11 @@ pub(super) async fn resolve_or_create_chat_session(
             let session = if provider_authorized {
                 state
                     .session_service
-                    .get_session_for_provider_request(session_id.clone(), user.user_id.clone())
+                    .get_session_for_provider_request_with_admission_facts(
+                        session_id.clone(),
+                        user.user_id.clone(),
+                    )
                     .await
-                    .map(|session| (session, None))
             } else {
                 state
                     .session_service

@@ -1068,8 +1068,12 @@ pub fn authorize_manifest_provider(
     }
 }
 
+pub(crate) fn legacy_moi_session_namespace(user_id: &str) -> bool {
+    user_id.starts_with("external_authorized:moi:")
+}
+
 fn provider_session_namespace(user_id: &str) -> bool {
-    user_id.starts_with("provider_authorized:") || user_id.starts_with("external_authorized:moi:")
+    user_id.starts_with("provider_authorized:") || legacy_moi_session_namespace(user_id)
 }
 
 /// Read the immutable provider binding used by memory recovery and tools.
@@ -1167,7 +1171,7 @@ where
     .await
 }
 
-pub(crate) async fn authorize_provider_session_update(
+pub async fn authorize_existing_provider_session(
     executor: impl sqlx::Executor<'_, Database = MySql>,
     user_id: &str,
     session_id: &str,
@@ -1200,34 +1204,26 @@ async fn authorize_provider_session_scope(
     if required.is_none() && !provider_session_namespace(user_id) {
         return Ok(());
     }
-    let key = SessionKeyV1::owner_session("server", user_id, session_id, "main");
-    let row = sqlx::query(
-        "SELECT JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1') IS NOT NULL AS has_scope_binding,
-                JSON_EXTRACT(s.`metadata`, '$.__astra_provider_memory_scope_proof_v1') IS NOT NULL AS has_memory_scope_binding,
-                JSON_EXTRACT(s.`metadata`, '$.fork_id') IS NOT NULL AS has_fork_metadata,
-                CASE WHEN OCTET_LENGTH(JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1'))) = 43
-                     THEN JSON_UNQUOTE(JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1'))
-                     ELSE NULL END AS scope_proof,
-                CAST(f.manifest_json AS CHAR) AS scope_manifest
-         FROM agent_sessions s LEFT JOIN session_forks f
-           ON f.isolation_domain = ? AND f.owner_user_id = s.user_id
-          AND f.child_session_id = s.session_id AND f.child_branch_id = ?
-         WHERE s.user_id = ? AND s.session_id = ?
-           AND (NOT ? OR s.delete_requested_at IS NULL)",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.branch_id)
-    .bind(user_id)
-    .bind(session_id)
-    .bind(require_existing_session)
-    .fetch_optional(executor)
-    .await
-    .map_err(|source| database_error("load_provider_session_scope", source))?;
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_provider_session_scope(&mut query, user_id, session_id);
+    query
+        .push(" FROM agent_sessions WHERE user_id = ")
+        .push_bind(user_id)
+        .push(" AND session_id = ")
+        .push_bind(session_id)
+        .push(" AND (NOT ")
+        .push_bind(require_existing_session)
+        .push(" OR delete_requested_at IS NULL)");
+    let row = query
+        .build()
+        .fetch_optional(executor)
+        .await
+        .map_err(|source| database_error("load_provider_session_scope", source))?;
     let Some(row) = row else {
         if require_existing_session {
             return Err(SessionForkCoordinatorError::NotFound);
         }
-        if user_id.starts_with("external_authorized:moi:") {
+        if legacy_moi_session_namespace(user_id) {
             return Ok(());
         }
         return if required.is_some() || provider_session_namespace(user_id) {
@@ -1236,75 +1232,135 @@ async fn authorize_provider_session_scope(
             Ok(())
         };
     };
-    // Retain the subject-owned contract of old Edge Sessions and forks. They
-    // remain ineligible for workspace memory. New memory-bound Sessions must
-    // also prove the calling token's workspace before reading/writing Context.
-    if user_id.starts_with("external_authorized:moi:")
-        && !row
-            .try_get::<bool, _>("has_memory_scope_binding")
-            .map_err(|source| database_error("decode_provider_session_scope", source))?
-    {
-        return Ok(());
-    }
-    let raw_manifest: Option<String> = row
-        .try_get("scope_manifest")
+    let facts = ProviderSessionScopeFacts::from_row(&row, user_id, session_id)
         .map_err(|source| database_error("decode_provider_session_scope", source))?;
-    let Some(raw_manifest) = raw_manifest else {
-        let Some(owner) = required else {
-            return if provider_session_namespace(user_id) {
-                Err(SessionForkCoordinatorError::Forbidden)
-            } else {
-                Ok(())
-            };
-        };
-        let has_scope_binding: bool = row
-            .try_get("has_scope_binding")
-            .map_err(|source| database_error("decode_provider_session_scope", source))?;
-        let has_fork_metadata: bool = row
-            .try_get("has_fork_metadata")
-            .map_err(|source| database_error("decode_provider_session_scope", source))?;
-        if !has_scope_binding
-            && !has_fork_metadata
-            && requirement == ProviderSessionScopeRequirement::ExistingConversation
-        {
+    facts.authorize(required, encryptor, requirement)
+}
+
+/// Project the same authority evidence into the owned Session read and its
+/// transaction-locked reread. The manifest lookup uses the exact fork key.
+pub(crate) fn push_provider_session_scope(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+) {
+    query.push("JSON_EXTRACT(`metadata`, '$.__astra_provider_scope_proof_v1') IS NOT NULL AS has_scope_binding,
+                JSON_EXTRACT(`metadata`, '$.__astra_provider_memory_scope_proof_v1') IS NOT NULL AS has_memory_scope_binding,
+                JSON_EXTRACT(`metadata`, '$.fork_id') IS NOT NULL AS has_fork_metadata,
+                CASE WHEN OCTET_LENGTH(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.__astra_provider_scope_proof_v1'))) = 43
+                     THEN JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.__astra_provider_scope_proof_v1'))
+                     ELSE NULL END AS scope_proof, ");
+    let legacy = legacy_moi_session_namespace(user_id);
+    if legacy {
+        query.push("CASE WHEN JSON_EXTRACT(`metadata`, '$.__astra_provider_memory_scope_proof_v1') IS NOT NULL THEN ");
+    }
+    query
+        .push(
+            "(SELECT CAST(f.manifest_json AS CHAR) FROM session_forks f
+                 WHERE f.isolation_domain = 'server' AND f.owner_user_id = ",
+        )
+        .push_bind(user_id.to_owned())
+        .push(" AND f.child_session_id = ")
+        .push_bind(session_id.to_owned())
+        .push(" AND f.child_branch_id = 'main')");
+    if legacy {
+        query.push(" END");
+    }
+    query.push(" AS scope_manifest");
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSessionScopeFacts {
+    user_id: String,
+    session_id: String,
+    has_memory_scope_binding: bool,
+    has_scope_binding: bool,
+    has_fork_metadata: bool,
+    scope_proof: Option<String>,
+    scope_manifest: Option<String>,
+}
+
+impl ProviderSessionScopeFacts {
+    pub(crate) fn from_row(
+        row: &sqlx::mysql::MySqlRow,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            user_id: user_id.to_owned(),
+            session_id: session_id.to_owned(),
+            has_memory_scope_binding: row.try_get("has_memory_scope_binding")?,
+            has_scope_binding: row.try_get("has_scope_binding")?,
+            has_fork_metadata: row.try_get("has_fork_metadata")?,
+            scope_proof: row.try_get("scope_proof")?,
+            scope_manifest: row.try_get("scope_manifest")?,
+        })
+    }
+
+    pub(crate) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
+        self.user_id == user_id && self.session_id == session_id
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        required: Option<&crate::runs::ProviderRunOwner>,
+        encryptor: Option<&crate::auth::FernetTokenEncryptor>,
+        requirement: ProviderSessionScopeRequirement,
+    ) -> Result<(), SessionForkCoordinatorError> {
+        let user_id = self.user_id.as_str();
+        let session_id = self.session_id.as_str();
+        if legacy_moi_session_namespace(user_id) && !self.has_memory_scope_binding {
             return Ok(());
         }
-        let proof: Option<String> = row
-            .try_get("scope_proof")
-            .map_err(|source| database_error("decode_provider_session_scope", source))?;
-        return if proof
-            .as_deref()
-            .zip(encryptor)
-            .is_some_and(|(proof, encryptor)| {
-                encryptor.verify_provider_session_scope(
-                    user_id,
-                    session_id,
-                    &owner.provider_id,
-                    &owner.provider_scope_id,
-                    proof,
-                )
-            }) {
-            Ok(())
-        } else {
-            Err(SessionForkCoordinatorError::Forbidden)
+        let Some(raw_manifest) = self.scope_manifest.as_deref() else {
+            let Some(owner) = required else {
+                return if provider_session_namespace(user_id) {
+                    Err(SessionForkCoordinatorError::Forbidden)
+                } else {
+                    Ok(())
+                };
+            };
+            if !self.has_scope_binding
+                && !self.has_fork_metadata
+                && !self.has_memory_scope_binding
+                && requirement == ProviderSessionScopeRequirement::ExistingConversation
+            {
+                return Ok(());
+            }
+            return if self.scope_proof.as_deref().zip(encryptor).is_some_and(
+                |(proof, encryptor)| {
+                    encryptor.verify_provider_session_scope(
+                        user_id,
+                        session_id,
+                        &owner.provider_id,
+                        &owner.provider_scope_id,
+                        proof,
+                    )
+                },
+            ) {
+                Ok(())
+            } else {
+                Err(SessionForkCoordinatorError::Forbidden)
+            };
         };
-    };
-    let manifest: SessionForkManifestV1 = serde_json::from_str(&raw_manifest)
-        .map_err(|error| SessionForkCoordinatorError::NeedsRepair(error.to_string()))?;
-    validate_stored_manifest(&manifest, &manifest.parent_key)?;
-    if manifest.child_key != key {
-        return Err(SessionForkCoordinatorError::Forbidden);
-    }
-    if let Some(owner) = manifest.provider_owner.as_ref() {
-        if required != Some(owner) || manifest.state != SessionForkStateV1::Active {
+        let manifest: SessionForkManifestV1 = serde_json::from_str(raw_manifest)
+            .map_err(|error| SessionForkCoordinatorError::NeedsRepair(error.to_string()))?;
+        validate_stored_manifest(&manifest, &manifest.parent_key)?;
+        if manifest.child_key != SessionKeyV1::owner_session("server", user_id, session_id, "main")
+        {
             return Err(SessionForkCoordinatorError::Forbidden);
         }
-    } else if required.is_some() || provider_session_namespace(user_id) {
-        // A provider fork without retained scope cannot be claimed by the
-        // first request, regardless of which provider credential was used.
-        return Err(SessionForkCoordinatorError::Forbidden);
+        if let Some(owner) = manifest.provider_owner.as_ref() {
+            if required != Some(owner) || manifest.state != SessionForkStateV1::Active {
+                return Err(SessionForkCoordinatorError::Forbidden);
+            }
+        } else if required.is_some() || provider_session_namespace(user_id) {
+            // A provider fork without retained scope cannot be claimed by the
+            // first request, regardless of which provider credential was used.
+            return Err(SessionForkCoordinatorError::Forbidden);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 async fn insert_fork_child_session(
@@ -1683,6 +1739,30 @@ mod tests {
 
     use super::*;
     use crate::{DatabaseSessionContextCoordinator, ReserveTurnOutcome, SessionContextCoordinator};
+
+    #[test]
+    fn partial_memory_binding_cannot_use_legacy_chat_admission() {
+        let mut facts = ProviderSessionScopeFacts {
+            user_id: "external_authorized:moi:example".into(),
+            session_id: "session".into(),
+            has_memory_scope_binding: false,
+            has_scope_binding: false,
+            has_fork_metadata: false,
+            scope_proof: None,
+            scope_manifest: None,
+        };
+        let owner = crate::runs::ProviderRunOwner {
+            provider_id: "moi".into(),
+            provider_scope_id: "workspace".into(),
+        };
+        let requirement = ProviderSessionScopeRequirement::ExistingConversation;
+        assert!(facts.authorize(Some(&owner), None, requirement).is_ok());
+        facts.has_memory_scope_binding = true;
+        assert!(matches!(
+            facts.authorize(Some(&owner), None, requirement),
+            Err(SessionForkCoordinatorError::Forbidden)
+        ));
+    }
 
     static FORK_SCHEMA: OnceCell<()> = OnceCell::const_new();
 

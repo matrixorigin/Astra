@@ -4,6 +4,10 @@
 //! Recovery and normal chat share this baseline; updating it requires reviewing
 //! the MOI wire contract, not adapting expectations to an Astra API change.
 
+#[allow(dead_code)] // Timing fields are consumed by chat_sql_budget.
+#[path = "support/sql_capture.rs"]
+mod sql_capture;
+
 use astra_core::config::{AppSettings, ProviderRequestAuthConfig};
 use astra_runtime::server::provider_test_support::openai_response;
 use astra_runtime::{build_app, build_server_state};

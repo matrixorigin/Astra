@@ -9,7 +9,10 @@ mod test_support;
 use harness::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+#[path = "support/sql_capture.rs"]
+mod sql_capture;
+use sql_capture::{ObservedSql, SqlCapture};
+use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 
 /// The run drain does not own the detached observer. Its completion counter is
@@ -141,36 +144,6 @@ async fn prime_chat_pool(ctx: &MatrixE2eCtx) {
     .expect("initialize and return the chat-pool reserve before SQL capture");
 }
 
-#[derive(Default)]
-struct Statement(String, f64);
-
-impl tracing::field::Visit for Statement {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "db.statement" && !value.trim().is_empty() {
-            self.0 = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        } else if field.name() == "summary" && self.0.is_empty() {
-            self.0 = value.to_owned();
-        }
-    }
-
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        if field.name() == "elapsed_secs" {
-            self.1 = value;
-        }
-    }
-
-    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-}
-
-struct ObservedSql {
-    sql: String,
-    elapsed: std::time::Duration,
-    finished_at: std::time::Instant,
-}
-
-#[derive(Clone, Default)]
-struct SqlCapture(Arc<Mutex<Option<Vec<ObservedSql>>>>);
-
 // This ordinary-chat probe owns sequential opening/terminal transactions.
 // If a scenario introduces overlapping transactions, report the ambiguity
 // instead of attributing concurrent connection events to the wrong owner.
@@ -212,24 +185,6 @@ fn transaction_windows(samples: &[ObservedSql]) -> Value {
         }
     }
     json!({"windows":windows,"open_transaction":active.is_some()})
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() != "sqlx::query" {
-            return;
-        }
-        let mut guard = self.0.lock().unwrap();
-        if let Some(statements) = guard.as_mut() {
-            let mut statement = Statement::default();
-            event.record(&mut statement);
-            statements.push(ObservedSql {
-                sql: statement.0,
-                elapsed: std::time::Duration::from_secs_f64(statement.1),
-                finished_at: std::time::Instant::now(),
-            });
-        }
-    }
 }
 
 const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, last_guidance_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";

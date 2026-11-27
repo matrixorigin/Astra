@@ -259,6 +259,17 @@ pub trait SessionService: Send + Sync {
         self.get_session(session_id, user_id).await
     }
 
+    async fn get_session_for_provider_request_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.get_session_for_provider_request(session_id, user_id)
+            .await
+            .map(|session| (session, None))
+    }
+
     async fn update_session(
         &self,
         session_id: String,
@@ -772,7 +783,12 @@ impl DatabaseSessionService {
                     ));
                 }
                 let (record, admission_facts) = self
-                    .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
+                    .fetch_session_for_user_with_admission_facts(
+                        &mut *tx,
+                        &session_id,
+                        &user_id,
+                        false,
+                    )
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
                 // Replaying the same deterministic creation intent may read
@@ -843,7 +859,7 @@ impl DatabaseSessionService {
         // session. Keep database-generated fields, but only return after commit
         // succeeds so a commit failure cannot be reported as successful creation.
         let (record, admission_facts) = self
-            .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
+            .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id, false)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
         debug_assert_eq!(admission_facts.active_plan_id, None);
@@ -876,7 +892,7 @@ impl DatabaseSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
-        self.fetch_session_for_user_with_admission_facts(executor, session_id, user_id)
+        self.fetch_session_for_user_with_admission_facts(executor, session_id, user_id, false)
             .await
             .map(|record| record.map(|(session, _)| session))
     }
@@ -886,6 +902,7 @@ impl DatabaseSessionService {
         executor: impl sqlx::Executor<'_, Database = MySql>,
         session_id: &str,
         user_id: &str,
+        include_scope: bool,
     ) -> Result<Option<(SessionRecord, SessionAdmissionFacts)>, (StatusCode, Json<ErrorResponse>)>
     {
         let mut select = QueryBuilder::<MySql>::new(
@@ -894,9 +911,17 @@ impl DatabaseSessionService {
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
              DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
-             IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM ",
+             IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json",
         );
+        if include_scope {
+            select.push(", ");
+            crate::session_fork_coordinator::push_provider_session_scope(
+                &mut select,
+                user_id,
+                session_id,
+            );
+        }
+        select.push(" FROM ");
         push_session_activity_source(&mut select, user_id);
         select
             .push(" WHERE session_id = ")
@@ -911,8 +936,22 @@ impl DatabaseSessionService {
             return Ok(None);
         };
         let active_plan_id = row.try_get("active_plan_id").map_err(internal_error)?;
+        let provider_scope = include_scope
+            .then(|| {
+                crate::session_fork_coordinator::ProviderSessionScopeFacts::from_row(
+                    &row, user_id, session_id,
+                )
+            })
+            .transpose()
+            .map_err(internal_error)?;
         let session = session_record_from_row(row)?;
-        Ok(Some((session, SessionAdmissionFacts { active_plan_id })))
+        Ok(Some((
+            session,
+            SessionAdmissionFacts {
+                active_plan_id,
+                provider_scope,
+            },
+        )))
     }
 
     async fn delete_session_lifecycle(
@@ -1217,7 +1256,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
     {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        self.fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id)
+        self.fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id, false)
             .await?
             .map(|(session, facts)| (session, Some(facts)))
             .ok_or_else(|| {
@@ -1233,13 +1272,29 @@ impl SessionService for DatabaseSessionService {
         session_id: String,
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        match self.get_session(session_id.clone(), user_id).await {
-            Ok(session) => Ok(session),
-            Err(error) if error.0 == StatusCode::NOT_FOUND => {
-                // Only the failed lookup needs classification. Do not turn a
-                // hidden foreign session or a database failure into permission
-                // to rebuild a conversation on the provider's side.
-                let pool = self.get_pool().await.map_err(internal_error)?;
+        self.get_session_for_provider_request_with_admission_facts(session_id, user_id)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    async fn get_session_for_provider_request_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let record = self
+            .fetch_session_for_user_with_admission_facts(
+                &pool,
+                &session_id,
+                &user_id,
+                crate::session_fork_coordinator::legacy_moi_session_namespace(&user_id),
+            )
+            .await?;
+        match record {
+            Some((session, facts)) => Ok((session, Some(facts))),
+            None => {
                 let exists = query("SELECT 1 FROM agent_sessions WHERE session_id = ? LIMIT 1")
                     .bind(&session_id)
                     .fetch_optional(&pool)
@@ -1247,7 +1302,10 @@ impl SessionService for DatabaseSessionService {
                     .map_err(internal_error)?
                     .is_some();
                 if exists {
-                    Err(error)
+                    Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Session {session_id} 不存在"),
+                    ))
                 } else {
                     Err(error_response_coded(
                         StatusCode::NOT_FOUND,
@@ -1256,7 +1314,6 @@ impl SessionService for DatabaseSessionService {
                     ))
                 }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1291,7 +1348,7 @@ impl SessionService for DatabaseSessionService {
         if let Some(owner) = provider_owner {
             // The scope lookup establishes row existence and ownership in the
             // same read. The existing write fence still guards the mutation.
-            crate::session_fork_coordinator::authorize_provider_session_update(
+            crate::session_fork_coordinator::authorize_existing_provider_session(
                 &pool,
                 &user_id,
                 &session_id,

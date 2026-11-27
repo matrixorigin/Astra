@@ -380,6 +380,10 @@ Workspace-wide proxy operations without a Session use the verified token's
 workspace and still check current IAM grants. Reflection needs both grants,
 and write-only responses expose bounded receipts. The legacy Session update
 route also verifies the workspace before closing a memory-bound Session.
+For a fresh independent Run in an existing MOI Edge Session, chat preflight
+checks the scope from the owned Session read. Run insertion checks it again
+from the locked Session row. Neither check resolves memory IAM grants.
+Status and finalize verify the existing Session and workspace in one read.
 The MOI caller must invoke close/finalize for session-end maintenance.
 
 The identity callback has a two-second request deadline including response-body
