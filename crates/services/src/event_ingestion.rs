@@ -44,8 +44,7 @@ use measurement::{
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::observation_capture::{
-    DurableCaptureOutcome, ObservationCollisionReceipt, canonical_agent_event_payload_hash,
-    classify_capture, record_observation_collisions,
+    DurableCaptureOutcome, canonical_agent_event_payload_hash, classify_capture,
 };
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
@@ -84,7 +83,6 @@ pub const DEFAULT_INGESTION_DB_ATTEMPT_TIMEOUT_SECS: u64 = 30;
 const DISCONNECTED_PENDING_DEFERRAL_LIMIT: usize = 1;
 const TELEMETRY_CHANNEL_RESERVE_DIVISOR: usize = 10;
 const MIN_SHARED_POOL_CONNECTION_RESERVE: usize = 2;
-const AGENT_EVENT_COLLISION_SOURCE: &str = "event_ingestion";
 const INGESTION_LATENCY_BUCKET_UPPER_US: [u64; 16] = [
     1_000,
     2_000,
@@ -2828,7 +2826,6 @@ impl EventIngestionWorker {
         let mut inserted_events = Vec::new();
         let mut replayed_events = 0_usize;
         let mut collision_events = 0_usize;
-        let mut collision_receipts = Vec::new();
         for (values, outcome) in event_rows.iter().zip(&capture_outcomes) {
             match outcome {
                 DurableCaptureOutcome::Inserted => inserted_events.push(values.event),
@@ -2840,14 +2837,6 @@ impl EventIngestionWorker {
                     attempted_payload_hash,
                 } => {
                     collision_events = collision_events.saturating_add(1);
-                    collision_receipts.push(ObservationCollisionReceipt {
-                        user_id: &values.event.user_id,
-                        identity_id: &values.event.event_id,
-                        session_id: &values.event.session_id,
-                        stored_payload_hash,
-                        attempted_payload_hash,
-                        source: AGENT_EVENT_COLLISION_SOURCE,
-                    });
                     tracing::warn!(
                         target: "astra_services::event_ingestion",
                         user_id = %values.event.user_id,
@@ -2855,15 +2844,11 @@ impl EventIngestionWorker {
                         event_id = %values.event.event_id,
                         stored_payload_hash = %stored_payload_hash,
                         attempted_payload_hash = %attempted_payload_hash,
-                        "event identity collision recorded without applying derived effects"
+                        "event identity collision rejected"
                     );
                 }
             }
         }
-
-        record_observation_collisions(&mut tx, &collision_receipts)
-            .await
-            .map_err(|error| format!("record event identity collisions: {error}"))?;
 
         let inserted_event_count = u64::try_from(inserted_events.len())
             .map_err(|_| "event_ingestion.inserted_events: len exceeds u64::MAX".to_string())?;

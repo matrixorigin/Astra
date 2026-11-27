@@ -208,10 +208,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
     },
     SessionDeleteStatement {
-        label: "observation_identity_collisions",
-        sql: "DELETE FROM observation_identity_collisions WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "workspace_records",
         sql: "DELETE FROM workspace_records WHERE session_id = ? AND owner_id = ?",
     },
@@ -290,13 +286,6 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: "DELETE FROM inference_invocations
              WHERE session_id = ? AND user_id = ?
              ORDER BY created_at ASC, invocation_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "inference_routes",
-        sql: "DELETE FROM inference_routes
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY created_at ASC, route_id ASC
              LIMIT ?",
     },
     SessionBatchDeleteStatement {
@@ -1491,7 +1480,6 @@ mod tests {
                 "inference_invocation_settlement_debts",
                 "inference_invocations",
                 "inference_provider_attempts",
-                "inference_routes",
                 "model_request_context_events",
             ])
         );

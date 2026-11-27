@@ -990,7 +990,7 @@ The usage tree exposes the actual route and cost of background and delegated inf
 
 ## Resolved route
 
-For each inference, Server persists an immutable route before provider execution:
+Before provider execution, Server stores the immutable admitted route on the invocation row.
 
 ```rust
 struct ResolvedInferenceRoute {
@@ -1899,7 +1899,7 @@ Each inference boundary performs:
 3. Revalidate principal binding, definition/access revisions, policy, purpose, capabilities, data boundary, and reachability.
 4. Resolve the exact connection, credential owner, billing owner, and execution placement.
 5. Reserve budget and concurrency capacity.
-6. Persist the route, admitted invocation, and provider-attempt identity.
+6. Persist the invocation with its admitted route and the provider-attempt identity.
 7. Materialize short-lived credential data inside the selected executor.
 8. Execute and stream typed events with bounded backpressure.
 9. Persist provider request identity, usage, cost, and terminal state.

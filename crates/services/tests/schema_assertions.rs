@@ -796,6 +796,8 @@ async fn schema_rationalization_runtime_contract() {
         "model_request_metric_shards",
         "semantic_read_observations",
         "semantic_read_observation_budgets",
+        "observation_identity_collisions",
+        "inference_routes",
         "prompt_chunks",
         "harness_sources",
         "harness_decisions",
@@ -2247,43 +2249,6 @@ async fn transcript_source_identity_is_collation_unique_and_owner_session_scoped
         .execute(pool.get())
         .await
         .unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn observation_collision_schema_contract() {
-    let pool = common::setup_pool().await;
-    let schema = current_schema(&pool).await;
-    let collisions = column_names(&pool, &schema, "observation_identity_collisions").await;
-    for expected in [
-        "user_id",
-        "identity_kind",
-        "identity_id",
-        "stored_payload_hash",
-        "attempted_payload_hash",
-        "collision_count",
-        "expires_at",
-    ] {
-        assert!(
-            collisions.iter().any(|column| column == expected),
-            "observation_identity_collisions missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "observation_identity_collisions").await,
-        ["user_id", "identity_kind", "identity_id"],
-        "collision receipts must have one bounded row per tenant-scoped identity"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "observation_identity_collisions",
-            "idx_observation_collisions_expiry"
-        )
-        .await,
-        ["expires_at", "user_id", "identity_kind", "identity_id"]
-    );
 }
 
 #[tokio::test]

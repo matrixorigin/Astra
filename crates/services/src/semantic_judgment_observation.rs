@@ -1430,8 +1430,6 @@ pub fn apply_semantic_execution_capture(
             });
             let identity_conflict = facts.iter().any(|fact| {
                 fact.invocation_session_id.as_deref() != Some(session_id)
-                    || fact.route_session_id.as_deref() != Some(session_id)
-                    || fact.route_run_id != fact.invocation_run_id
                     || fact.attempt_session_id.as_deref() != Some(session_id)
                     || fact.attempt_run_id != fact.invocation_run_id
             }) || route_provider.as_deref().is_none_or(str::is_empty)
@@ -1657,8 +1655,6 @@ mod tests {
             invocation_run_id: Some(run_id.into()),
             invocation_turn: Some(i64::from(turn)),
             invocation_round: Some(i64::from(round)),
-            route_session_id: Some("session-1".into()),
-            route_run_id: Some(run_id.into()),
             route_provider: Some("deepseek".into()),
             attempt_id: attempt_id.into(),
             attempt_index: i64::from(attempt_index),
@@ -1807,8 +1803,6 @@ mod tests {
                 invocation_run_id: Some("run-1".into()),
                 invocation_turn: Some(2),
                 invocation_round: Some(3),
-                route_session_id: Some("session-1".into()),
-                route_run_id: Some("run-1".into()),
                 route_provider: Some("deepseek".into()),
                 attempt_id: "attempt-1".into(),
                 attempt_index: 0,

@@ -852,7 +852,6 @@ async fn sustained_ingestion_capacity() {
     };
     output.as_object_mut().unwrap().extend(metrics);
     for query in [
-        "DELETE FROM observation_identity_collisions WHERE user_id LIKE ?",
         "DELETE FROM agent_event_edges WHERE user_id LIKE ?",
         "DELETE FROM agent_events WHERE user_id LIKE ?",
         "DELETE FROM agent_session_lifecycle_fences WHERE user_id LIKE ?",

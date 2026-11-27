@@ -719,24 +719,16 @@ mod tests {
         .expect("decode event count");
         assert_eq!(actual_events, 2);
 
-        let collision_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM observation_identity_collisions \
-             WHERE user_id = ? AND identity_kind = 'agent_event'",
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM agent_events WHERE user_id = ? AND event_id = ?",
         )
         .bind(&user_id)
+        .bind(&aux_duplicate_event_id)
         .fetch_one(&pool)
         .await
-        .expect("count hash-fenced writer collisions");
-        assert_eq!(
-            collision_count, 1,
-            "changed auxiliary stable IDs must be classified as collisions"
-        );
+        .expect("read original auxiliary event");
+        assert_eq!(content, "first duplicate");
 
-        sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup event writer collision receipts");
         sqlx::query("DELETE FROM agent_event_edges WHERE session_id = ? AND user_id = ?")
             .bind(&session_id)
             .bind(&user_id)
