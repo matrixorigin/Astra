@@ -21,8 +21,8 @@ pub fn path_matches_skill(file_path: &str, skill: &SkillManifest) -> bool {
 
 /// Simplified glob matching supporting `*` and `**`.
 fn glob_match(pattern: &str, path: &str) -> bool {
-    let pattern_parts: Vec<&str> = pattern.split('/').collect();
-    let path_parts: Vec<&str> = path.split('/').collect();
+    let pattern_parts: Vec<&str> = pattern.trim_start_matches("./").split('/').collect();
+    let path_parts: Vec<&str> = path.trim_start_matches("./").split('/').collect();
     glob_match_parts(&pattern_parts, &path_parts)
 }
 
@@ -50,18 +50,32 @@ fn glob_match_parts(pattern: &[&str], path: &[&str]) -> bool {
     }
 }
 
+/// Match one path segment against a pattern where `*` matches any run of
+/// characters within the segment and `?` matches exactly one character.
 fn segment_matches(pattern: &str, segment: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = segment.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((star_pi, star_ti)) = star {
+            pi = star_pi + 1;
+            ti = star_ti + 1;
+            star = Some((star_pi, star_ti + 1));
+        } else {
+            return false;
+        }
     }
-    // Support *.ext patterns
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return segment.ends_with(suffix);
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return segment.starts_with(prefix);
-    }
-    pattern == segment
+    pi == pat.len()
 }
 
 /// Tracks which conditional skills have been activated.
@@ -155,6 +169,26 @@ mod tests {
         assert!(glob_match("**/*.rs", "src/main.rs"));
         assert!(glob_match("**/*.rs", "a/b/c/d.rs"));
         assert!(!glob_match("**/*.rs", "file.py"));
+    }
+
+    #[test]
+    fn glob_match_wildcards_inside_a_segment() {
+        assert!(glob_match("**/*.test.*", "src/app/button.test.tsx"));
+        assert!(glob_match(
+            "**/*_test*.go",
+            "pkg/store/store_test_helpers.go"
+        ));
+        assert!(glob_match("migrations/*_*.sql", "migrations/0001_init.sql"));
+        assert!(glob_match("src/mod?.rs", "src/mod1.rs"));
+        assert!(!glob_match("**/*.test.*", "src/app/button.tsx"));
+        assert!(!glob_match("src/*.rs", "src/sub/main.rs"));
+        assert!(!glob_match("src/mod?.rs", "src/mod12.rs"));
+    }
+
+    #[test]
+    fn glob_match_ignores_leading_current_dir() {
+        assert!(glob_match("src/**/*.rs", "./src/main.rs"));
+        assert!(glob_match("./src/**/*.rs", "src/main.rs"));
     }
 
     #[test]
