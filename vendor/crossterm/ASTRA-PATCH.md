@@ -2,8 +2,9 @@
 
 Base: crossterm 0.29.0, as published on crates.io (MIT; see LICENSE).
 The package records upstream commit 36d95b26a26e64b0f8c12edfe11f410a6d56a812.
-This directory is a local dependency patch, not a new upstream release.
-The application must not depend on a modified Cargo registry cache.
+Astra uses private version `0.29.1` for this patch and pins the CLI directly to
+this directory. The version distinguishes the timed-input API from earlier
+`0.29.0` builds. The workspace patch keeps the TUI backend on the same source.
 
 ## Review fixes
 

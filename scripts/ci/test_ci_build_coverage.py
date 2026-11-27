@@ -397,6 +397,12 @@ rm() {
             self.assertIn(required, step)
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
+        cli = ROOT / "crates/astra-cli"
+        vendored = ROOT / "vendor/crossterm"
+        dependency = tomllib.loads((cli / "Cargo.toml").read_text())["dependencies"]["crossterm"]
+        version = tomllib.loads((vendored / "Cargo.toml").read_text())["package"]["version"]
+        self.assertEqual((cli / dependency["path"]).resolve(), vendored)
+        self.assertEqual(dependency["version"], f"={version}")
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         lanes = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
         self.assertIn("run-macos-lanes.sh vendored", workflow)
