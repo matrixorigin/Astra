@@ -123,6 +123,7 @@ jobs:
           or test(=unknown_root_message_can_be_rechecked_after_turn_completion)
           or test(=unknown_root_message_is_read_only_while_receipt_is_pending)
           or test(=old_root_receipt_is_visible_during_a_quiet_next_turn)
+          or test(=exit_during_unbound_turn_reconciles_the_exact_run)
           or test(=guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes)
           or test(=completed_turn_does_not_restart_when_background_shell_finishes)
           or test(=active_turn_guidance_preserves_order_and_steers_queued_turns)

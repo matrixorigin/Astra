@@ -2674,9 +2674,9 @@ async fn exit_during_unbound_turn_reconciles_the_exact_run() {
         tokio::task::yield_now().await;
     }
     astra.write(&[0x0f]);
-    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x0f]);
-    astra.wait_for_absent("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit("/exit");
     astra.wait_for_screen("exit or stopping", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("Stopping") || screen.contains("Exiting")
