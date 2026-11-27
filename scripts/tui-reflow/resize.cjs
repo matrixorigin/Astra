@@ -71,10 +71,8 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       if (tracingResize) snapshot('output');
     });
   });
-  const lines = () => {
-    const buffer = terminal.buffer.active;
-    return Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i).translateToString(true));
-  };
+  const lines = (buffer = terminal.buffer.active) =>
+    Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i).translateToString(true));
   function snapshot(label) {
     const b = terminal.buffer.active;
     trace.push({label, elapsedMs: Date.now() - started, size: [terminal.cols, terminal.rows], base: b.baseY,
@@ -202,20 +200,23 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
         'baseline history must be visible before opening the panel');
       const openContext = async () => {
         send({ input: '\x1b[200~/context\x1b[201~\r' });
-        await waitFor(() => visible().some(line => line.includes('Esc close')));
+        await waitFor(() => terminal.buffer.active.type === 'alternate' &&
+          visible().some(line => line.startsWith('┌ Context')));
         await settle();
-        assert.equal(terminal.buffer.active.type, 'alternate');
       };
       const closeContext = async (label) => {
+        const isContextNote = line => line.includes('Opened context panel');
+        const previousNotes = lines(terminal.buffer.normal).filter(isContextNote).length;
         send({ input: '\x1b' });
-        await waitFor(() => visible().some(line => line.includes('Opened context panel')) &&
+        await waitFor(() => terminal.buffer.active.type === 'normal' &&
+          lines().filter(isContextNote).length > previousNotes &&
           visible().some(line => line.includes('Message Astra')));
         await settle();
         const screen = visible();
-        const note = screen.findIndex(line => line.includes('Opened context panel'));
+        const note = screen.findLastIndex(isContextNote);
         const prompt = screen.findIndex(line => line.includes('Message Astra'));
-        assert(prompt > note && prompt - note <= 4, 'blank gap on return:\n' + screen.join('\n'));
-        assert.equal(terminal.buffer.active.type, 'normal');
+        assert(note >= 0 && prompt > note && prompt - note <= 4,
+          'blank gap on return:\n' + screen.join('\n'));
         check(label);
       };
       await openContext();

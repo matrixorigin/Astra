@@ -365,22 +365,27 @@ impl TerminalGuard {
                 .inline_recovery_deadline
                 .get_or_insert(now + Duration::from_millis(500));
             if now >= *deadline {
-                // Retire the one painted footer before giving up its geometry.
                 // The reader keeps the unanswered cursor request quarantined.
-                self.terminal.clear_inline_from_cursor()?;
-                self.terminal.set_viewport_area(ratatui::layout::Rect::new(
-                    0,
-                    size.height,
-                    size.width,
-                    0,
-                ));
-                self.terminal
-                    .set_cursor_position(ratatui::layout::Position::new(
+                if size == self.terminal.last_known_screen_size {
+                    // Reflow can restore the old frame's geometry while
+                    // leaving the cursor displaced. Repaint the old footprint.
+                    self.clear_viewport_from = Some(self.terminal.viewport_area.top());
+                } else {
+                    self.terminal.clear_inline_from_cursor()?;
+                    self.terminal.set_viewport_area(ratatui::layout::Rect::new(
                         0,
-                        size.height.saturating_sub(1),
-                    ))?;
+                        size.height,
+                        size.width,
+                        0,
+                    ));
+                    self.terminal
+                        .set_cursor_position(ratatui::layout::Position::new(
+                            0,
+                            size.height.saturating_sub(1),
+                        ))?;
+                    self.clear_viewport_from = None;
+                }
                 self.terminal.resize(size)?;
-                self.clear_viewport_from = None;
                 self.clipped_reflow_below_cursor = None;
                 self.unreconciled_width = false;
                 self.inline_recovery_deadline = None;

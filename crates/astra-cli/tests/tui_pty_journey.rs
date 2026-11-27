@@ -3975,6 +3975,9 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.write(b"\t");
     astra.write(b"e"); // A hidden Tab must leave the cursor inside the draft.
     astra.wait_for("› delet", UI_TRANSITION_TIMEOUT);
+    // Keep the next Tab separate from the last character. A Tab arriving
+    // within the raw paste-detection interval is literal input.
+    tokio::time::sleep(Duration::from_millis(25)).await;
 
     astra.resize(30, 100);
     astra.wait_for_screen(
@@ -3999,7 +4002,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("│› keep this draft", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x12]); // Ctrl+R keeps the explicit reverse search.
     astra.wait_for("(reverse-i-search)", UI_TRANSITION_TIMEOUT);
-    astra.write(b"deleg");
+    astra.write(b"\x1b[200~deleg\x1b[201~");
     astra.wait_for_screen(
         "explicit reverse search result",
         UI_TRANSITION_TIMEOUT,
@@ -4038,7 +4041,8 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
             })
     });
     astra.record_frame("Live run transcript");
-    astra.write(b"/child_evidence_visible");
+    astra.write(b"/");
+    astra.write(b"\x1b[200~child_evidence_visible\x1b[201~");
     astra.wait_for("Search: /child_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for_screen(

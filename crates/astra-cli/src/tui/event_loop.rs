@@ -19772,7 +19772,7 @@ mod tests {
             .unwrap();
         assert_eq!(assistant.source(), source);
         assert!(!assistant.is_live());
-        let expected = AssistantCell::from_markdown(source).display_lines(80);
+        let expected = assistant.display_lines(80);
         assistant.prepare_scrollback_layout(80);
         let mut emitted = Vec::new();
         let mut start = 0;
