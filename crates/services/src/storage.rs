@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-27-v128";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-28-v129";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -2605,6 +2605,9 @@ fn inference_invocation_schema_mismatches(
     columns: &BTreeMap<String, ObservedColumnShape>,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    if columns.contains_key("route_id") {
+        reasons.push("obsolete column route_id".to_string());
+    }
     for (name, expected_type, expected_width) in [
         ("admission_token", "char", Some(32_i64)),
         ("owner_token", "char", Some(32_i64)),
@@ -2650,7 +2653,7 @@ async fn verify_inference_invocation_schema_contract(
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
            AND COLUMN_NAME IN ('admission_token', 'owner_token', 'owner_generation',
                                'owner_lease_expires_at', 'usage_status',
-                               'provider_delivery_state')",
+                               'provider_delivery_state', 'route_id')",
     )
     .bind(database)
     .bind(table)
@@ -3953,32 +3956,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
-
-    core_schema_create!(
-        pool,
-        "observation_identity_collisions",
-        "CREATE TABLE IF NOT EXISTS observation_identity_collisions (
-            user_id VARCHAR(128) NOT NULL,
-            identity_kind VARCHAR(32) NOT NULL,
-            identity_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NULL,
-            stored_payload_hash VARCHAR(80) NOT NULL,
-            attempted_payload_hash VARCHAR(80) NOT NULL,
-            source VARCHAR(64) NOT NULL,
-            collision_count BIGINT UNSIGNED NOT NULL DEFAULT 1,
-            first_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            last_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            expires_at DATETIME(6) NOT NULL,
-            PRIMARY KEY (user_id, identity_kind, identity_id),
-            INDEX idx_observation_collisions_owner_seen (user_id, last_seen_at),
-            INDEX idx_observation_collisions_owner_session_seen (user_id, session_id, last_seen_at),
-            INDEX idx_observation_collisions_expiry (expires_at, user_id, identity_kind, identity_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── State projection v1 (Phase 4 / G2+G4+G5+G6+G14+G16+G20) ────────
 
     core_schema_create!(
@@ -4051,44 +4028,11 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // Canonical inference execution ledger. Admission writes the immutable route
-    // and logical invocation together; each physical attempt is then committed
-    // before its provider I/O. Route rows contain no credential or endpoint
-    // material and remain safe to project after execution.
-    core_schema_create!(pool, "inference_routes",
-        "CREATE TABLE IF NOT EXISTS inference_routes (
-            route_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            scope_kind VARCHAR(16) NOT NULL,
-            run_id VARCHAR(64) NULL,
-            offering_id VARCHAR(64) NOT NULL,
-            resolved_model_name VARCHAR(255) NOT NULL,
-            upstream_model_name VARCHAR(255) NOT NULL,
-            provider VARCHAR(64) NOT NULL,
-            execution_placement VARCHAR(32) NOT NULL,
-            access_kind VARCHAR(32) NOT NULL,
-            purpose VARCHAR(64) NOT NULL,
-            price_snapshot_json JSON NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, route_id),
-            CONSTRAINT chk_inference_routes_scope_kind
-                CHECK (scope_kind IN ('run', 'session')),
-            CONSTRAINT chk_inference_routes_scope_owner
-                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
-                    OR (scope_kind = 'session' AND run_id IS NULL)),
-            INDEX idx_inference_routes_owner_session_created (user_id, session_id, created_at, route_id),
-            INDEX idx_inference_routes_owner_run_created (user_id, run_id, created_at, route_id),
-            INDEX idx_inference_routes_offering_created (offering_id, created_at, route_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
+    // The invocation row freezes its admitted route and price. Each physical
+    // delivery attempt commits before provider I/O and references this row.
     core_schema_create!(pool, "inference_invocations",
         "CREATE TABLE IF NOT EXISTS inference_invocations (
             invocation_id VARCHAR(64) NOT NULL,
-            route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             scope_kind VARCHAR(16) NOT NULL,
@@ -4102,6 +4046,13 @@ async fn ensure_core_schema_while_leased(
             operation_id VARCHAR(64) NOT NULL,
             logical_attempt BIGINT NOT NULL,
             purpose VARCHAR(64) NOT NULL,
+            offering_id VARCHAR(64) NOT NULL,
+            resolved_model_name VARCHAR(255) NOT NULL,
+            upstream_model_name VARCHAR(255) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            execution_placement VARCHAR(32) NOT NULL,
+            access_kind VARCHAR(32) NOT NULL,
+            price_snapshot_json JSON NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
             usage_status VARCHAR(32) NOT NULL,
@@ -4127,7 +4078,6 @@ async fn ensure_core_schema_while_leased(
                 CHECK (usage_status IN ('provider_exact', 'provider_partial', 'unavailable')),
             CONSTRAINT chk_inference_invocations_delivery_state
                 CHECK (provider_delivery_state IN ('unknown', 'pre_delivery', 'delivery_authorized')),
-            UNIQUE KEY uq_inference_invocation_route (user_id, route_id),
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_turn (user_id, session_id, turn_index, purpose, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
@@ -4358,7 +4308,6 @@ async fn ensure_core_schema_while_leased(
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, registry_id),
             UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
-            INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at),
             INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id),
             INDEX idx_edge_registry_user_workspace_agent (user_id, workspace_id, edge_agent_id)
         )",
@@ -5458,76 +5407,6 @@ async fn verify_core_schema_shape(
     fail_if_obsolete_shape(
         pool,
         database,
-        "observation_identity_collisions",
-        &[
-            "user_id",
-            "identity_kind",
-            "identity_id",
-            "session_id",
-            "stored_payload_hash",
-            "attempted_payload_hash",
-            "source",
-            "collision_count",
-            "first_seen_at",
-            "last_seen_at",
-            "expires_at",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
-        "observation_identity_collisions",
-        &[
-            "stored_payload_hash",
-            "attempted_payload_hash",
-            "collision_count",
-            "first_seen_at",
-            "last_seen_at",
-            "expires_at",
-            "source",
-        ],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        pool,
-        database,
-        "observation_identity_collisions",
-        &[("stored_payload_hash", 80), ("attempted_payload_hash", 80)],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "observation_identity_collisions",
-        "PRIMARY",
-        &["user_id", "identity_kind", "identity_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_observation_collisions_owner_seen",
-            &["user_id", "last_seen_at"][..],
-        ),
-        (
-            "idx_observation_collisions_owner_session_seen",
-            &["user_id", "session_id", "last_seen_at"][..],
-        ),
-        (
-            "idx_observation_collisions_expiry",
-            &["expires_at", "user_id", "identity_kind", "identity_id"][..],
-        ),
-    ] {
-        ensure_index_shape(
-            &indexes,
-            "observation_identity_collisions",
-            index,
-            expected_columns,
-        )?;
-    }
-    fail_if_obsolete_shape(
-        pool,
-        database,
         "agent_event_edges",
         &[
             "user_id",
@@ -5614,13 +5493,6 @@ async fn verify_core_schema_shape(
     fail_if_required_columns_missing_or_nullable(
         pool,
         database,
-        "inference_routes",
-        &["scope_kind"],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
         "inference_invocation_settlement_debts",
         &[
             "usage_status",
@@ -5634,14 +5506,25 @@ async fn verify_core_schema_shape(
         pool,
         database,
         "inference_invocations",
-        &["scope_kind", "operation_id"],
+        &[
+            "scope_kind",
+            "operation_id",
+            "offering_id",
+            "resolved_model_name",
+            "upstream_model_name",
+            "provider",
+            "execution_placement",
+            "access_kind",
+        ],
     )
     .await?;
     verify_inference_invocation_schema_contract(pool, database).await?;
     verify_inference_provider_attempt_schema_contract(pool, database).await?;
     for (table, nullable_columns) in [
-        ("inference_routes", &["run_id"][..]),
-        ("inference_invocations", &["run_id"][..]),
+        (
+            "inference_invocations",
+            &["run_id", "price_snapshot_json"][..],
+        ),
         ("inference_provider_attempts", &["run_id"][..]),
         (
             "inference_invocation_settlement_debts",

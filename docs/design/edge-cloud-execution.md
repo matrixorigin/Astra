@@ -391,6 +391,11 @@ stores the edge dispatch owner, not the session principal that owns the
 and `agent_runs` has a `(user_id, run_id)` primary key. The actual cleanup
 plan depends on MatrixOne's optimizer.
 
+The registry records the last heartbeat on the owner-scoped Edge row. Service
+status orders that owner's records by heartbeat when it reads them. The fresh
+schema keeps the owner and agent keys for lookup, so a periodic heartbeat
+updates one base row without a heartbeat index entry.
+
 Work workspace attestation uses durable relay admission even when the Edge
 socket is local. The relay checks the selected connection incarnation, its
 attestation capability, and its materialization before stripping the marker

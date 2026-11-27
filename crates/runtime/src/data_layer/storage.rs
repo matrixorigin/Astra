@@ -6,8 +6,8 @@ use sqlx::{MySql, QueryBuilder, Row, query};
 use astra_core::canonical_names::{metadata_duration_ms, metadata_tool_name};
 use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_services::observation_capture::{
-    DurableCaptureOutcome, ObservationCollisionReceipt, all_agent_event_rows_were_inserted,
-    canonical_agent_event_payload_hash, classify_capture, record_observation_collisions,
+    DurableCaptureOutcome, all_agent_event_rows_were_inserted, canonical_agent_event_payload_hash,
+    classify_capture,
 };
 use astra_turn_core::contracts::TurnAuxiliaryEventRecord;
 use astra_turn_core::trace_event::TraceEvent;
@@ -181,30 +181,11 @@ pub(crate) async fn classify_agent_event_capture_attempts(
                 stored_payload_hash = %stored_payload_hash,
                 attempted_payload_hash = %attempted_payload_hash,
                 source = collision_source,
-                "agent event identity collision recorded without applying derived effects"
+                "agent event identity collision rejected"
             );
         }
         outcomes.push(outcome);
     }
-    let receipts = attempts
-        .iter()
-        .zip(&outcomes)
-        .filter_map(|(attempt, outcome)| match outcome {
-            DurableCaptureOutcome::Collision {
-                stored_payload_hash,
-                attempted_payload_hash,
-            } => Some(ObservationCollisionReceipt {
-                user_id: attempt.user_id,
-                identity_id: attempt.event_id,
-                session_id: attempt.session_id,
-                stored_payload_hash,
-                attempted_payload_hash,
-                source: collision_source,
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    record_observation_collisions(tx, &receipts).await?;
     Ok(outcomes)
 }
 
@@ -471,10 +452,8 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ASTRA_TEST_DB_IT=1 and MatrixOne"]
-    async fn trace_capture_batch_preserves_mixed_outcomes_and_collision_order() {
+    async fn trace_capture_batch_preserves_mixed_outcomes_without_mutating_events() {
         use super::{DurableCaptureOutcome, insert_trace_events};
-        use sqlx::Row;
-
         assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
         let settings = astra_core::MatrixOneSettings::from_env();
         let catalog =
@@ -514,18 +493,14 @@ mod tests {
             outcome.event_outcomes["first"],
             DurableCaptureOutcome::Collision { .. }
         ));
-        let receipt = sqlx::query("SELECT collision_count, stored_payload_hash, attempted_payload_hash, source FROM observation_identity_collisions WHERE user_id = ?")
-            .bind(&owner).fetch_one(&mut *tx).await.unwrap();
-        assert_eq!(receipt.get::<u64, _>("collision_count"), 130);
-        assert_eq!(
-            receipt.get::<String, _>("stored_payload_hash"),
-            trace_event_payload_hash(&first).unwrap()
-        );
-        assert_eq!(
-            receipt.get::<String, _>("attempted_payload_hash"),
-            trace_event_payload_hash(events.last().unwrap()).unwrap()
-        );
-        assert_eq!(receipt.get::<String, _>("source"), "runtime_trace_event");
+        let stored_hash: String = sqlx::query_scalar(
+            "SELECT payload_hash FROM agent_events WHERE user_id = ? AND event_id = 'first'",
+        )
+        .bind(&owner)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(stored_hash, trace_event_payload_hash(&first).unwrap());
         let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ?")
             .bind(&owner)
             .fetch_one(&mut *tx)
@@ -548,13 +523,12 @@ mod tests {
                 .all(|outcome| *outcome == DurableCaptureOutcome::Replayed)
         );
         tx.rollback().await.unwrap();
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM observation_identity_collisions WHERE user_id = ?",
-        )
-        .bind(&owner)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ?")
+                .bind(&owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(remaining, 0);
         pool.close().await;
     }

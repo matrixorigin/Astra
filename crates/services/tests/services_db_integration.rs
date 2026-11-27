@@ -4772,59 +4772,34 @@ async fn session_audit_prices_historical_physical_attempts_without_catalog_repri
     .expect("insert priced audit event");
 
     let historical_price_snapshot = r#"{"calculation_version":1,"currency":"USD","unit":"per_token","source":"configured","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015,"configuration_updated_at":"2026-09-30"}"#;
-    let route_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
     let invocation_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
-    for (route_id, invocation_id, run_id, operation_id) in [
-        (
-            &route_ids[0],
-            &invocation_ids[0],
-            "audit-root-run",
-            "audit_root_request",
-        ),
-        (
-            &route_ids[1],
-            &invocation_ids[1],
-            "audit-child-run",
-            "audit_child_request",
-        ),
+    for (invocation_id, run_id, operation_id) in [
+        (&invocation_ids[0], "audit-root-run", "audit_root_request"),
+        (&invocation_ids[1], "audit-child-run", "audit_child_request"),
     ] {
         sqlx::query(
-            "INSERT INTO inference_routes \
-             (route_id, user_id, session_id, scope_kind, run_id, offering_id, \
-              resolved_model_name, upstream_model_name, provider, execution_placement, \
-              access_kind, purpose, price_snapshot_json, created_at) \
-             VALUES (?, ?, ?, 'run', ?, 'audit-offering', ?, ?, 'mock', 'server', \
-                     'self_hosted', 'primary_agent', CAST(? AS JSON), NOW(6))",
-        )
-        .bind(route_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .bind(&model_name)
-        .bind(&model_name)
-        .bind(historical_price_snapshot)
-        .execute(&pool)
-        .await
-        .expect("insert historical priced route");
-
-        sqlx::query(
             "INSERT INTO inference_invocations \
-             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, \
+             (invocation_id, user_id, session_id, scope_kind, run_id, \
               admission_token, owner_token, owner_generation, owner_lease_expires_at, \
-              turn_index, round_index, operation_id, logical_attempt, purpose, status, \
-              terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at) \
-             VALUES (?, ?, ?, ?, 'run', ?, ?, ?, 1, DATE_ADD(NOW(6), INTERVAL 60 SECOND), \
-                     1, 0, ?, 0, 'primary_agent', 'succeeded', NULL, \
-                     'provider_exact', 'delivery_authorized', NOW(6), NOW(6))",
+              turn_index, round_index, operation_id, logical_attempt, purpose, offering_id, \
+              resolved_model_name, upstream_model_name, provider, execution_placement, access_kind, \
+              price_snapshot_json, status, terminal_fingerprint, usage_status, provider_delivery_state, \
+              created_at, terminal_at) \
+             VALUES (?, ?, ?, 'run', ?, ?, ?, 1, DATE_ADD(NOW(6), INTERVAL 60 SECOND), \
+                     1, 0, ?, 0, 'primary_agent', 'audit-offering', ?, ?, 'mock', 'server', \
+                     'self_hosted', CAST(? AS JSON), 'succeeded', NULL, 'provider_exact', \
+                     'delivery_authorized', NOW(6), NOW(6))",
         )
         .bind(invocation_id)
-        .bind(route_id)
         .bind(&user_id)
         .bind(&session_id)
         .bind(run_id)
         .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         .bind(operation_id)
+        .bind(&model_name)
+        .bind(&model_name)
+        .bind(historical_price_snapshot)
         .execute(&pool)
         .await
         .expect("insert historical priced invocation");
@@ -5009,13 +4984,6 @@ async fn session_audit_prices_historical_physical_attempts_without_catalog_repri
         .execute(&pool)
         .await
         .expect("delete audit invocations");
-    sqlx::query("DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?")
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("delete audit routes");
-
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &user_id,
@@ -7507,19 +7475,12 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
 
 async fn cleanup_sync_event_fixture(pool: &sqlx::Pool<sqlx::MySql>, user: &str, session: &str) {
     cleanup_session_delete_fixture_for_owner(pool, user, session).await;
-    for table in [
-        "observation_identity_collisions",
-        "agent_session_lifecycle_fences",
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        )))
+    sqlx::query("DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?")
         .bind(user)
         .bind(session)
         .execute(pool)
         .await
         .unwrap();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

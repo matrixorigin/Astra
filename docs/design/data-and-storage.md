@@ -216,6 +216,13 @@ memory. Ending the executor releases its cache. Session deletion has no
 cache-table cleanup. A v127 database requires replacement under the existing
 fresh-schema contract.
 
+Fresh schema contract v129 stores the immutable admitted route and price
+on the invocation row. Admission writes both together and session audit reads
+the historical price from that row. Physical attempts retain their own
+delivery and usage records. Event identity collisions use the original
+event's hash and emit structured diagnostics. Fresh bootstrap declares
+106 tables.
+
 ## Session-memory recovery journal
 
 Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed

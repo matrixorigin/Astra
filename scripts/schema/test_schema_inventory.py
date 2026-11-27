@@ -857,6 +857,7 @@ fn char_literal() { let slash = '/'; }
         for table in (
             "conversation_log", "skill_selection_events", "infra_sandbox_metadata",
             "skill_metrics", "session_checkpoints", "mcp_tools", "skill_user_credentials",
+            "inference_routes", "observation_identity_collisions",
         ):
             self.assertNotIn(table, self.tables)
 

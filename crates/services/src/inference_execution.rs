@@ -1286,7 +1286,6 @@ fn unavailable_scope_error(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PersistedInvocationAdmissionFact {
-    route_id: String,
     admission_token: String,
     owner_token: String,
     owner_generation: i64,
@@ -1302,7 +1301,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
     sqlx::query(
-        "SELECT route_id, admission_token, owner_token, owner_generation,
+        "SELECT admission_token, owner_token, owner_generation,
                 status, terminal_fingerprint
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? LIMIT 1",
@@ -1320,7 +1319,6 @@ where
     })?
     .map(|row| {
         Ok::<_, sqlx::Error>(PersistedInvocationAdmissionFact {
-            route_id: row.try_get("route_id")?,
             admission_token: row.try_get("admission_token")?,
             owner_token: row.try_get("owner_token")?,
             owner_generation: row.try_get("owner_generation")?,
@@ -1372,9 +1370,6 @@ fn validate_ambiguous_invocation_admission(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
     let mut mismatches = Vec::new();
-    if persisted.route_id != plan.route_id {
-        mismatches.push("route_id");
-    }
     if persisted.admission_token != plan.admission_token {
         mismatches.push("admission_token");
     }
@@ -1506,80 +1501,38 @@ async fn insert_inference_invocation_admission(
     // produced impossible mixed rows at the CHECK boundary. Variant-specific
     // statements make every submitted row valid by construction; the CHECKs
     // remain defense in depth for non-Rust writers.
-    let route_query = match &plan.input.scope {
-        InferenceInvocationScope::Run {
-            session_id, run_id, ..
-        } => sqlx::query(
-            "INSERT INTO inference_routes
-                 (route_id, user_id, session_id, scope_kind, run_id,
-                  offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
-                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(session_id)
-        .bind(run_id),
-        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
-            "INSERT INTO inference_routes
-                 (route_id, user_id, session_id, scope_kind,
-                  offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
-                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(session_id),
-    };
-    route_query
-        .bind(&plan.input.offering_id)
-        .bind(&plan.input.resolved_model_name)
-        .bind(&plan.input.upstream_model_name)
-        .bind(&plan.input.provider)
-        .bind(plan.input.execution_placement.as_str())
-        .bind(plan.input.access_kind.as_str())
-        .bind(plan.input.purpose.as_str())
-        .bind(&plan.price_snapshot_json)
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert inference route",
-                error,
-            )
-        })?;
-
     let invocation_query = match &plan.input.scope {
         InferenceInvocationScope::Run {
             session_id, run_id, ..
         } => sqlx::query(
             "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+                 (invocation_id, user_id, session_id, scope_kind, run_id,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
-                  turn_index, round_index, operation_id, logical_attempt, purpose, status,
+                  turn_index, round_index, operation_id, logical_attempt, purpose,
+                  offering_id, resolved_model_name, upstream_model_name, provider,
+                  execution_placement, access_kind, price_snapshot_json, status,
                   terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, ?, 'run', ?, ?, ?, ?,
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+                         ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id)
         .bind(run_id),
         InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
             "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, session_id, scope_kind,
+                 (invocation_id, user_id, session_id, scope_kind,
                   admission_token, owner_token, owner_generation, owner_lease_expires_at,
-                  turn_index, round_index, operation_id, logical_attempt, purpose, status,
+                  turn_index, round_index, operation_id, logical_attempt, purpose,
+                  offering_id, resolved_model_name, upstream_model_name, provider,
+                  execution_placement, access_kind, price_snapshot_json, status,
                   terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, ?, 'session', ?, ?, ?,
+                 VALUES (?, ?, ?, 'session', ?, ?, ?,
                          DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+                         ?, ?, ?, ?, ?, ?, ?, 'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
     };
@@ -1599,6 +1552,13 @@ async fn insert_inference_invocation_admission(
         .bind(plan.input.scope.operation_id())
         .bind(i64::from(plan.input.scope.logical_attempt()))
         .bind(plan.input.purpose.as_str())
+        .bind(&plan.input.offering_id)
+        .bind(&plan.input.resolved_model_name)
+        .bind(&plan.input.upstream_model_name)
+        .bind(&plan.input.provider)
+        .bind(plan.input.execution_placement.as_str())
+        .bind(plan.input.access_kind.as_str())
+        .bind(&plan.price_snapshot_json)
         .execute(&mut *connection)
         .await
         .map_err(|error| {
@@ -1669,7 +1629,7 @@ pub async fn settle_uncertain_inference_admission(
         }
     };
     let row = sqlx::query(
-        "SELECT route_id, admission_token, owner_token, owner_generation,
+        "SELECT admission_token, owner_token, owner_generation,
                 status, terminal_fingerprint,
                 IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
          FROM inference_invocations
@@ -1704,13 +1664,6 @@ pub async fn settle_uncertain_inference_admission(
                 )
             })? == 1;
             let persisted = PersistedInvocationAdmissionFact {
-                route_id: row.try_get("route_id").map_err(|error| {
-                    ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "decode resolved inference route",
-                        error,
-                    )
-                })?,
                 admission_token: row.try_get("admission_token").map_err(|error| {
                     ServiceError::with_source(
                         ServiceErrorKind::Persistence,
@@ -1747,8 +1700,7 @@ pub async fn settle_uncertain_inference_admission(
                     )
                 })?,
             };
-            if persisted.route_id != plan.route_id
-                || persisted.admission_token != plan.admission_token
+            if persisted.admission_token != plan.admission_token
                 || persisted.owner_token != plan.owner_token
                 || persisted.owner_generation
                     != i64::try_from(plan.owner_generation).unwrap_or(i64::MAX)
@@ -5866,8 +5818,6 @@ pub struct AuxiliaryExecutionAttemptFact {
     pub invocation_run_id: Option<String>,
     pub invocation_turn: Option<i64>,
     pub invocation_round: Option<i64>,
-    pub route_session_id: Option<String>,
-    pub route_run_id: Option<String>,
     pub route_provider: Option<String>,
     pub attempt_id: String,
     pub attempt_index: i64,
@@ -5900,7 +5850,7 @@ pub async fn load_explain_auxiliary_usage(
 ) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
-    let rows = sqlx::query("SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
+    let rows = sqlx::query("SELECT a.attempt_id, a.provider, a.provider_protocol, i.offering_id, i.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
         .bind(user_id).bind(session_id).bind(i64::from(turn))
         .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid Explain capture budget"))?).fetch_all(pool.get()).await
         .map_err(|e| ServiceError::internal(format!("load auxiliary Explain usage: {e}")))?;
@@ -5937,15 +5887,15 @@ pub async fn load_session_auxiliary_capture(
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
     let select = if include_execution {
-        "SELECT i.invocation_id, i.session_id AS invocation_session_id, i.run_id AS invocation_run_id, i.turn_index AS invocation_turn, i.round_index AS invocation_round, r.session_id AS route_session_id, r.run_id AS route_run_id, r.provider AS route_provider, a.attempt_id, a.attempt_index, a.session_id AS attempt_session_id, a.run_id AS attempt_run_id, a.provider, a.provider_protocol, a.status AS attempt_status, r.resolved_model_name, r.upstream_model_name, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens, r.offering_id, i.purpose, i.operation_id"
+        "SELECT i.invocation_id, i.session_id AS invocation_session_id, i.run_id AS invocation_run_id, i.turn_index AS invocation_turn, i.round_index AS invocation_round, i.provider AS route_provider, a.attempt_id, a.attempt_index, a.session_id AS attempt_session_id, a.run_id AS attempt_run_id, a.provider, a.provider_protocol, a.status AS attempt_status, i.resolved_model_name, i.upstream_model_name, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens, i.offering_id, i.purpose, i.operation_id"
     } else {
-        "SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens"
+        "SELECT a.attempt_id, a.provider, a.provider_protocol, i.offering_id, i.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens"
     };
     // Delegation/model-selector judgments use request-specific operation IDs;
     // classify their usage by the admitted introspection purpose instead of
     // attempting to enumerate hashed operation identities.
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
+        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
     )))
         .bind(user_id)
         .bind(session_id)
@@ -6014,12 +5964,6 @@ fn project_auxiliary_usage_rows_with_execution(
                     .map_err(|e| ServiceError::internal(e.to_string()))?,
                 invocation_round: row
                     .try_get("invocation_round")
-                    .map_err(|e| ServiceError::internal(e.to_string()))?,
-                route_session_id: row
-                    .try_get("route_session_id")
-                    .map_err(|e| ServiceError::internal(e.to_string()))?,
-                route_run_id: row
-                    .try_get("route_run_id")
                     .map_err(|e| ServiceError::internal(e.to_string()))?,
                 route_provider: Some(text("route_provider")?),
                 attempt_id: text("attempt_id")?,
@@ -6428,7 +6372,6 @@ mod tests {
             ),
         );
         for (table, expected) in [
-            ("inference_routes", 2_i64),
             ("inference_invocations", 2),
             ("inference_provider_attempts", 0),
             ("inference_invocation_settlement_debts", 1),
@@ -6553,7 +6496,6 @@ mod tests {
             "inference_invocation_settlement_debts",
             "inference_provider_attempts",
             "inference_invocations",
-            "inference_routes",
             "agent_runs",
             "agent_sessions",
         ] {
@@ -6640,9 +6582,9 @@ mod tests {
             (InferenceInvocationAdmissionResolution::Settled, None),
         );
         let retained: String = sqlx::query_scalar(
-            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_routes WHERE user_id = ? AND route_id = ?",
+            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
         )
-        .bind(&user_id).bind(original.route_id()).fetch_one(pool.get()).await.unwrap();
+        .bind(&user_id).bind(original.invocation_id()).fetch_one(pool.get()).await.unwrap();
         assert_eq!(
             crate::models::InferencePriceSnapshot::from_stored(&retained),
             Some(snapshot(0.000001))
@@ -6650,7 +6592,6 @@ mod tests {
         for table in [
             "inference_invocation_settlement_debts",
             "inference_invocations",
-            "inference_routes",
             "agent_sessions",
         ] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -6767,7 +6708,6 @@ mod tests {
             "inference_provider_attempts",
             "inference_invocation_settlement_debts",
             "inference_invocations",
-            "inference_routes",
             "agent_sessions",
         ] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -6947,7 +6887,6 @@ mod tests {
     fn ambiguous_invocation_admission_requires_the_plans_fencing_token() {
         let plan = plan_inference_invocation(input()).expect("invocation");
         let exact = PersistedInvocationAdmissionFact {
-            route_id: plan.route_id.clone(),
             admission_token: plan.admission_token.clone(),
             owner_token: plan.owner_token.clone(),
             owner_generation: i64::try_from(plan.owner_generation).expect("owner generation"),

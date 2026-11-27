@@ -1307,17 +1307,15 @@ async fn combined_first_attempt_admission_is_atomic_and_replay_safe() {
 
     let counts = sqlx::query(
         "SELECT
-            (SELECT COUNT(*) FROM inference_routes
-             WHERE user_id = ? AND route_id = ?) AS route_count,
             (SELECT COUNT(*) FROM inference_invocations
-             WHERE user_id = ? AND invocation_id = ?) AS invocation_count,
+             WHERE user_id = ? AND invocation_id = ?
+               AND offering_id = 'combined-admission-offering'
+               AND upstream_model_name = 'combined-admission-model') AS invocation_count,
             (SELECT COUNT(*) FROM inference_provider_attempts
              WHERE user_id = ? AND attempt_id = ?) AS attempt_count,
             (SELECT COUNT(*) FROM model_request_context_events
              WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted') AS context_count",
     )
-    .bind(&user_id)
-    .bind(plan.route_id())
     .bind(&user_id)
     .bind(plan.invocation_id())
     .bind(&user_id)
@@ -1327,7 +1325,6 @@ async fn combined_first_attempt_admission_is_atomic_and_replay_safe() {
     .fetch_one(pool)
     .await
     .expect("load combined admission facts");
-    assert_eq!(counts.get::<i64, _>("route_count"), 1);
     assert_eq!(counts.get::<i64, _>("invocation_count"), 1);
     assert_eq!(counts.get::<i64, _>("attempt_count"), 1);
     assert_eq!(counts.get::<i64, _>("context_count"), 1);
@@ -2562,10 +2559,6 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
             session_id,
         ),
         (
-            "DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?",
-            session_id,
-        ),
-        (
             "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             run_id,
         ),
@@ -3309,12 +3302,8 @@ async fn deleting_session_fences_new_run_and_session_inference_admission() {
     }
 
     let durable_rows: i64 = sqlx::query_scalar(
-        "SELECT
-             (SELECT COUNT(*) FROM inference_routes WHERE user_id = ? AND session_id = ?)
-           + (SELECT COUNT(*) FROM inference_invocations WHERE user_id = ? AND session_id = ?)",
+        "SELECT COUNT(*) FROM inference_invocations WHERE user_id = ? AND session_id = ?",
     )
-    .bind(&user_id)
-    .bind(&session_id)
     .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool)
@@ -3996,10 +3985,10 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     assert_eq!(duplicate_conflicts, 1);
     let route = sqlx::query(
         "SELECT offering_id, upstream_model_name, execution_placement, access_kind, purpose
-         FROM inference_routes WHERE user_id = ? AND route_id = ?",
+         FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
-    .bind(plan.route_id())
+    .bind(plan.invocation_id())
     .fetch_one(pool)
     .await
     .expect("durable route exists");
@@ -4780,11 +4769,11 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
         .expect("admit session-scoped inference");
 
     let route = sqlx::query(
-        "SELECT scope_kind, run_id FROM inference_routes
-         WHERE user_id = ? AND route_id = ?",
+        "SELECT scope_kind, run_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
-    .bind(plan.route_id())
+    .bind(plan.invocation_id())
     .fetch_one(pool)
     .await
     .expect("load session-scoped route");
@@ -4861,13 +4850,13 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
 
     let rows = sqlx::query(
         "SELECT scope_kind, session_id, run_id
-         FROM inference_routes
-         WHERE user_id = ? AND route_id IN (?, ?)
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id IN (?, ?)
          ORDER BY scope_kind",
     )
     .bind(&user_id)
-    .bind(run_plan.route_id())
-    .bind(session_plan.route_id())
+    .bind(run_plan.invocation_id())
+    .bind(session_plan.invocation_id())
     .fetch_all(pool)
     .await
     .expect("load concurrent mixed-scope routes");
@@ -5603,7 +5592,6 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",
-        "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE 'lease-fair-%'");
         sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
@@ -5622,37 +5610,22 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
             format!("{user_prefix}-quiet-{index}")
         };
         let session_id = format!("fair-session-{index}-{suffix}");
-        let route_id = format!("fair-route-{index}-{suffix}");
         let invocation_id = format!("fair-inv-{index}-{suffix}");
         sqlx::query(
-            "INSERT INTO inference_routes
-             (route_id, user_id, session_id, scope_kind, run_id,
-              offering_id, resolved_model_name, upstream_model_name, provider,
-              execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, 'session', NULL, 'fair-offering', 'fair-model',
-                     'fair-model', 'openai', 'server', 'self_hosted',
-                     'primary_agent', NOW(6))",
-        )
-        .bind(&route_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&mut *tx)
-        .await
-        .expect("seed fair route");
-        sqlx::query(
             "INSERT INTO inference_invocations
-             (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+             (invocation_id, user_id, session_id, scope_kind, run_id,
               admission_token, owner_token, owner_generation,
               owner_lease_expires_at, turn_index, round_index, operation_id,
-              logical_attempt, purpose, status, terminal_fingerprint, usage_status,
+              logical_attempt, purpose, offering_id, resolved_model_name, upstream_model_name,
+              provider, execution_placement, access_kind, status, terminal_fingerprint, usage_status,
               provider_delivery_state, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, 'session', NULL, ?, ?, 1,
+             VALUES (?, ?, ?, 'session', NULL, ?, ?, 1,
                      TIMESTAMP('1970-01-01 00:00:00.000001'), 1, ?, 'fair_recovery', 0,
-                     'primary_agent', 'admitted', NULL, 'unavailable', 'unknown',
+                     'primary_agent', 'fair-offering', 'fair-model', 'fair-model',
+                     'openai', 'server', 'self_hosted', 'admitted', NULL, 'unavailable', 'unknown',
                      NOW(6), NULL)",
         )
         .bind(&invocation_id)
-        .bind(&route_id)
         .bind(&user_id)
         .bind(&session_id)
         .bind(Uuid::new_v4().simple().to_string())
@@ -5761,7 +5734,6 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",
-        "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE ?");
         sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))

@@ -1120,12 +1120,10 @@ mod tests {
         );
 
         let durable = sqlx::query(
-            "SELECT r.scope_kind, r.run_id, i.operation_id, i.status AS invocation_status,
+            "SELECT i.scope_kind, i.run_id, i.operation_id, i.status AS invocation_status,
                     i.input_tokens, i.output_tokens, a.status AS attempt_status,
                     a.provider_response_id
              FROM inference_invocations i
-             JOIN inference_routes r
-               ON r.user_id = i.user_id AND r.route_id = i.route_id
              JOIN inference_provider_attempts a
                ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id
              WHERE i.user_id = 'test-user' AND i.session_id = ?",
@@ -1337,7 +1335,6 @@ mod tests {
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id = 'test-user' AND session_id = ?",
             "DELETE FROM inference_provider_attempts WHERE user_id = 'test-user' AND session_id = ?",
             "DELETE FROM inference_invocations WHERE user_id = 'test-user' AND session_id = ?",
-            "DELETE FROM inference_routes WHERE user_id = 'test-user' AND session_id = ?",
             "DELETE FROM agent_sessions WHERE user_id = 'test-user' AND session_id = ?",
         ] {
             sqlx::query(statement)
@@ -1535,7 +1532,6 @@ mod tests {
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id='test-user' AND session_id=?",
             "DELETE FROM inference_provider_attempts WHERE user_id='test-user' AND session_id=?",
             "DELETE FROM inference_invocations WHERE user_id='test-user' AND session_id=?",
-            "DELETE FROM inference_routes WHERE user_id='test-user' AND session_id=?",
             "DELETE FROM agent_sessions WHERE user_id='test-user' AND session_id=?",
         ] {
             sqlx::query(statement)

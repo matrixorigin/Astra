@@ -1099,11 +1099,10 @@ impl DatabaseEventService {
         Ok(receipts)
     }
 
-    async fn replay_or_conflict(
-        tx: &mut sqlx::Transaction<'_, MySql>,
+    fn replay_or_conflict(
         event: &PreparedEvent,
         existing: &ExistingEventRecord,
-    ) -> Result<EventBatchEntry, (StatusCode, Json<ErrorResponse>)> {
+    ) -> EventBatchEntry {
         let record = &event.record;
         if existing.payload_hash == event.payload_hash
             && duplicate_event_matches_request(
@@ -1116,30 +1115,26 @@ impl DatabaseEventService {
                     .then_some(event.payload_hash.as_str()),
             )
         {
-            return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
+            return EventBatchEntry::Accepted(EventCreateOutcome::replayed(
                 existing.record.clone(),
-            )));
+            ));
         }
-        crate::observation_capture::record_observation_collisions(
-            &mut *tx,
-            &[crate::observation_capture::ObservationCollisionReceipt {
-                user_id: &record.user_id,
-                identity_id: &record.event_id,
-                session_id: &record.session_id,
-                stored_payload_hash: &existing.payload_hash,
-                attempted_payload_hash: &event.payload_hash,
-                source: "event_service",
-            }],
-        )
-        .await
-        .map_err(internal_error)?;
-        Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
+        tracing::warn!(
+            target: "astra_services::events",
+            user_id = %record.user_id,
+            session_id = %record.session_id,
+            event_id = %record.event_id,
+            stored_payload_hash = %existing.payload_hash,
+            attempted_payload_hash = %event.payload_hash,
+            "event identity collision rejected"
+        );
+        EventBatchEntry::Rejected(EventCreateRejection::conflict(
             &record.event_id,
             format!(
                 "event_id {} already exists with a different payload hash",
                 record.event_id
             ),
-        )))
+        ))
     }
 
     async fn create_event_in_transaction(
@@ -1157,7 +1152,7 @@ impl DatabaseEventService {
             if event.client_supplied_event_id
                 && let Some(existing) = write_state.existing_events.get(&record.event_id)
             {
-                return Self::replay_or_conflict(tx, event, existing).await;
+                return Ok(Self::replay_or_conflict(event, existing));
             }
             match self.insert_events(tx, &[event]).await {
                 Ok(mut receipts) => receipts.remove(&record.event_id).ok_or_else(|| {
@@ -1169,7 +1164,7 @@ impl DatabaseEventService {
                         .await?
                         .get(&record.event_id)
                     {
-                        return Self::replay_or_conflict(tx, event, existing).await;
+                        return Ok(Self::replay_or_conflict(event, existing));
                     }
                     return Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
                         &record.event_id,

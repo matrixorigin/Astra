@@ -3620,14 +3620,11 @@ async fn load_session_request_usage(
     let mut rows = query(
         "SELECT a.status, a.provider_protocol, a.usage_status, a.input_tokens, a.output_tokens, \
                 a.cache_read_tokens, a.cache_creation_tokens, \
-                CAST(r.price_snapshot_json AS CHAR) AS price_snapshot_json \
+                CAST(i.price_snapshot_json AS CHAR) AS price_snapshot_json \
          FROM inference_provider_attempts AS a \
          LEFT JOIN inference_invocations AS i \
            ON i.user_id = a.user_id AND i.session_id = a.session_id \
           AND i.invocation_id = a.invocation_id \
-         LEFT JOIN inference_routes AS r \
-           ON r.user_id = i.user_id AND r.session_id = i.session_id \
-          AND r.route_id = i.route_id \
          WHERE a.user_id = ? AND a.session_id = ?",
     )
     .bind(user_id)

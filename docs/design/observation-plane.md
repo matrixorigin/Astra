@@ -652,25 +652,9 @@ and the complete item set ordered by `item_order`. Every item lookup, join, and
 delete must carry the owner. Unknown-reason diagnostics commit with the first
 manifest capture and are not repeated by replay or collision.
 
-Collision receipts retain identities and hashes, never observation payloads.
-They aggregate into one row per `(user_id, identity_kind, identity_id)`, with a
-count and latest conflicting hash. Their fixed seven-day expiry is not extended
-by repeated conflicts. The bounded runtime-maintenance sweep removes expired
-receipts, and explicit session deletion removes its owner-scoped receipts.
-Batch producers submit receipts in input order through one shared writer, in
-chunks of at most 128 receipts. Each multi-receipt chunk uses one database
-grouping query followed by one weighted upsert (at most 1,024 binds); a single
-receipt needs only the upsert. Grouping inherits the target columns' types and
-collation and returns first/last input ordinals and counts. This avoids passing
-duplicate fresh identities to MatrixOne's multi-row upsert. Callers do not
-normalize identities, and every receipt is checked against schema field bounds
-before reduction. Each input increments the count once. Duplicate updates preserve the
-first stored hash, session, source, first-seen time, and fixed expiry, while the
-last input supplies the attempted hash. Timestamps have statement granularity;
-expiry remains seven days after first observation. Empty batches issue no SQL,
-and all chunks share the caller's transaction and rollback boundary. This saves
-statement round trips and repeated row updates within a batch, not contention between
-independent transactions on the same identity.
+Identity collisions emit structured diagnostics with owner, event identity and
+hashes. The original event row supplies the persisted identity and payload
+hash used to distinguish replays from collisions.
 
 The v83 core schema requires capture hashes and attempt markers on event and
 manifest writes. Deployments using an earlier table shape require a fresh-schema
