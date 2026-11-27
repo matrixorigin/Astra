@@ -4307,7 +4307,6 @@ async fn ensure_core_schema_while_leased(
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, registry_id),
             UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
-            INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at),
             INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id),
             INDEX idx_edge_registry_user_workspace_agent (user_id, workspace_id, edge_agent_id)
         )",

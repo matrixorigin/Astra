@@ -892,6 +892,16 @@ async fn schema_rationalization_runtime_contract() {
         ["user_id", "registry_id"],
         "edge registry identity must be owner-bound so registry_id lookups never scan across tenants"
     );
+    assert!(
+        index_columns(
+            &pool,
+            &schema,
+            "edge_agent_registry",
+            "idx_edge_registry_user_heartbeat",
+        )
+        .await
+        .is_empty()
+    );
 }
 
 #[tokio::test]
