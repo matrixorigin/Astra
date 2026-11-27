@@ -4436,6 +4436,21 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
+    let fallback = store
+        .load_run_control_batch_after_parent_failure(&keys)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    // Restore the deliberate corruption before assertions so a failing test
+    // cannot poison later global recovery scans in the same CI database.
+    sqlx::query("UPDATE agent_runs SET last_guidance_event_idx=-1 WHERE user_id=? AND run_id=?")
+        .bind(&other)
+        .bind(&bad_root)
+        .execute(pool.get())
+        .await
+        .unwrap();
     assert_eq!(
         capture
             .0
@@ -4505,9 +4520,13 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
     }));
     {
         let sparse_sql = sparse_sql.0.lock().unwrap();
-        assert_eq!(sparse_sql.len(), 1);
+        let run_queries: Vec<_> = sparse_sql
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .collect();
+        assert_eq!(run_queries.len(), 1, "captured statements: {sparse_sql:?}");
         assert!(
-            !sparse_sql[0].contains("JOIN agent_runs parent"),
+            !run_queries[0].contains("JOIN agent_runs parent"),
             "sparse batches must avoid the parent join"
         );
     }
@@ -4546,13 +4565,6 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
 
     // Recovery uses one unjoined query with at most 256 physical positions.
     // Keep the same per-position ownership and parent errors as the join.
-    let fallback = store
-        .load_run_control_batch_after_parent_failure(&keys)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
     for (actual, expected) in fallback.iter().zip(&results) {
         assert_eq!(actual.own, expected.own);
         assert_eq!(actual.parent, expected.parent);
