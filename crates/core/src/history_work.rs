@@ -47,7 +47,6 @@ pub enum HistoryWorkSite {
     CliJournalDigestSerialization,
     CliSessionRestoreHydration,
     CliSessionRestoreCanonicalHistoryClone,
-    CliSessionRestoreJournalHistoryClone,
     CliTurnUserInputProjection,
     CslMaterializedStateClone,
     CslPersistInputClone,
@@ -126,7 +125,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 106;
+    const COUNT: usize = 105;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -160,7 +159,6 @@ impl HistoryWorkSite {
         Self::CliJournalDigestSerialization,
         Self::CliSessionRestoreHydration,
         Self::CliSessionRestoreCanonicalHistoryClone,
-        Self::CliSessionRestoreJournalHistoryClone,
         Self::CliTurnUserInputProjection,
         Self::CslMaterializedStateClone,
         Self::CslPersistInputClone,
@@ -275,9 +273,6 @@ impl HistoryWorkSite {
             Self::CliSessionRestoreHydration => "cli_session_restore_hydration",
             Self::CliSessionRestoreCanonicalHistoryClone => {
                 "cli_session_restore_canonical_history_clone"
-            }
-            Self::CliSessionRestoreJournalHistoryClone => {
-                "cli_session_restore_journal_history_clone"
             }
             Self::CliTurnUserInputProjection => "cli_turn_user_input_projection",
             Self::CslMaterializedStateClone => "csl_materialized_state_clone",
@@ -398,8 +393,7 @@ impl HistoryWorkSite {
             Self::CliJournalDigestMaterialization | Self::CliJournalDigestSerialization => {
                 "cli.journal_digest"
             }
-            Self::CliSessionRestoreCanonicalHistoryClone
-            | Self::CliSessionRestoreJournalHistoryClone => "cli.session_restore",
+            Self::CliSessionRestoreCanonicalHistoryClone => "cli.session_restore",
             Self::CliTurnUserInputProjection => "cli.stream_settlement",
             Self::CslMaterializedStateClone
             | Self::CslPersistInputClone
@@ -512,7 +506,6 @@ impl HistoryWorkSite {
             | Self::ServerForkToolSchemaClone
             | Self::ServerForkPrefixSerialization
             | Self::CliSessionRestoreCanonicalHistoryClone
-            | Self::CliSessionRestoreJournalHistoryClone
             | Self::DelegationParentMessagesClone => 5,
             Self::RuntimeContextMaterialization
             | Self::PromptCacheHistoryScan

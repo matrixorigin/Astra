@@ -1859,6 +1859,40 @@ pub(crate) fn restored_journal_state(session_id: &str) -> Result<RestoredJournal
     restore_session_state_from_journal(session_id)
 }
 
+/// Recover terminal events after the selected canonical conversation head.
+pub(crate) fn restore_history_after_commit(
+    events: &[session_journal::JournalEvent],
+    cursor: &astra_turn_types::SessionCursorV1,
+) -> Result<Vec<(String, String)>, String> {
+    let retry = || {
+        format!(
+            "session {} changed during restore; retry",
+            cursor.session_id
+        )
+    };
+    let index = events
+        .iter()
+        .rposition(|event| {
+            event
+                .conversation_commit
+                .as_ref()
+                .is_some_and(|commit| commit.cursor == *cursor)
+        })
+        .ok_or_else(retry)?;
+    let trailing = &events[index + 1..];
+    if trailing
+        .iter()
+        .any(|event| event.conversation_commit.is_some())
+    {
+        return Err(retry());
+    }
+    Ok(
+        restored_journal_state_from_append_order_events(true, trailing, true)
+            .session
+            .history,
+    )
+}
+
 fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJournalState, String> {
     session_journal::validate_session_id(session_id)
         .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
@@ -3470,14 +3504,14 @@ mod tests {
         ];
         let committed = ActiveConversation::empty("owner", sid)
             .unwrap()
-            .prepare_commit(5, None, messages.clone())
+            .prepare_commit(5, None, messages)
             .unwrap();
         let mut failed =
             JournalEvent::turn_error(Some(sid), 6, None, "retry", "request interrupted", 0);
         failed.tokens_in = Some(5);
         failed.tokens_out = Some(2);
         failed.tools_used = Some(vec!["shell".into()]);
-        let events = vec![
+        let mut events = vec![
             JournalEvent::session_start(Some(sid), None),
             JournalEvent::turn(Some(sid), 5, None, "question", "answer", 0, 10, 4, 0)
                 .with_cache_tokens(7, 2)
@@ -3543,10 +3577,62 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(active.cursor().completed_turn, 5);
+        assert_eq!(
+            super::restore_history_after_commit(&events, active.cursor()).unwrap(),
+            vec![(
+                "retry".into(),
+                "[Previous turn failed: request interrupted]".into()
+            )]
+        );
         let next = active
-            .prepare_commit(restored.session.turn + 1, None, messages)
+            .prepare_commit(
+                restored.session.turn + 1,
+                None,
+                vec![
+                    serde_json::json!({"role":"user", "content":"after compaction"}),
+                    serde_json::json!({"role":"assistant", "content":"new answer"}),
+                ],
+            )
             .unwrap();
         assert_eq!(next.next.cursor().completed_turn, 7);
+        assert!(matches!(
+            next.commit.delta,
+            astra_turn_types::ConversationDeltaV1::Replace { .. }
+        ));
+        events.push(
+            JournalEvent::turn(
+                Some(sid),
+                7,
+                None,
+                "after compaction",
+                "new answer",
+                0,
+                0,
+                0,
+                0,
+            )
+            .with_conversation_commit(next.commit),
+        );
+        events.push(JournalEvent::turn_error(
+            Some(sid),
+            8,
+            None,
+            "retry again",
+            "unavailable",
+            0,
+        ));
+        assert!(
+            super::restore_history_after_commit(&events, active.cursor())
+                .unwrap_err()
+                .contains("changed during restore")
+        );
+        assert_eq!(
+            super::restore_history_after_commit(&events, next.next.cursor()).unwrap(),
+            vec![(
+                "retry again".into(),
+                "[Previous turn failed: unavailable]".into()
+            )]
+        );
     }
 
     #[test]
