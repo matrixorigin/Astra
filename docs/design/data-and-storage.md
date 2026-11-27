@@ -184,9 +184,9 @@ continuation uses canonical Context and Run checkpoints; CLI continuation uses
 its file CSL. Fresh schemas omit the database CSL table.
 
 When CLI continuation loads its file CSL, it reads the latest complete snapshot
-and replays later records. Corruption in that replay range fails the read, with
-the existing exception for a malformed final JSON line. Explicit history reads
-still inspect the older records superseded by the snapshot.
+and replays later records. Corruption in that replay range, including a torn
+final record, fails the read instead of presenting an older prefix as complete.
+Explicit history reads still inspect the older records superseded by the snapshot.
 
 Bootstrap supports a fresh database or the current schema contract. Canonical
 CREATE declarations define the complete table shape; startup validates it
@@ -812,6 +812,15 @@ Unknown effects remain hot. Archive key ranges are candidate indexes: a late
 settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
+
+Fresh schema contract `2026-11-27-v127` keeps a fork's prepare reason and
+terminal status in its owner-scoped `session_forks` manifest. Creation and
+terminal transition times remain on that row. Forks have at most one terminal
+transition, so the separate full-manifest transition copies and their writes
+are retired. This retains the fork facts needed for recovery and inspection,
+but not an independent historical copy for diagnosing later row corruption.
+The previous schema is rejected without rewriting it; deploy against a fresh
+schema.
 
 Fresh schema contract `2026-11-20-v126` records the validated Run owner, tool
 name and exact request digest in the Edge dispatch row. A new admission

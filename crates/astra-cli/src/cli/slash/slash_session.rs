@@ -950,58 +950,16 @@ struct PreparedSessionHistory {
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
 }
 
-fn materialize_prepared_session_history(
-    mgr: astra_turn_core::conversation_log::manager::CslManager,
-    mat: Option<astra_turn_core::conversation_log::MaterializedState>,
-    restored_journal: session_runtime::RestoredJournalState,
+async fn prepare_session_history(
     session_id: &str,
-) -> PreparedSessionHistory {
-    let has_csl_materialization = mat.is_some();
-    let mut history = crate::cli::history_work::clone_pair_history(
-        astra_core::history_work::HistoryWorkSite::CliSessionRestoreJournalHistoryClone,
-        &restored_journal.session.history,
-    );
-    let mut recent_tools = restored_journal.session.recent_tools.clone();
-    let mut deferred_tool_activations = Vec::new();
-    let mut active_conversation = None;
-    if let Some(ref materialized) = mat {
-        let canonical_messages = session_continuation::sanitize_continuation_messages(
-            session_continuation::materialize_cli_continuation_messages(
-                astra_core::history_work::HistoryWorkSite::CliSessionRestoreCanonicalHistoryClone,
-                &materialized.messages,
-            ),
-        );
-        history = session_continuation::history_pairs_from_messages(&canonical_messages);
-        active_conversation =
-            astra_turn_core::active_conversation::ActiveConversation::from_projection(
-                &crate::cli::cli_config::cli_utils::cli_user_id(),
-                session_id,
-                canonical_messages,
-                materialized.last_turn,
-                astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
-            )
-            .ok();
-        if !materialized.session_state.recent_tools.is_empty() {
-            recent_tools = materialized.session_state.recent_tools.clone();
-        }
-        deferred_tool_activations =
-            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-                &materialized.messages,
-                materialized.session_state.deferred_tool_activations.clone(),
-            );
-    }
-    PreparedSessionHistory {
-        history,
-        active_conversation,
-        resume: None,
-        recent_tools,
-        deferred_tool_activations,
-        csl_manager: has_csl_materialization.then_some(mgr),
-    }
-}
-
-async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHistory, String> {
-    let restored_journal = session_runtime::restored_journal_state(session_id)?;
+    restored_journal: session_runtime::RestoredJournalState,
+) -> Result<
+    (
+        PreparedSessionHistory,
+        Option<session_journal::JournalEvent>,
+    ),
+    String,
+> {
     // Try CSL first — full-fidelity message history via CslManager.
     let base_dir = session_journal::local_owner_sessions_dir();
     let store = std::sync::Arc::new(
@@ -1013,30 +971,79 @@ async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHist
         Default::default(),
     )
     .map_err(|e| format!("initialize CSL state for session {session_id}: {e}"))?;
-    let mut prepared = match mgr.load().await {
-        Ok(materialized) => {
-            materialize_prepared_session_history(mgr, materialized, restored_journal, session_id)
+    let mut materialized = mgr.load().await.map_err(|e| {
+        format!(
+            "cannot restore session {session_id}: local conversation history is unreadable: {e}"
+        )
+    })?;
+    let continuation = session_continuation::load_session_continuation_for_recovery(session_id);
+    let has_journal = restored_journal.exists;
+    let last_turn_event = restored_journal.last_turn_event;
+    let last_turn = last_turn_event.as_ref().and_then(|event| event.turn);
+    let mut recent_tools = restored_journal.session.recent_tools;
+    if let Some(projection) = materialized.as_mut() {
+        let projected_tools = std::mem::take(&mut projection.session_state.recent_tools);
+        if !projected_tools.is_empty() {
+            recent_tools = projected_tools;
         }
-        Err(e) => {
-            return Err(format!("load CSL state for session {session_id}: {e}"));
-        }
+    }
+    let mut prepared = PreparedSessionHistory {
+        history: restored_journal.session.history,
+        active_conversation: None,
+        resume: None,
+        recent_tools,
+        deferred_tool_activations: Vec::new(),
+        csl_manager: materialized.is_some().then_some(mgr),
     };
 
-    // The canonical journal lane is authoritative even when the asynchronous
-    // CSL projection has not caught up yet.
-    if let Some(continuation) =
-        session_continuation::load_session_continuation_for_recovery(session_id)
-    {
-        let canonical_history =
-            session_continuation::history_pairs_from_messages(&continuation.messages);
-        if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
-            prepared.history = canonical_history;
+    if let Some(continuation) = continuation {
+        if !has_journal || continuation.resume.cursor.conversation_seq > 0 {
+            prepared.history =
+                session_continuation::history_pairs_from_messages(&continuation.messages);
+            if continuation.resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+                && last_turn.is_some_and(|turn| turn > continuation.resume.cursor.completed_turn)
+            {
+                let events = session_journal::read_complete_journal_append_order(session_id)
+                    .map_err(|error| {
+                        format!("failed to read session journal for {session_id}: {error}")
+                    })?;
+                prepared
+                    .history
+                    .extend(session_runtime::restore_history_after_commit(
+                        &events,
+                        &continuation.resume.cursor,
+                    )?);
+            }
         }
         prepared.deferred_tool_activations = continuation.deferred_tool_activations;
         prepared.active_conversation = Some(continuation.active_conversation);
         prepared.resume = Some(continuation.resume);
+    } else if let Some(projection) = materialized {
+        let messages = session_continuation::sanitize_continuation_messages(
+            session_continuation::materialize_cli_continuation_messages(
+                astra_core::history_work::HistoryWorkSite::CliSessionRestoreCanonicalHistoryClone,
+                &projection.messages,
+            ),
+        );
+        if !has_journal {
+            prepared.history = session_continuation::history_pairs_from_messages(&messages);
+        }
+        prepared.active_conversation =
+            astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
+                session_id,
+                messages,
+                projection.last_turn,
+                astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
+            )
+            .ok();
+        prepared.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &projection.messages,
+                projection.session_state.deferred_tool_activations,
+            );
     }
-    Ok(prepared)
+    Ok((prepared, last_turn_event))
 }
 
 async fn apply_restored_session(
@@ -1070,16 +1077,16 @@ async fn apply_restored_session(
             restored.session_id
         ));
     }
-    let local_state = local_journal.session;
+    let local_has_journal = local_journal.exists;
     let total_cache_read_tokens = restored
         .total_cache_read_tokens
-        .max(local_state.total_cache_read_tokens);
+        .max(local_journal.session.total_cache_read_tokens);
     let total_cache_creation_tokens = restored
         .total_cache_creation_tokens
-        .max(local_state.total_cache_creation_tokens);
-    let prepared_workspace =
-        load_prepared_workspace_restore(&restored, state, local_journal.exists)?;
-    let prepared_history = prepare_session_history(&restored.session_id).await?;
+        .max(local_journal.session.total_cache_creation_tokens);
+    let prepared_workspace = load_prepared_workspace_restore(&restored, state, local_has_journal)?;
+    let (prepared_history, last_turn_event) =
+        prepare_session_history(&restored.session_id, local_journal).await?;
     let use_typed_continuation = match (
         prepared_history.resume.as_ref(),
         typed_continuation.as_ref(),
@@ -1147,7 +1154,6 @@ async fn apply_restored_session(
     } else {
         Vec::new()
     };
-    let last_turn_event = local_journal.last_turn_event;
     let user_id = state
         .ingestion_user_id
         .as_deref()
@@ -1431,9 +1437,23 @@ async fn apply_restored_session(
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     }
 
-    if use_typed_continuation {
+    // A local failure after the same canonical head remains a visible fact
+    // when the Server supplies the prompt continuation.
+    let use_local_terminal_history = local_has_journal
+        && prepared_activation_is_admissible
+        && prepared_history.resume.as_ref().is_some_and(|resume| {
+            resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+        })
+        && last_turn_event
+            .as_ref()
+            .and_then(|event| event.turn)
+            .zip(selected_cursor.as_ref())
+            .is_some_and(|(turn, cursor)| {
+                turn > cursor.completed_turn && (!use_server_canonical || turn == local_turn_count)
+            });
+    if use_typed_continuation && !use_local_terminal_history {
         state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);
-    } else if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
+    } else if local_has_journal || !prepared_history.history.is_empty() {
         state.history = prepared_history.history;
     }
     if prepared_activation_is_admissible && !prepared_history.recent_tools.is_empty() {
@@ -1569,8 +1589,8 @@ pub(crate) async fn restore_session_into_state(
 mod resume_tests {
     use super::{
         apply_heavy_checkpoint_fallback, apply_restored_session, apply_resume_recovery_state,
-        build_step_resume_guidance, prepare_session_history, restore_session_into_state,
-        resume_persistence_warning, session_restore_client,
+        build_step_resume_guidance, restore_session_into_state, resume_persistence_warning,
+        session_restore_client,
     };
     use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
@@ -1579,6 +1599,15 @@ mod resume_tests {
     use astra_services::session_workspace;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn prepare_session_history(
+        session_id: &str,
+    ) -> Result<super::PreparedSessionHistory, String> {
+        let journal = super::session_runtime::restored_journal_state(session_id)?;
+        super::prepare_session_history(session_id, journal)
+            .await
+            .map(|(prepared, _)| prepared)
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -2666,6 +2695,218 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn restore_uses_canonical_history_even_when_stale_csl_has_the_same_pair_count() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let session_id = format!("resume-same-length-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+        let current = vec![
+            serde_json::json!({"role":"user", "content":"current question"}),
+            serde_json::json!({"role":"assistant", "content":"current answer"}),
+        ];
+        let commit =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner, &session_id)
+                .unwrap()
+                .prepare_commit(2, None, current.clone())
+                .unwrap();
+        session_journal::JournalWriter::new(&session_id)
+            .unwrap()
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&session_id),
+                    2,
+                    Some("gpt-5"),
+                    "current question",
+                    "current answer",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(commit.commit),
+            )
+            .unwrap();
+
+        let stale = vec![
+            serde_json::json!({"role":"user", "content":"stale question"}),
+            serde_json::json!({"role":"assistant", "content":"stale answer"}),
+        ];
+        let stale_cursor =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner, &session_id)
+                .unwrap()
+                .prepare_commit(1, None, stale.clone())
+                .unwrap()
+                .next
+                .cursor()
+                .clone();
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &stale,
+            &astra_turn_core::conversation_log::SessionStateCompact {
+                source_cursor: Some(stale_cursor),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        apply_restored_session(
+            None,
+            &api,
+            &mut state,
+            RestoredSession {
+                session_id,
+                turn_count: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.history,
+            vec![("current question".into(), "current answer".into())]
+        );
+        assert_eq!(state.last_response.as_deref(), Some("current answer"));
+        assert_eq!(state.active_conversation.unwrap().messages(), current);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_keeps_failed_turns_and_full_committed_content_with_or_without_csl() {
+        use astra_turn_core::active_conversation::ActiveConversation;
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+
+        for (with_csl, with_commit, from_cloud) in [
+            (false, true, false),
+            (true, true, false),
+            (false, false, false),
+            (true, false, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let session_id = format!("resume-failed-{}", uuid::Uuid::new_v4());
+            let question = format!("{}end", "long question ".repeat(60));
+            let answer = format!("{}end", "long answer ".repeat(1_000));
+            let messages = vec![
+                serde_json::json!({"role":"user", "content":question}),
+                serde_json::json!({"role":"assistant", "content":answer}),
+            ];
+            let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+            let commit = ActiveConversation::empty(&owner, &session_id)
+                .unwrap()
+                .prepare_commit(1, None, messages.clone())
+                .unwrap();
+            let writer = session_journal::JournalWriter::new(&session_id).unwrap();
+            writer
+                .append(&session_journal::JournalEvent::session_start(
+                    Some(&session_id),
+                    Some("gpt-5"),
+                ))
+                .unwrap();
+            if with_commit {
+                writer
+                    .append(
+                        &session_journal::JournalEvent::turn(
+                            Some(&session_id),
+                            1,
+                            Some("gpt-5"),
+                            &question,
+                            &answer,
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                        .with_conversation_commit(commit.commit),
+                    )
+                    .unwrap();
+            }
+            for (turn, input) in [(2, "first retry"), (3, "latest retry")] {
+                writer
+                    .append(&session_journal::JournalEvent::turn_error(
+                        Some(&session_id),
+                        turn,
+                        Some("gpt-5"),
+                        input,
+                        "provider timeout",
+                        0,
+                    ))
+                    .unwrap();
+            }
+            if with_csl {
+                crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+                    &session_id,
+                    1,
+                    &messages,
+                    &astra_turn_core::conversation_log::SessionStateCompact {
+                        source_cursor: Some(commit.next.cursor().clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            let restored = if from_cloud {
+                canonical_server_test_restore(&session_id, 3, &commit.next)
+            } else {
+                RestoredSession {
+                    session_id,
+                    turn_count: 3,
+                    ..Default::default()
+                }
+            };
+            let mut state = SessionState::default();
+            apply_restored_session(None, &api, &mut state, restored)
+                .await
+                .unwrap();
+
+            let mut expected = Vec::new();
+            if with_commit {
+                expected.push((question.clone(), answer.clone()));
+            }
+            expected.extend([
+                (
+                    "first retry".into(),
+                    "[Previous turn failed: provider timeout]".into(),
+                ),
+                (
+                    "latest retry".into(),
+                    "[Previous turn failed: provider timeout]".into(),
+                ),
+            ]);
+            assert_eq!(
+                state.history, expected,
+                "with_csl={with_csl}, with_commit={with_commit}, from_cloud={from_cloud}"
+            );
+            assert_eq!(
+                state.last_response.as_deref(),
+                Some("[Previous turn failed: provider timeout]")
+            );
+            assert_eq!(
+                state
+                    .continuation_anchor
+                    .as_ref()
+                    .and_then(|anchor| anchor.recent_user_input.as_deref()),
+                Some("latest retry")
+            );
+            let active = state.active_conversation.unwrap();
+            if with_commit {
+                assert_eq!(active.messages(), messages);
+            } else {
+                assert!(active.messages().is_empty());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn restore_without_csl_restores_recent_tools_from_journal() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("no-csl-tools-{}", uuid::Uuid::new_v4());
@@ -2731,7 +2972,66 @@ mod resume_tests {
             .err()
             .expect("corrupt csl should fail");
 
-        assert!(error.contains("load CSL state"), "{error}");
+        assert!(
+            error.contains("local conversation history is unreadable"),
+            "{error}"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_with_torn_csl_tail_reports_the_error_without_rebinding() {
+        use std::io::Write;
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        for damaged in [
+            b"{\"type\":\"turn_delta\"".as_slice(),
+            b"{\"content\":\"\xe4\xb8",
+        ] {
+            let session_id = format!("corrupt-csl-tail-{}", uuid::Uuid::new_v4());
+            write_local_resumable_session(&session_id, 2);
+            crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+                &session_id,
+                1,
+                &[serde_json::json!({"role":"user", "content":"old"})],
+                &Default::default(),
+            )
+            .unwrap();
+            let path = crate::cli::session::session_recovery::io::csl_log_path_for(&session_id);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(damaged)
+                .unwrap();
+
+            let mut state = SessionState {
+                session_id: Some("existing-session".into()),
+                history: vec![("existing".into(), "answer".into())],
+                ..Default::default()
+            };
+            let error = apply_restored_session(
+                None,
+                &api,
+                &mut state,
+                RestoredSession {
+                    session_id,
+                    turn_count: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("damaged CSL must not be accepted as complete history");
+            assert!(
+                error.contains("local conversation history is unreadable"),
+                "{error}"
+            );
+            assert_eq!(state.session_id.as_deref(), Some("existing-session"));
+            assert_eq!(state.history, vec![("existing".into(), "answer".into())]);
+        }
     }
 
     // ── derive_history_pairs_from_messages tests ─────────────────────────
@@ -3678,43 +3978,45 @@ mod resume_tests {
         let owner = crate::cli::cli_config::cli_utils::cli_user_id();
         let mut local = SessionState::default();
         local.set_session_id(&sid);
-        local.turn = 3;
+        local.turn = 2;
         local.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
         local.active_conversation = Some(ActiveConversation::empty(&owner, &sid).unwrap());
-        let mut third_result = crate::tests::stub_stream_result("local answer 3");
-        third_result.final_messages = vec![
-            serde_json::json!({"role":"user", "content":"local question 3"}),
-            serde_json::json!({"role":"assistant", "content":"local answer 3"}),
+        let mut initial_result = crate::tests::stub_stream_result("local answer 2");
+        initial_result.final_messages = vec![
+            serde_json::json!({"role":"user", "content":"local question 2"}),
+            serde_json::json!({"role":"assistant", "content":"local answer 2"}),
         ];
-        let third_trace = ContextAssemblyTrace {
-            turn_id: "local-trace-3".into(),
+        let initial_trace = ContextAssemblyTrace {
+            turn_id: "local-trace-2".into(),
             session_id: sid.clone(),
             ..Default::default()
         };
-        third_result.pending_context_assembly_trace = Some((3, third_trace.to_json_value()));
-        let third = commit_primary_turn(
+        initial_result.pending_context_assembly_trace = Some((2, initial_trace.to_json_value()));
+        let initial = commit_primary_turn(
             &mut local,
-            "local question 3",
-            &mut third_result,
+            "local question 2",
+            &mut initial_result,
             std::time::Instant::now(),
         );
-        assert!(third.outcome.turn_persisted);
-        let third_sidecar = third.deferred_sidecars.unwrap();
-        third_sidecar.execute(false).unwrap();
-        let local_third = local.active_conversation.as_ref().unwrap().clone();
-        let remote = ActiveConversation::empty(&owner, &sid)
+        assert!(initial.outcome.turn_persisted);
+        let initial_sidecar = initial.deferred_sidecars.unwrap();
+        initial_sidecar.execute(false).unwrap();
+        let local_head = local.active_conversation.as_ref().unwrap().clone();
+        local
+            .journal
+            .as_ref()
             .unwrap()
-            .prepare_commit(
-                20,
+            .append(&session_journal::JournalEvent::turn_error(
+                Some(&sid),
+                3,
                 None,
-                vec![
-                    serde_json::json!({"role":"user", "content":"Server question"}),
-                    serde_json::json!({"role":"assistant", "content":"Server answer"}),
-                ],
-            )
-            .unwrap()
-            .next;
-        let restored = canonical_server_test_restore(&sid, 20, &remote);
+                "failed before concurrent turn",
+                "timeout",
+                0,
+            ))
+            .unwrap();
+        let remote = local_head.clone();
+        let restored = canonical_server_test_restore(&sid, 3, &remote);
 
         // Hold the actual optional memory response until another admitted local
         // surface has committed turn4 and its real workspace/context sidecar.
@@ -3767,9 +4069,9 @@ mod resume_tests {
             fourth.set_session_id(&sid);
             fourth.turn = 4;
             fourth.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
-            fourth.active_conversation = Some(local_third.clone());
+            fourth.active_conversation = Some(local_head.clone());
             let mut result = crate::tests::stub_stream_result("local answer 4");
-            result.final_messages = local_third.materialize();
+            result.final_messages = local_head.materialize();
             result.final_messages.extend([
                 serde_json::json!({"role":"user", "content":"local question 4"}),
                 serde_json::json!({"role":"assistant", "content":"local answer 4"}),
@@ -3855,7 +4157,12 @@ mod resume_tests {
             remote.cursor(),
             "fresh local workspace metadata cannot replace the selected Server cursor"
         );
-        third_sidecar.execute(false).unwrap();
+        assert_eq!(
+            state.last_response.as_deref(),
+            Some("local answer 2"),
+            "a stale local failure must not replace the selected Server history"
+        );
+        initial_sidecar.execute(false).unwrap();
         let workspace = session_workspace::read_workspace(&sid).unwrap();
         assert_eq!(
             workspace.turn_count, 4,

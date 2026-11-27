@@ -5,6 +5,7 @@ use astra_turn_types::{
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
     canonical_conversation_append_identity, canonical_conversation_identity,
+    canonical_json_prefix_len,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -231,7 +232,7 @@ impl ActiveConversation {
 
         let durable_base = self.source.is_durable_canonical();
         let common_prefix = if durable_base {
-            common_prefix_len(self.messages(), &messages)
+            canonical_json_prefix_len(self.messages(), &messages)
         } else {
             0
         };
@@ -372,13 +373,6 @@ fn validate_commit_identity(
     Ok(())
 }
 
-fn common_prefix_len(left: &[Value], right: &[Value]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -427,6 +421,31 @@ mod tests {
         assert_eq!(replayed.cursor().completed_turn, 4);
         assert_eq!(replayed.cursor().conversation_seq, 4);
         assert_eq!(replayed.source(), ActiveConversationSource::Journal);
+    }
+
+    #[test]
+    fn changed_nested_number_is_preserved_by_commit_and_replay() {
+        let first = ActiveConversation::empty("owner", "session")
+            .unwrap()
+            .prepare_commit(1, None, vec![json!({"content": {"value": [0.0]}})])
+            .unwrap();
+        let messages = vec![json!({"content": {"value": [-0.0]}})];
+        let second = first
+            .next
+            .prepare_commit(2, None, messages.clone())
+            .unwrap();
+        assert!(matches!(
+            second.commit.delta,
+            ConversationDeltaV1::Replace { .. }
+        ));
+        let replayed =
+            ActiveConversation::replay("owner", "session", [first.commit, second.commit])
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            canonical_conversation_root(replayed.messages()),
+            canonical_conversation_root(&messages)
+        );
     }
 
     #[test]

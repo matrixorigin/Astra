@@ -39,12 +39,8 @@ pub(crate) fn apply_turn_success(
     }
 }
 
-// Settlement owns several independent commit sinks; keeping them explicit
-// makes partial-failure handling auditable at this transaction boundary.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_turn_success_async(
     state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     mut result: StreamResult,
@@ -72,14 +68,6 @@ pub(crate) async fn apply_turn_success_async(
             run_control.take_remotely_applied_user_intents(),
         );
     }
-    // Primary settlement projects the continuation anchor from typed message
-    // semantics. Keep the messages on `result` until that synchronous state
-    // transition completes; the deferred CSL worker receives its own owned
-    // snapshot.
-    let final_messages = crate::cli::history_work::clone_json_history(
-        astra_core::history_work::HistoryWorkSite::CliPostCommitSnapshot,
-        &result.final_messages,
-    );
     let primary_commit_started = Instant::now();
     let primary_commit =
         apply_turn_success_on_blocking_worker(state, profile, line, result, turn_start).await;
@@ -93,8 +81,7 @@ pub(crate) async fn apply_turn_success_async(
     let turn_persisted = commit_outcome.turn_persisted;
     if turn_persisted {
         let post_commit_started = Instant::now();
-        let mut post_commit =
-            prepare_turn_post_commit_job(state, api, profile, final_messages, turn_start);
+        let mut post_commit = prepare_turn_post_commit_job(state, turn_start);
         attach_deferred_sidecars(&mut post_commit, primary_commit.deferred_sidecars);
         if let Some(tx) = post_commit_tx {
             account_turn_post_commit_queue(&mut post_commit);
@@ -979,7 +966,6 @@ mod tests {
         let journal_path = session_journal::journal_file_path(&sid);
         std::fs::create_dir_all(&journal_path).unwrap();
 
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
             last_turn_interrupted: true,
@@ -996,7 +982,6 @@ mod tests {
 
         apply_turn_success_async(
             &mut state,
-            &api,
             None,
             "new question",
             result,
@@ -1031,7 +1016,6 @@ mod tests {
     async fn tui_post_commit_queue_releases_turn_after_primary_journal_event() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("queued-turn-post-commit-{}", uuid::Uuid::new_v4());
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState {
             session_id: Some(sid.clone()),
             journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
@@ -1059,7 +1043,6 @@ mod tests {
 
         apply_turn_success_async(
             &mut state,
-            &api,
             None,
             "inspect persistence",
             result,
@@ -1117,7 +1100,6 @@ mod tests {
     async fn durable_tail_guidance_is_included_when_primary_live_fanout_closed() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("remote-guidance-commit-{}", uuid::Uuid::new_v4());
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         control.expect_remote_user_intent_disposition("intent-tail", 1);
         control.record_remotely_applied_user_intent(
@@ -1155,7 +1137,6 @@ mod tests {
 
         apply_turn_success_async(
             &mut state,
-            &api,
             None,
             "original",
             result,

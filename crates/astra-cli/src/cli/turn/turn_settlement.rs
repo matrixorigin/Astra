@@ -48,7 +48,6 @@ pub(crate) async fn settle_interrupted_turn(
     publish_turn_usage(dispatch, usage);
     apply_user_cancelled_turn(
         state,
-        dispatch.ctx.api,
         dispatch.ctx.profile,
         dispatch.line,
         result,
@@ -68,7 +67,6 @@ pub(crate) async fn settle_successful_turn(
     publish_turn_usage(dispatch, TurnUsage::from_stream_result(&result));
     let turn_persisted = apply_turn_success_async(
         state,
-        dispatch.ctx.api,
         dispatch.ctx.profile,
         dispatch.line,
         result,

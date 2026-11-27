@@ -18,7 +18,6 @@ const TRACE_ENV: &str = "ASTRA_HISTORY_WORK_TRACE";
 #[repr(usize)]
 pub enum HistoryWorkSite {
     AgenticRequestSnapshot,
-    CliPostCommitSnapshot,
     CliSettlementRollbackSnapshot,
     CliPrimaryCommitWorkerHistoryQueue,
     CliPrimaryCommitWorkerFinalMessagesQueue,
@@ -48,12 +47,10 @@ pub enum HistoryWorkSite {
     CliJournalDigestSerialization,
     CliSessionRestoreHydration,
     CliSessionRestoreCanonicalHistoryClone,
-    CliSessionRestoreJournalHistoryClone,
     CliTurnUserInputProjection,
     CslMaterializedStateClone,
     CslPersistInputClone,
     CslSnapshotClone,
-    CslMessageHash,
     CslFileRead,
     CslFileAppendSerialization,
     CslFileRewriteSerialization,
@@ -128,12 +125,11 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 108;
+    const COUNT: usize = 105;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
         Self::AgenticRequestSnapshot,
-        Self::CliPostCommitSnapshot,
         Self::CliSettlementRollbackSnapshot,
         Self::CliPrimaryCommitWorkerHistoryQueue,
         Self::CliPrimaryCommitWorkerFinalMessagesQueue,
@@ -163,12 +159,10 @@ impl HistoryWorkSite {
         Self::CliJournalDigestSerialization,
         Self::CliSessionRestoreHydration,
         Self::CliSessionRestoreCanonicalHistoryClone,
-        Self::CliSessionRestoreJournalHistoryClone,
         Self::CliTurnUserInputProjection,
         Self::CslMaterializedStateClone,
         Self::CslPersistInputClone,
         Self::CslSnapshotClone,
-        Self::CslMessageHash,
         Self::CslFileRead,
         Self::CslFileAppendSerialization,
         Self::CslFileRewriteSerialization,
@@ -245,7 +239,6 @@ impl HistoryWorkSite {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgenticRequestSnapshot => "agentic_request_snapshot",
-            Self::CliPostCommitSnapshot => "cli_post_commit_snapshot",
             Self::CliSettlementRollbackSnapshot => "cli_settlement_rollback_snapshot",
             Self::CliPrimaryCommitWorkerHistoryQueue => "cli_primary_commit_worker_history_queue",
             Self::CliPrimaryCommitWorkerFinalMessagesQueue => {
@@ -281,14 +274,10 @@ impl HistoryWorkSite {
             Self::CliSessionRestoreCanonicalHistoryClone => {
                 "cli_session_restore_canonical_history_clone"
             }
-            Self::CliSessionRestoreJournalHistoryClone => {
-                "cli_session_restore_journal_history_clone"
-            }
             Self::CliTurnUserInputProjection => "cli_turn_user_input_projection",
             Self::CslMaterializedStateClone => "csl_materialized_state_clone",
             Self::CslPersistInputClone => "csl_persist_input_clone",
             Self::CslSnapshotClone => "csl_snapshot_clone",
-            Self::CslMessageHash => "csl_message_hash",
             Self::CslFileRead => "csl_file_read",
             Self::CslFileAppendSerialization => "csl_file_append_serialization",
             Self::CslFileRewriteSerialization => "csl_file_rewrite_serialization",
@@ -372,8 +361,7 @@ impl HistoryWorkSite {
     pub const fn owner(self) -> &'static str {
         match self {
             Self::AgenticRequestSnapshot => "runtime.agentic_loop",
-            Self::CliPostCommitSnapshot
-            | Self::CliSettlementRollbackSnapshot
+            Self::CliSettlementRollbackSnapshot
             | Self::CliPrimaryCommitWorkerHistoryQueue
             | Self::CliPrimaryCommitWorkerFinalMessagesQueue
             | Self::CliPostCommitQueue => "cli.turn_settlement",
@@ -405,13 +393,11 @@ impl HistoryWorkSite {
             Self::CliJournalDigestMaterialization | Self::CliJournalDigestSerialization => {
                 "cli.journal_digest"
             }
-            Self::CliSessionRestoreCanonicalHistoryClone
-            | Self::CliSessionRestoreJournalHistoryClone => "cli.session_restore",
+            Self::CliSessionRestoreCanonicalHistoryClone => "cli.session_restore",
             Self::CliTurnUserInputProjection => "cli.stream_settlement",
             Self::CslMaterializedStateClone
             | Self::CslPersistInputClone
-            | Self::CslSnapshotClone
-            | Self::CslMessageHash => "turn_core.csl_manager",
+            | Self::CslSnapshotClone => "turn_core.csl_manager",
             Self::CslFileRead
             | Self::CslFileAppendSerialization
             | Self::CslFileRewriteSerialization => "turn_core.csl_file_store",
@@ -520,7 +506,6 @@ impl HistoryWorkSite {
             | Self::ServerForkToolSchemaClone
             | Self::ServerForkPrefixSerialization
             | Self::CliSessionRestoreCanonicalHistoryClone
-            | Self::CliSessionRestoreJournalHistoryClone
             | Self::DelegationParentMessagesClone => 5,
             Self::RuntimeContextMaterialization
             | Self::PromptCacheHistoryScan

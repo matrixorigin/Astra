@@ -648,17 +648,82 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn continuation_prefers_the_newer_typed_causal_projection() {
+    fn local_continuation_reports_a_damaged_tail_instead_of_using_old_history() {
+        use std::io::Write;
+
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("routing-causal-{}", uuid::Uuid::new_v4());
+        let session_id = format!("routing-torn-{}", uuid::Uuid::new_v4());
+        let messages = vec![serde_json::json!({"role":"user", "content":"older"})];
+        let cursor = astra_turn_core::active_conversation::ActiveConversation::empty(
+            astra_services::local_owner_scope().id(),
+            &session_id,
+        )
+        .unwrap()
+        .prepare_commit(1, None, messages.clone())
+        .unwrap()
+        .next
+        .cursor()
+        .clone();
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             1,
-            &[
-                serde_json::json!({"role": "user", "content": "stale local question"}),
-                serde_json::json!({"role": "assistant", "content": "stale local answer"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            &messages,
+            &astra_turn_core::conversation_log::SessionStateCompact {
+                source_cursor: Some(cursor),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = crate::cli::session::session_recovery::io::csl_log_path_for(&session_id);
+        let mut routing = OneShotSessionRouting {
+            history_source_session_id: Some(session_id),
+            ..Default::default()
+        };
+        assert_eq!(
+            routing.continuation_turn_inputs().unwrap().0.unwrap(),
+            messages
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"{\"type\":\"turn_delta\",\"content\":\"\xe4\xb8")
+            .unwrap();
+        let error = routing.continuation_turn_inputs().unwrap_err();
+        assert!(
+            error.contains("local conversation history is unreadable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn continuation_prefers_the_newer_typed_causal_projection() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("routing-causal-{}", uuid::Uuid::new_v4());
+        let stale_messages = vec![
+            serde_json::json!({"role": "user", "content": "stale local question"}),
+            serde_json::json!({"role": "assistant", "content": "stale local answer"}),
+        ];
+        let stale_cursor = astra_turn_core::active_conversation::ActiveConversation::empty(
+            astra_services::local_owner_scope().id(),
+            &session_id,
+        )
+        .unwrap()
+        .prepare_commit(1, None, stale_messages.clone())
+        .unwrap()
+        .next
+        .cursor()
+        .clone();
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &stale_messages,
+            &astra_turn_core::conversation_log::SessionStateCompact {
+                source_cursor: Some(stale_cursor),
+                ..Default::default()
+            },
         )
         .unwrap();
         let remote_messages = vec![
