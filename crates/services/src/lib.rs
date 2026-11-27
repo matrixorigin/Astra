@@ -296,9 +296,9 @@ pub use sync_outbox::{
     SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_SCHEMA_VERSION,
     SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncDomain, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
     SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile,
-    SyncOutboxJournalBatchOutcome, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
-    SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind,
-    SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
+    SyncOutboxJournalBatchOutcome, SyncOutboxJournalDeltaOutcome, SyncOutboxRecord,
+    SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind, SyncOutboxSkippedRecord,
+    SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
     sync_outbox_stable_event_id,
 };
 pub use turn_intent_judge::{

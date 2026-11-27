@@ -1767,7 +1767,6 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     }
     for table in [
         "session_forks",
-        "session_fork_events",
         "conversation_manifest_pins",
         "conversation_manifest_nodes",
     ] {

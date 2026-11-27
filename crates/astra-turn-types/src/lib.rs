@@ -122,7 +122,8 @@ pub use explain_analyze::{
     ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
-    ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
+    ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeObservedProviderUsage,
+    ExplainAnalyzeObservedTokenLane, ExplainAnalyzeProjectedNodeV1,
     ExplainAnalyzeProjectionApplyResultV1, ExplainAnalyzeProjectionDiagnosticCodeV1,
     ExplainAnalyzeProjectionDiagnosticV1, ExplainAnalyzeProjectionDiagnosticsV1,
     ExplainAnalyzeScopeCoverageV1,
@@ -225,15 +226,16 @@ pub use session_cursor::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
-    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_identity,
-    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_fits,
-    json_serialized_len,
+    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_append_identity,
+    canonical_conversation_identity, canonical_conversation_root,
+    canonical_conversation_serialized_len, canonical_json_eq, canonical_json_prefix_len,
+    json_serialized_fits, json_serialized_len,
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
     ForkExcludedAuthorityV1, ProviderRunOwner, SESSION_FORK_MANIFEST_SCHEMA_VERSION,
-    SessionForkActivationV1, SessionForkManifestV1, SessionForkStateV1, SessionForkValidationError,
-    SharedManifestPrefixV1,
+    SESSION_FORK_REASON_MAX_BYTES, SessionForkActivationV1, SessionForkManifestV1,
+    SessionForkStateV1, SessionForkValidationError, SharedManifestPrefixV1,
 };
 pub use session_handoff::{
     HandoffOperationWatermarksV1, HandoffRiskEvidenceV1, MANIFEST_DELTA_SCHEMA_VERSION,

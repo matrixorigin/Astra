@@ -8,8 +8,6 @@
 
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-
 use super::{
     CslEntry, CslStore, CslStoreError, MaterializedState, SessionStateCompact, SessionStatePatch,
     materialize, validate_session_id,
@@ -79,7 +77,6 @@ pub struct CslManager {
     last_seq: u64,
     last_turn: u32,
     last_canonical_messages: Vec<serde_json::Value>,
-    last_canonical_message_hashes: Vec<CanonicalMessageHash>,
     last_session_state: SessionStateCompact,
     /// A manager may be reconstructed while a prior projection is still
     /// completing. Do not assume `last_seq == 0` means the store is empty:
@@ -101,7 +98,6 @@ impl CslManager {
             last_seq: 0,
             last_turn: 0,
             last_canonical_messages: Vec::new(),
-            last_canonical_message_hashes: Vec::new(),
             last_session_state: SessionStateCompact::default(),
             loaded: false,
         })
@@ -149,17 +145,9 @@ impl CslManager {
             &mat.messages,
         );
         self.last_canonical_messages = mat.messages.clone();
-        self.last_canonical_message_hashes = canonical_message_hashes(&mat.messages);
         self.last_session_state = mat.session_state.clone();
         Ok(Some(mat))
     }
-
-    /// Record the message count at the start of the current turn.
-    ///
-    /// This remains available to callers that track turn boundaries, but
-    /// `persist_turn` computes CSL deltas from the last canonical message
-    /// sequence instead of trusting a caller-provided count.
-    pub fn mark_turn_start(&mut self, _message_count: usize) {}
 
     /// Persist the outcome of the current turn.
     ///
@@ -205,7 +193,10 @@ impl CslManager {
                             ));
                         }
                         if cursor.compaction_generation == previous.compaction_generation
-                            && !messages.starts_with(&self.last_canonical_messages)
+                            && astra_turn_types::canonical_json_prefix_len(
+                                &self.last_canonical_messages,
+                                messages,
+                            ) != self.last_canonical_messages.len()
                         {
                             return Err(CslStoreError::CausalProjection(
                                 "CSL projection does not extend the prior canonical messages"
@@ -229,7 +220,6 @@ impl CslManager {
         carry_forward_user_turn_semantics(&self.last_canonical_messages, &mut canonical_messages);
 
         if self.last_seq == 0 {
-            let canonical_message_hashes = canonical_message_hashes(&canonical_messages);
             record_full_history_clone(
                 astra_core::history_work::HistoryWorkSite::CslSnapshotClone,
                 &canonical_messages,
@@ -244,17 +234,15 @@ impl CslManager {
             self.last_seq = 1;
             self.last_turn = turn;
             self.last_canonical_messages = canonical_messages;
-            self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             return Ok(());
         }
 
-        let canonical_message_hashes = canonical_message_hashes(&canonical_messages);
-        let common_prefix_len = common_canonical_prefix_len(
-            &self.last_canonical_message_hashes,
-            &canonical_message_hashes,
+        let common_prefix_len = astra_turn_types::canonical_json_prefix_len(
+            &self.last_canonical_messages,
+            &canonical_messages,
         );
-        if common_prefix_len < self.last_canonical_message_hashes.len() {
+        if common_prefix_len < self.last_canonical_messages.len() {
             let next_seq = self.last_seq + 1;
             record_full_history_clone(
                 astra_core::history_work::HistoryWorkSite::CslSnapshotClone,
@@ -270,7 +258,6 @@ impl CslManager {
             self.last_seq = next_seq;
             self.last_turn = turn;
             self.last_canonical_messages = canonical_messages;
-            self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             self.gc().await?;
             return Ok(());
@@ -289,7 +276,6 @@ impl CslManager {
         self.last_seq = next_seq;
         self.last_turn = turn;
         self.last_canonical_messages = canonical_messages;
-        self.last_canonical_message_hashes = canonical_message_hashes;
         self.last_session_state = session_state.clone();
 
         // Periodic snapshot + GC.
@@ -349,7 +335,6 @@ impl CslManager {
         self.last_seq = 0;
         self.last_turn = 0;
         self.last_canonical_messages.clear();
-        self.last_canonical_message_hashes.clear();
         self.last_session_state = SessionStateCompact::default();
         self.loaded = true;
         Ok(())
@@ -376,35 +361,6 @@ impl CslManager {
     }
 }
 
-type CanonicalMessageHash = [u8; 32];
-
-fn canonical_message_hashes(messages: &[serde_json::Value]) -> Vec<CanonicalMessageHash> {
-    messages.iter().map(canonical_message_hash).collect()
-}
-
-fn canonical_message_hash(message: &serde_json::Value) -> CanonicalMessageHash {
-    // serde_json::Value object order can come from insertion order when the
-    // preserve_order feature is enabled, so sort recursively before hashing.
-    let canonical = sort_json_object_keys(message);
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_else(|error| {
-        // Serializing a serde_json::Value should be infallible; keep a stable
-        // fallback so a representation error cannot crash CSL diffing, while
-        // invalidating any active instrumentation interval.
-        astra_core::history_work::record_serialization_failure(
-            astra_core::history_work::HistoryWorkSite::CslMessageHash,
-            &error,
-        );
-        canonical.to_string().into_bytes()
-    });
-    if astra_core::history_work::instrumentation_enabled() {
-        astra_core::history_work::record_bytes(
-            astra_core::history_work::HistoryWorkSite::CslMessageHash,
-            bytes.len().try_into().unwrap_or(u64::MAX),
-        );
-    }
-    Sha256::digest(bytes).into()
-}
-
 fn record_full_history_clone(
     site: astra_core::history_work::HistoryWorkSite,
     messages: &[serde_json::Value],
@@ -412,12 +368,21 @@ fn record_full_history_clone(
     astra_core::history_work::record_serialized_value(site, messages);
 }
 
-fn canonical_message_identity_hash(message: &serde_json::Value) -> CanonicalMessageHash {
-    let mut identity = message.clone();
-    if let Some(object) = identity.as_object_mut() {
-        object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
-    }
-    canonical_message_hash(&identity)
+fn same_message_without_semantics(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
+        return astra_turn_types::canonical_json_eq(left, right);
+    };
+    let field = astra_turn_types::USER_TURN_SEMANTICS_FIELD;
+    left.len() - usize::from(left.contains_key(field))
+        == right.len() - usize::from(right.contains_key(field))
+        && left
+            .iter()
+            .filter(|(key, _)| key.as_str() != field)
+            .all(|(key, value)| {
+                right
+                    .get(key)
+                    .is_some_and(|other| astra_turn_types::canonical_json_eq(value, other))
+            })
 }
 
 /// A prompt/display projection may omit producer-owned turn semantics while
@@ -432,9 +397,7 @@ fn carry_forward_user_turn_semantics(
     let shared_prefix = previous
         .iter()
         .zip(incoming.iter())
-        .take_while(|(previous, incoming)| {
-            canonical_message_identity_hash(previous) == canonical_message_identity_hash(incoming)
-        })
+        .take_while(|(previous, incoming)| same_message_without_semantics(previous, incoming))
         .count();
 
     for (index, (previous, incoming)) in previous
@@ -471,35 +434,6 @@ fn carry_forward_user_turn_semantics(
             }
         }
     }
-}
-
-/// Recursively sort all object keys in a JSON value to guarantee
-/// deterministic serialization regardless of insertion order.
-fn sort_json_object_keys(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut sorted: Vec<_> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), sort_json_object_keys(v)))
-                .collect();
-            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-            serde_json::Value::Object(sorted.into_iter().collect())
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(sort_json_object_keys).collect())
-        }
-        other => other.clone(),
-    }
-}
-
-fn common_canonical_prefix_len(
-    left: &[CanonicalMessageHash],
-    right: &[CanonicalMessageHash],
-) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(left, right)| left == right)
-        .count()
 }
 
 impl SessionStatePatch {
@@ -719,7 +653,6 @@ mod tests {
             user_msg("t2"),
             assistant_msg("r2"),
         ];
-        mgr.mark_turn_start(2);
         mgr.persist_turn(2, &msgs2, &default_state()).await.unwrap();
 
         assert_eq!(mgr.last_seq(), 2);
@@ -843,7 +776,6 @@ mod tests {
         assert_eq!(mgr.last_seq(), 1);
 
         // Turn 2: Delta at seq=2
-        mgr.mark_turn_start(2);
         let msgs2 = vec![
             user_msg("t1"),
             assistant_msg("r1"),
@@ -854,7 +786,6 @@ mod tests {
         assert_eq!(mgr.last_seq(), 2);
 
         // Turn 3: Delta at seq=3, then Snapshot at seq=4 (because 3 % 3 == 0)
-        mgr.mark_turn_start(4);
         let msgs3 = vec![
             user_msg("t1"),
             assistant_msg("r1"),
@@ -883,7 +814,6 @@ mod tests {
             .unwrap();
 
         // Turn 2: Delta(seq=2) + Snapshot(seq=3) + GC
-        mgr.mark_turn_start(1);
         let msgs2 = vec![user_msg("t1"), user_msg("t2")];
         mgr.persist_turn(2, &msgs2, &default_state()).await.unwrap();
         assert_eq!(mgr.last_seq(), 3);
@@ -931,7 +861,6 @@ mod tests {
         let msgs = vec![user_msg("t1"), assistant_msg("r1")];
         mgr.persist_turn(1, &msgs, &default_state()).await.unwrap();
 
-        mgr.mark_turn_start(2);
         let msgs2 = vec![
             user_msg("t1"),
             assistant_msg("r1"),
@@ -1012,7 +941,6 @@ mod tests {
             consecutive_ctx_errors: 0,
             ..Default::default()
         };
-        mgr.mark_turn_start(1);
         mgr.persist_turn(2, &[user_msg("t1"), user_msg("t2")], &state2)
             .await
             .unwrap();
@@ -1083,7 +1011,6 @@ mod tests {
         mgr.persist_turn(1, &msgs1, &state1).await.unwrap();
 
         // Turn 2
-        mgr.mark_turn_start(2);
         let msgs2 = vec![
             user_msg("t1"),
             assistant_msg("r1"),
@@ -1094,7 +1021,6 @@ mod tests {
         mgr.persist_turn(2, &msgs2, &state2).await.unwrap();
 
         // Turn 3
-        mgr.mark_turn_start(4);
         let msgs3 = vec![
             user_msg("t1"),
             assistant_msg("r1"),
@@ -1185,7 +1111,7 @@ mod tests {
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
         mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
 
-        // Turn 2: 4 messages total. WITHOUT calling mark_turn_start manually,
+        // Turn 2: 4 messages total;
         // the delta should contain only the 2 new messages (not all 4).
         let t2 = vec![
             user_msg("q1"),
@@ -1404,7 +1330,6 @@ mod tests {
             user_msg("1+4"),
             assistant_msg("1+4 = 5"),
         ];
-        mgr.mark_turn_start(t1.len());
         mgr.persist_turn(2, &t2, &default_state()).await.unwrap();
 
         let entries = store.load_after("canonical-divergence", 0).await.unwrap();
@@ -1485,7 +1410,6 @@ mod tests {
             delegation: None,
             ..Default::default()
         };
-        mgr.mark_turn_start(1);
         mgr.persist_turn(2, &[user_msg("t1"), user_msg("t2")], &state2)
             .await
             .unwrap();
@@ -1823,7 +1747,7 @@ mod tests {
         let mat = mgr2.load().await.unwrap().unwrap();
         assert_eq!(mat.messages.len(), 4);
 
-        // Persist turn 3 WITHOUT calling mark_turn_start — load() should have
+        // Persist turn 3 after load() has
         // restored the canonical 4-message state so the delta is only the 2 new messages.
         let t3 = vec![
             user_msg("q1"),
@@ -1842,7 +1766,7 @@ mod tests {
         assert_eq!(
             mat.messages.len(),
             6,
-            "after load+persist without mark_turn_start, should have 6 messages, got {}",
+            "after load+persist, should have 6 messages, got {}",
             mat.messages.len()
         );
     }
@@ -1890,34 +1814,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_keeps_only_canonical_message_hashes_between_persists() {
+    async fn changed_canonical_value_survives_cold_csl_recovery() {
         let tmp = TempDir::new().unwrap();
-        let mut mgr = test_manager(&tmp);
-        let large_assistant_text = "x".repeat(256 * 1024);
-        let messages = vec![
-            user_msg("q1"),
-            assistant_msg(&large_assistant_text),
-            assistant_msg("a1"),
-        ];
-
-        mgr.persist_turn(1, &messages, &default_state())
+        let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(tmp.path()));
+        let mut manager = CslManager::new(
+            Arc::clone(&store),
+            "changed-number".into(),
+            Default::default(),
+        )
+        .unwrap();
+        manager
+            .persist_turn(
+                1,
+                &[json!({"role":"tool", "content": [0.0]})],
+                &default_state(),
+            )
             .await
             .unwrap();
-
+        let changed = vec![json!({"role":"tool", "content": [-0.0]})];
+        manager
+            .persist_turn(2, &changed, &default_state())
+            .await
+            .unwrap();
+        let entries = store.load_after("changed-number", 0).await.unwrap();
+        assert!(matches!(entries[1], CslEntry::Snapshot { .. }));
+        let mut cold = CslManager::new(store, "changed-number".into(), Default::default()).unwrap();
+        let recovered = cold.load().await.unwrap().unwrap();
         assert_eq!(
-            mgr.last_canonical_message_hashes.len(),
-            messages.len(),
-            "manager should retain one fixed-size hash per canonical message"
-        );
-        assert_eq!(
-            std::mem::size_of_val(mgr.last_canonical_message_hashes.as_slice()),
-            messages.len() * std::mem::size_of::<CanonicalMessageHash>(),
-            "manager state must scale with message count, not message payload bytes"
+            astra_turn_types::canonical_conversation_root(&recovered.messages),
+            astra_turn_types::canonical_conversation_root(&changed)
         );
     }
 
     #[test]
-    fn canonical_message_hash_is_independent_of_object_insertion_order() {
+    fn canonical_message_identity_is_independent_of_object_insertion_order() {
         fn object(fields: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
             let mut map = serde_json::Map::new();
             for (key, value) in fields {
@@ -1969,14 +1899,8 @@ mod tests {
             ("role", json!("assistant")),
         ]);
 
-        assert_eq!(
-            canonical_message_hash(&left),
-            canonical_message_hash(&right)
-        );
-        assert_ne!(
-            canonical_message_hash(&left),
-            canonical_message_hash(&changed)
-        );
+        assert!(same_message_without_semantics(&left, &right));
+        assert!(!same_message_without_semantics(&left, &changed));
     }
 
     // ── Test gap: fork at turn 0 ───────────────────────────────────────

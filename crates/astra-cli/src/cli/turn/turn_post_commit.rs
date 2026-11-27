@@ -22,9 +22,8 @@ pub(crate) struct TurnPostCommitJob {
     owner_id: String,
     session_id: Option<String>,
     attachment_epoch: u64,
-    expected_cursor: Option<astra_turn_types::SessionCursorV1>,
     turn: u32,
-    final_messages: Vec<serde_json::Value>,
+    conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     csl_state: astra_turn_core::conversation_log::SessionStateCompact,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
     deferred_sidecars: Option<DeferredTurnSidecarWork>,
@@ -48,20 +47,11 @@ pub(crate) struct TurnPostCommitCompletion {
 
 pub(crate) fn prepare_turn_post_commit_job(
     state: &mut SessionState,
-    _api: &astra_thin_client::ThinClient,
-    _profile: Option<&str>,
-    final_messages: Vec<serde_json::Value>,
     turn_start: Instant,
 ) -> TurnPostCommitJob {
-    let expected_cursor = state
-        .active_conversation
-        .as_ref()
-        .map(|conversation| conversation.cursor().clone());
-    let final_messages = state
-        .active_conversation
-        .as_ref()
-        .map(|conversation| conversation.materialize())
-        .unwrap_or(final_messages);
+    // Each queued job retains the exact immutable conversation committed by
+    // its turn, even when the next turn replaces the active handle.
+    let conversation = state.active_conversation.clone();
     let csl_state = state
         .csl_manager
         .as_ref()
@@ -92,9 +82,8 @@ pub(crate) fn prepare_turn_post_commit_job(
         owner_id: owner.id().to_string(),
         session_id: state.session_id.clone(),
         attachment_epoch: state.session_attachment_epoch,
-        expected_cursor,
         turn: state.turn,
-        final_messages,
+        conversation,
         csl_state,
         csl_manager,
         deferred_sidecars: None,
@@ -105,10 +94,12 @@ pub(crate) fn prepare_turn_post_commit_job(
 
 pub(crate) fn account_turn_post_commit_queue(job: &mut TurnPostCommitJob) {
     if job._queue_bytes.is_none() {
-        job._queue_bytes = crate::cli::history_work::reserve_json_history_queue(
-            astra_core::history_work::HistoryWorkSite::CliPostCommitQueue,
-            &job.final_messages,
-        );
+        job._queue_bytes = job.conversation.as_ref().and_then(|conversation| {
+            crate::cli::history_work::reserve_json_history_queue(
+                astra_core::history_work::HistoryWorkSite::CliPostCommitQueue,
+                conversation.messages(),
+            )
+        });
     }
 }
 
@@ -163,7 +154,10 @@ pub(crate) async fn execute_turn_post_commit_job(
     let session_id = job.session_id.clone();
     let owner_id = job.owner_id.clone();
     let attachment_epoch = job.attachment_epoch;
-    let expected_cursor = job.expected_cursor.clone();
+    let expected_cursor = job
+        .conversation
+        .as_ref()
+        .map(|value| value.cursor().clone());
     let turn = job.turn;
     let mut errors = Vec::new();
     let sidecar_started = Instant::now();
@@ -195,17 +189,25 @@ pub(crate) async fn execute_turn_post_commit_job(
     let csl_started = Instant::now();
     let csl_manager = match job.csl_manager.take() {
         None => None,
-        Some(mut manager) => match manager
-            .persist_turn(job.turn, &job.final_messages, &job.csl_state)
-            .await
-        {
-            Ok(()) => Some(manager),
-            Err(error) => {
-                errors.push(format!(
-                    "CSL projection failed; journal continuation remains available: {error}"
-                ));
-                // Keep the manager: a transient append failure must not make
-                // all later turns silently stop producing CSL projections.
+        Some(mut manager) => match job.conversation.as_ref() {
+            Some(conversation) => match manager
+                .persist_turn(job.turn, conversation.messages(), &job.csl_state)
+                .await
+            {
+                Ok(()) => Some(manager),
+                Err(error) => {
+                    errors.push(format!(
+                        "CSL projection failed; journal continuation remains available: {error}"
+                    ));
+                    // Keep the manager: a transient append failure must not make
+                    // all later turns silently stop producing CSL projections.
+                    Some(manager)
+                }
+            },
+            None => {
+                errors.push(
+                    "CSL projection failed: committed conversation is unavailable".to_string(),
+                );
                 Some(manager)
             }
         },
@@ -325,10 +327,6 @@ mod tests {
     use astra_turn_core::conversation_log::{CslEntry, CslStore, CslStoreError};
     use std::time::Instant;
 
-    fn test_api() -> astra_thin_client::ThinClient {
-        astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap()
-    }
-
     struct DelayedCslStore(std::time::Duration);
 
     #[async_trait::async_trait]
@@ -422,9 +420,7 @@ mod tests {
             .unwrap(),
         );
 
-        let api = test_api();
-        let job =
-            prepare_turn_post_commit_job(&mut state, &api, None, final_messages, Instant::now());
+        let job = prepare_turn_post_commit_job(&mut state, Instant::now());
         let completion = execute_turn_post_commit_job(job).await;
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
         apply_turn_post_commit_completion(completion, &mut state);
@@ -481,13 +477,7 @@ mod tests {
             .owner_sessions_root(&owner_b)
             .unwrap();
         let store_b = FileCslStore::new(root_b);
-        let mut job = prepare_turn_post_commit_job(
-            &mut state,
-            &test_api(),
-            None,
-            result.final_messages,
-            Instant::now(),
-        );
+        let mut job = prepare_turn_post_commit_job(&mut state, Instant::now());
         super::attach_deferred_sidecars(&mut job, primary.deferred_sidecars);
         let completion = execute_turn_post_commit_job(job).await;
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
@@ -525,6 +515,78 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_turns_project_their_own_committed_conversations() {
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use astra_turn_core::conversation_log::{file_store::FileCslStore, manager::CslManager};
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("queued-turns-{}", uuid::Uuid::new_v4());
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_owner_sessions_dir(),
+        ));
+        let manager = CslManager::new(store.clone(), sid.clone(), Default::default()).unwrap();
+        let first_messages = vec![serde_json::json!({"role":"user", "content":"first"})];
+        let first = ActiveConversation::empty(astra_services::local_owner_scope().id(), &sid)
+            .unwrap()
+            .prepare_commit(1, None, first_messages.clone())
+            .unwrap()
+            .next;
+        let mut state = SessionState {
+            session_id: Some(sid.clone()),
+            csl_manager: Some(manager),
+            active_conversation: Some(first),
+            turn: 1,
+            ..Default::default()
+        };
+        let first_job = prepare_turn_post_commit_job(&mut state, Instant::now());
+        let mut second_messages = first_messages.clone();
+        second_messages.push(serde_json::json!({"role":"assistant", "content":"second"}));
+        state.active_conversation = Some(
+            state
+                .active_conversation
+                .as_ref()
+                .unwrap()
+                .prepare_commit(2, None, second_messages.clone())
+                .unwrap()
+                .next,
+        );
+        state.turn = 2;
+        let second_job = prepare_turn_post_commit_job(&mut state, Instant::now());
+
+        let first_completion = execute_turn_post_commit_job(first_job).await;
+        assert!(
+            first_completion.errors.is_empty(),
+            "{:?}",
+            first_completion.errors
+        );
+        assert_eq!(
+            store
+                .load_materialized_blocking(&sid)
+                .unwrap()
+                .unwrap()
+                .messages,
+            first_messages
+        );
+        apply_turn_post_commit_completion(first_completion, &mut state);
+        let second_completion = execute_turn_post_commit_job(second_job).await;
+        assert!(
+            second_completion.errors.is_empty(),
+            "{:?}",
+            second_completion.errors
+        );
+        assert_eq!(
+            store
+                .load_materialized_blocking(&sid)
+                .unwrap()
+                .unwrap()
+                .messages,
+            second_messages
+        );
+        assert!(apply_turn_post_commit_completion(second_completion, &mut state).is_empty());
+    }
+
+    #[tokio::test]
     async fn delayed_csl_projection_completes_without_being_cancelled() {
         use astra_turn_core::conversation_log::manager::CslManager;
 
@@ -535,15 +597,26 @@ mod tests {
             Default::default(),
         )
         .unwrap();
+        let conversation =
+            astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                astra_services::local_owner_scope().id(),
+                &session_id,
+                Vec::new(),
+                1,
+                astra_turn_core::active_conversation::ActiveConversationSource::Live,
+            )
+            .unwrap();
         let mut state = SessionState {
             session_id: Some(session_id),
             csl_manager: Some(manager),
+            active_conversation: Some(conversation),
             turn: 1,
             ..Default::default()
         };
 
-        let api = test_api();
-        let job = prepare_turn_post_commit_job(&mut state, &api, None, Vec::new(), Instant::now());
+        let mut job = prepare_turn_post_commit_job(&mut state, Instant::now());
+        // Use the delayed store instead of the fresh production file manager.
+        job.csl_manager = state.csl_manager.take();
         let completion = execute_turn_post_commit_job(job).await;
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
         assert!(completion.csl_manager.is_some());
@@ -564,8 +637,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _job =
-            prepare_turn_post_commit_job(&mut state, &test_api(), None, Vec::new(), Instant::now());
+        let _job = prepare_turn_post_commit_job(&mut state, Instant::now());
         assert!(state.csl_manager.is_some());
     }
 

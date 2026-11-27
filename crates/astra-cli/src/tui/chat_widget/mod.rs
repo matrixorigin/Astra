@@ -2968,10 +2968,12 @@ impl ChatWidget {
             return;
         };
         let events = std::mem::take(&mut self.explain_analyze_events);
+        graph.finish_ingest();
         let mut publication_error = None;
         let publication = match crate::explain_analyze_artifact::persist_rendered_report(
             &self.session_id,
             &events,
+            &graph,
             delivery_degraded,
             self.explain_analyze_report_format,
             self.explain_analyze_verbose,
@@ -2983,7 +2985,6 @@ impl ChatWidget {
                 None
             }
         };
-        graph.finish_ingest();
         if !graph.nodes().is_empty() {
             self.commit_cell(Box::new(ExplainAnalyzeCell::new(
                 graph,

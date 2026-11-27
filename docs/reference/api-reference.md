@@ -362,7 +362,8 @@ with terminal status; a client querying an incomplete run may receive
 `POST /sessions/{session_id}/forks` accepts
 `{idempotency_key, expected_parent_cursor, reason}` and returns the prepared
 `SessionForkManifestV1`. The key identifies the immutable request; changing the
-request under the same key conflicts.
+request under the same key conflicts. `prepare_reason` retains the original
+reason; `status_detail` describes a subsequent abort when present.
 
 `POST /sessions/{session_id}/forks/{fork_id}/activate-for-continuation` accepts
 `{}` and returns `{manifest, child_head}`. It activates the shared conversation

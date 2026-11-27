@@ -70,9 +70,36 @@ pub enum ExplainAnalyzeDecisionDetailV1 {
         requirement_index: u32,
         match_count: u32,
     },
+    /// Source-classified failure. Never includes provider prose or tool output.
+    Failure { error_kind: astra_core::ErrorKind },
 }
 
 impl ExplainAnalyzeDecisionDetailV1 {
+    pub fn failure(
+        error_kind: astra_core::ErrorKind,
+        outcome: ExplainAnalyzeOutcomeV1,
+    ) -> Option<Self> {
+        Self::is_reportable_failure(error_kind, Some(outcome))
+            .then_some(Self::Failure { error_kind })
+    }
+
+    fn is_reportable_failure(
+        error_kind: astra_core::ErrorKind,
+        outcome: Option<ExplainAnalyzeOutcomeV1>,
+    ) -> bool {
+        error_kind != astra_core::ErrorKind::Unknown
+            && matches!(
+                outcome,
+                Some(
+                    ExplainAnalyzeOutcomeV1::Failed
+                        | ExplainAnalyzeOutcomeV1::Blocked
+                        | ExplainAnalyzeOutcomeV1::Rejected
+                        | ExplainAnalyzeOutcomeV1::Interrupted
+                        | ExplainAnalyzeOutcomeV1::Cancelled
+                )
+            )
+    }
+
     fn is_valid_for(
         &self,
         kind: ExplainAnalyzeNodeKindV1,
@@ -92,6 +119,15 @@ impl ExplainAnalyzeDecisionDetailV1 {
                     )
                     && *requirement_index < 16
                     && *match_count != 1
+            }
+            Self::Failure { error_kind } => {
+                matches!(
+                    kind,
+                    ExplainAnalyzeNodeKindV1::ProviderAttempt
+                        | ExplainAnalyzeNodeKindV1::ToolCall
+                        | ExplainAnalyzeNodeKindV1::Admission
+                ) && transition == ExplainAnalyzeTransitionV1::Finished
+                    && Self::is_reportable_failure(*error_kind, outcome)
             }
         }
     }
@@ -774,6 +810,37 @@ mod tests {
             },
         );
         assert!(!event.is_valid());
+    }
+
+    #[test]
+    fn classified_failure_is_bounded_to_failed_execution_facts() {
+        let mut event = started();
+        event.transition = ExplainAnalyzeTransitionV1::Finished;
+        event.start_elapsed_ms = Some(0);
+        event.duration_ms = Some(event.elapsed_ms);
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Failed);
+        event.decision_detail = ExplainAnalyzeDecisionDetailV1::failure(
+            astra_core::ErrorKind::RateLimit,
+            ExplainAnalyzeOutcomeV1::Failed,
+        );
+        assert!(event.is_valid());
+        let mut wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            wire["decision_detail"],
+            serde_json::json!({"kind":"failure","error_kind":"rate_limit"})
+        );
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
+        assert!(!event.is_valid());
+        assert!(
+            ExplainAnalyzeDecisionDetailV1::failure(
+                astra_core::ErrorKind::Unknown,
+                ExplainAnalyzeOutcomeV1::Failed,
+            )
+            .is_none()
+        );
+        wire["decision_detail"]["error_kind"] =
+            serde_json::json!("provider message with private data");
+        assert!(serde_json::from_value::<ExplainAnalyzeEventV1>(wire).is_err());
     }
 
     #[test]
