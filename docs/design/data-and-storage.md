@@ -202,11 +202,11 @@ canonical owners; no replacement Agent metadata projection is stored.
 ## Optional database projections
 
 Fresh schema contract `2026-11-27-v128` removes the model request metric
-shards, two unused request-context indexes, and the semantic read observation
-and budget tables. Inference settlement and recovery write canonical evidence
-without an aggregate upsert. The dashboard reads existing process-local
-counters. Exact historical usage queries retain their Run and inference
-ledger sources.
+shards, eight metric-only request-context columns, two unused request-context
+indexes, and the semantic read observation and budget tables. Inference
+settlement and recovery write canonical evidence without an aggregate upsert.
+The dashboard reads existing process-local counters. Exact historical usage
+queries retain their Run and inference ledger sources.
 
 The existing executor-local cache owns optional MCP pure-read reuse. A hit
 does no cache SQL and can still complete the exact invocation in the existing

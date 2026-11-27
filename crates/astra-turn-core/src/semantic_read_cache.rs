@@ -1,6 +1,5 @@
-//! Bounded semantic read-observation cache state machine.
+//! Bounded executor-local cache for successful semantic read observations.
 //!
-//! This is the executable contract shared by ephemeral and durable adapters.
 //! It owns fill fencing and resource limits; it does not resolve provider
 //! policy, freshness, permission, or presentation hooks.
 

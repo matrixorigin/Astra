@@ -334,7 +334,9 @@ owner/session/run/attempt/invocation partner, even when the accepted row lies
 outside the requested page. Missing or inconsistent evidence is an error, not
 an omitted terminal or fabricated usage. Normal terminal writes do not read
 the accepted row; crash recovery retains its existing accepted-context lookup.
-Paired retention keeps its original policy. The model dashboard aggregates
+Topology, provider, purpose and usage remain in the request and terminal
+payloads. The table carries the keys and outcome needed for pairing and
+retention. The model dashboard aggregates
 existing process-local main-attempt and provider admission calibration counters
 in Prometheus. Those counters cover the operations observed by their producers
 and reset with the process. Exact historical usage remains in Run terminal

@@ -486,9 +486,6 @@ pub struct ModelRequestContextSeed {
     /// auxiliary subject cannot be retried by moving to another provider round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_round: Option<u32>,
-    /// Catalog-provided family used for low-cardinality aggregation. It is
-    /// never inferred by substring matching the provider model name.
-    pub model_family: Option<String>,
     pub actor_id: Option<String>,
     pub execution_principal: Option<String>,
     pub billing_scope: Option<String>,
@@ -513,7 +510,6 @@ impl ModelRequestContextSeed {
             topology: ModelRequestTopology::ServerOnly,
             rollout_stage: ModelRequestRolloutStage::Shadow,
             execution_round: None,
-            model_family: None,
             actor_id: None,
             execution_principal: None,
             billing_scope: None,

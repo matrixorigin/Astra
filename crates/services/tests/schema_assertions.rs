@@ -813,24 +813,21 @@ async fn schema_rationalization_runtime_contract() {
         );
     }
 
-    let request_context = column_names(&pool, &schema, "model_request_context_events").await;
-    for expected in [
-        "event_id",
-        "user_id",
-        "attempt_id",
-        "invocation_id",
-        "event_stage",
-        "topology",
-        "provider",
-        "model_family",
-        "purpose",
-        "event_json",
-    ] {
-        assert!(
-            request_context.iter().any(|column| column == expected),
-            "model_request_context_events missing {expected}"
-        );
-    }
+    assert_eq!(
+        column_names(&pool, &schema, "model_request_context_events").await,
+        [
+            "event_id",
+            "user_id",
+            "attempt_id",
+            "invocation_id",
+            "session_id",
+            "run_id",
+            "event_stage",
+            "terminal_status",
+            "event_json",
+            "created_at",
+        ]
+    );
     assert_eq!(
         primary_key_columns(&pool, &schema, "model_request_context_events").await,
         ["user_id", "event_id"],
