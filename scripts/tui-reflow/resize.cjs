@@ -13,6 +13,7 @@ const binary = path.resolve(process.env.ASTRA_TEST_BINARY || '../../target/debug
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function journey(sizes, draft = false, rapid = false, displacedCursor = false, expiredReply = false) {
+  const checkTranscriptReturn = draft && sizes.length === 0 && !rapid;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
   const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root], {
@@ -168,7 +169,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       await settle();
     }
     check('initial 100x30');
-    if (draft && !rapid) {
+    if (checkTranscriptReturn) {
       const draftText = 'DRAFT_SENTINEL';
       send({ input: '\x0f' });
       await waitFor(() => lines().some(line => line.includes('· Transcript')));
@@ -263,6 +264,7 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   await journey([[40, 30], [160, 30], [100, 30], [40, 30], [160, 30]]);
   await journey([[100, 15], [100, 30], [100, 10], [100, 35], [40, 15], [160, 30]]);
   await journey([[40, 30], [160, 30], [40, 15], [100, 30]], true);
+  await journey([], true);
   const rapidSizes = Array.from({ length: 3 }, () => [[40, 30], [160, 30], [100, 15], [100, 30]]).flat();
   await journey(rapidSizes, false, true);
   await journey(rapidSizes, true, true);
