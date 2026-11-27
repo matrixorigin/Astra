@@ -193,7 +193,7 @@ impl BottomPaneView for ListSelectionView {
                 self.filter.pop();
                 self.selected = 0;
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if crate::tui::event::is_text_key(&key) => {
                 self.filter.push(c);
                 self.selected = 0;
             }

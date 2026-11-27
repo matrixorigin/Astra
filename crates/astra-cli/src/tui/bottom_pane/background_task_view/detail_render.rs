@@ -6,9 +6,10 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::types::{
-    BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskStatusExt, DETAIL_TAIL_LINES,
+    BackgroundTaskRow, BackgroundTaskStatusExt, DETAIL_TAIL_LINES, LiveControlState,
     format_elapsed, format_timestamp_ms, pluralize_with_count,
 };
 
@@ -35,18 +36,30 @@ pub(crate) fn render_detail(
     }
     timing_parts.push(format!("elapsed {}", format_elapsed(row.elapsed_ms)));
 
-    let title_label = match row.kind {
-        BackgroundTaskKind::Shell => "  command ",
-        BackgroundTaskKind::LocalAgent => "  task ",
-        BackgroundTaskKind::CloudSession
-        | BackgroundTaskKind::MainSession
-        | BackgroundTaskKind::Monitor => "  title ",
+    let stale = row.live_control == LiveControlState::StaleHandle;
+    let status = if stale {
+        format!("stale · {}", row.status.label())
+    } else {
+        row.status.label().to_string()
     };
+    let status_color = if stale {
+        theme.warn
+    } else {
+        row.status.color()
+    };
+    let title = if row.title.trim().is_empty() {
+        &row.id
+    } else {
+        &row.title
+    };
+    let title_width = usize::from(area.width);
+    let title_width = title_width.saturating_sub(5 + status.width());
+    let title = super::super::chat_composer::input_preview(title, title_width);
     let title_line = Line::from(vec![
-        crate::tui::style::status_marker(row.status.presentation()),
-        Span::styled(row.id.clone(), title_style),
-        Span::styled(" · ", dim),
-        Span::styled(row.status.label(), Style::default().fg(row.status.color())),
+        Span::raw("  "),
+        Span::styled(title, title_style),
+        Span::styled(if title_width > 0 { " · " } else { "" }, dim),
+        Span::styled(status, Style::default().fg(status_color)),
     ]);
     let context_lines = vec![
         Line::from(vec![
@@ -55,10 +68,7 @@ pub(crate) fn render_detail(
             Span::styled(" · ", dim),
             Span::raw(timing_parts.join(" · ")),
         ]),
-        Line::from(vec![
-            Span::styled(title_label, dim),
-            Span::raw(row.title.clone()),
-        ]),
+        Line::from(vec![Span::styled("  id ", dim), Span::raw(row.id.clone())]),
     ];
     let mut secondary_lines = Vec::new();
     if let Some(total_bytes) = row.total_bytes {
@@ -123,27 +133,27 @@ pub(crate) fn render_detail(
     // Keep diagnostics and the next useful action ahead of low-signal
     // counters. The detail viewport is intentionally short, so silently
     // keeping insertion order could hide the reason a task needs attention.
-    let mut metadata_lines = Vec::with_capacity(
-        1 + actionable_lines.len() + context_lines.len() + secondary_lines.len(),
-    );
-    metadata_lines.push(title_line);
+    let mut metadata_lines =
+        Vec::with_capacity(actionable_lines.len() + context_lines.len() + secondary_lines.len());
     metadata_lines.extend(actionable_lines);
     metadata_lines.extend(context_lines);
     metadata_lines.extend(secondary_lines);
 
-    let tail = row
+    let output = row
         .output_tail
         .as_deref()
         .map(str::trim_end)
-        .filter(|tail| !tail.is_empty())
-        .unwrap_or_else(|| {
-            if row.live_control == super::types::LiveControlState::StaleHandle {
-                "No output retained · last known status"
-            } else {
-                row.status.empty_output_state()
-            }
-        });
-    let tail_lines = tail.lines().collect::<Vec<_>>();
+        .filter(|tail| !tail.is_empty());
+    let tail = output.unwrap_or(if stale {
+        "No output retained · last known status"
+    } else {
+        row.status.empty_output_state()
+    });
+    let tail_lines = tail
+        .lines()
+        .rev()
+        .take(DETAIL_TAIL_LINES)
+        .collect::<Vec<_>>();
     let body_height = usize::from(area.height);
     let tail_capacity = body_height
         .saturating_sub(3)
@@ -154,22 +164,33 @@ pub(crate) fn render_detail(
     } else {
         0
     };
-    let metadata_capacity = body_height
-        .saturating_sub(tail_budget)
-        .max(1)
-        .min(body_height.max(1));
-    let max_scroll = metadata_lines.len().saturating_sub(metadata_capacity);
+    let metadata_capacity = body_height.saturating_sub(tail_budget + 1);
+    let max_scroll = if metadata_capacity > 0 {
+        metadata_lines.len().saturating_sub(metadata_capacity)
+    } else {
+        0
+    };
     let scroll = requested_scroll.min(max_scroll);
-    let mut lines = metadata_lines
-        .into_iter()
-        .skip(scroll)
-        .take(metadata_capacity)
-        .collect::<Vec<_>>();
+    let mut lines = Vec::with_capacity(body_height);
+    lines.push(title_line);
+    lines.extend(
+        metadata_lines
+            .into_iter()
+            .skip(scroll)
+            .take(metadata_capacity),
+    );
     if tail_capacity > 0 {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  Latest output", dim)));
-        for line in &tail_lines[tail_lines.len() - tail_capacity..] {
-            lines.push(Line::from(format!("  {line}")));
+        for line in tail_lines[..tail_capacity].iter().rev() {
+            lines.push(Line::styled(
+                format!("  {line}"),
+                if output.is_some() {
+                    Style::default().fg(theme.fg)
+                } else {
+                    dim
+                },
+            ));
         }
     }
 

@@ -71,7 +71,7 @@ use crate::cli::chat_stream::ApprovalResponse;
 use ask_user_view::AskUserView;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 const MAX_PENDING_INTENTS: usize = 64;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
@@ -474,27 +474,16 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             astra_turn_types::UserIntentStatus::Returned,
         ) => format!("Message returned from {}", target.agent_name()),
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::AcceptedLocal) => {
-            "Waiting for the current task to receive your message".to_string()
+            "Guidance pending · current run".to_string()
         }
         (
             PendingUserIntentTarget::ActiveRun,
             astra_turn_types::UserIntentStatus::AcceptedRemote,
         ) => match task_status {
-            TaskStatus::ToolExecuting { .. } => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
-            TaskStatus::WaitingApproval { .. } => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
-            TaskStatus::WaitingModel => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
             TaskStatus::Cancelling => "Stopping · checking message delivery".to_string(),
-            TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
+            TaskStatus::Exiting => "Exiting · checking message delivery".to_string(),
             TaskStatus::Idle => "Checking whether your message was used".to_string(),
-            TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
+            _ => "Guidance received · current run".to_string(),
         },
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Applied) => {
             "Message added to the conversation".to_string()
@@ -2585,6 +2574,7 @@ impl BottomPane {
     pub(super) fn has_composer_hints(&self, width: u16) -> bool {
         width >= 34
             && !self.has_active_view()
+            && (!self.composer.is_empty() || !self.has_pending_approvals())
             && self.mention_menu.is_none()
             && self.skill_popup.is_none()
     }
@@ -2601,8 +2591,13 @@ impl BottomPane {
             } else {
                 "↑↓ select · Tab insert · Esc close menu"
             }
+        } else if matches!(
+            self.task_status,
+            TaskStatus::Cancelling | TaskStatus::Exiting
+        ) {
+            "Ctrl+G agents · Ctrl+O transcript · Shift+↓ background"
         } else if self.task_status.is_active() {
-            "Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · Ctrl+Q queue · Shift+Enter newline"
+            "Enter guide · Ctrl+Q queue · Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · Shift+Enter newline"
         } else {
             "Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · / commands · Shift+Enter newline"
         }
@@ -3015,9 +3010,7 @@ impl BottomPane {
             }
             return h;
         }
-        let content_h = self
-            .composer
-            .desired_height(width - super::style::conversation_margin(width) * 2);
+        let content_h = self.composer.desired_height(width);
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
         let next_turn_queue_h = self.next_turn_submission_height();
@@ -3052,7 +3045,7 @@ impl BottomPane {
         let approval = take(self.focused_approval_height(area.width));
         composer += take(
             self.composer
-                .desired_height(area.width - super::style::conversation_margin(area.width) * 2)
+                .desired_height(area.width)
                 .saturating_sub(composer),
         );
         let popup_rows = self.popup_height();
@@ -3072,16 +3065,12 @@ impl BottomPane {
             y += height;
             rect
         };
-        let margin = ratatui::layout::Margin {
-            horizontal: super::style::conversation_margin(area.width),
-            vertical: 0,
-        };
         [
             row(approval),
             row(queue),
             row(next_turn_queue),
             row(context),
-            row(composer).inner(margin),
+            row(composer),
             row(popup),
             row(footer),
             row(hints),
@@ -3760,7 +3749,7 @@ impl BottomPane {
             "/help keys lists the shortcuts.",
         ];
         const WORKING: &[&str] = &[
-            "Ctrl+Q queues input.",
+            "Enter guides this run. Ctrl+Q queues for the next turn.",
             "Ctrl+O opens the live transcript.",
             "Ctrl+G inspects active runs.",
         ];
@@ -4012,193 +4001,79 @@ impl BottomPane {
     }
 
     fn user_intent_height(&self) -> u16 {
-        let count = self.visible_pending_intents().take(3).count();
-        if count == 0 {
-            return 0;
-        }
-        let preview_rows = count.min(2) as u16;
-        let more_row = u16::from(count > 2);
-        1 + preview_rows + more_row
+        input_notice_height(self.visible_pending_intents().take(3).count())
     }
 
     fn next_turn_submission_height(&self) -> u16 {
-        let count = self.visible_next_turn_submissions().take(3).count();
-        if count == 0 {
-            return 0;
-        }
-        let preview_rows = count.min(2) as u16;
-        let more_row = u16::from(count > 2);
-        1 + preview_rows + more_row
+        input_notice_height(self.visible_next_turn_submissions().take(3).count())
     }
 
     fn render_pending_user_intents(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        use astra_turn_types::UserIntentStatus::{
+            AcceptedLocal, AcceptedRemote, Applied, Returned,
+        };
+
+        if area.is_empty() {
             return;
         }
-        let theme = crate::tui::theme::current();
-
-        // Distinct panel surface: visibly darker (dark term) / darker still
-        // (light term) than the composer surface so the queue reads as its
-        // own region, not as more of the input box.
-        let panel = crate::tui::style::queue_panel_style();
-        for y in area.y..area.y + area.height {
-            buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
-        }
-        let bg = panel.bg.unwrap_or(ratatui::style::Color::Reset);
-
-        let mut visible = self.visible_pending_intents();
-        let Some(head) = visible.next() else {
-            return;
-        };
-        let second = visible.next();
-        let remaining = if second.is_some() && area.height >= 4 {
-            visible.count()
-        } else {
-            0
-        };
+        let mut intents = self.visible_pending_intents();
+        let Some(first) = intents.next() else { return };
         let title = if self.interrupt_pending {
-            "Stopping · checking message delivery".to_string()
+            "Stopping · checking message delivery".into()
         } else {
-            pending_user_intent_title(head, &self.task_status)
+            pending_user_intent_title(first, &self.task_status)
         };
-        let title_style = Style::default().fg(theme.accent).bg(bg);
-        Widget::render(
-            Line::from(Span::styled(
-                truncate_display(&title, area.width as usize),
-                title_style,
-            )),
-            Rect::new(area.x, area.y, area.width, 1),
-            buf,
-        );
-
-        // Visual hierarchy on the queue band:
-        //   head — accent + bold, it's about to fire.
-        //   tail — `fg` (not `dim`): queued entries are user content that
-        //     must remain legible against the low-contrast queue surface;
-        //     `dim` (DarkGray) sat too close to the panel bg.
-        //   +N more — `accent_dim` keeps the count present without
-        //     competing with the queued text above. Dropped the DIM
-        //     modifier: it doubled up on a color already at low emphasis.
-        let head_style = Style::default()
-            .fg(theme.accent)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
-        let tail_style = panel;
-        let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
-
-        let preview_rows = (area.height as usize).saturating_sub(1);
-        for (idx, pending) in std::iter::once(head)
-            .chain(second)
-            .take(preview_rows)
-            .take(2)
-            .enumerate()
-        {
-            // Truncate by the actual column budget, not a hard-coded 100.
-            let status = if pending.custody == PendingUserIntentCustody::Unconfirmed {
-                "unknown"
+        let theme = super::theme::current();
+        let color = if self.interrupt_pending || first.delivery_is_unconfirmed() {
+            theme.warn
+        } else {
+            theme.accent
+        };
+        let previews = std::iter::once(("", first.text.as_str())).chain(intents.map(|pending| {
+            let prefix = if pending.delivery_is_unconfirmed() {
+                "Delivery unknown · "
+            } else if pending.target == first.target
+                && pending.status == first.status
+                && pending.custody == first.custody
+            {
+                ""
             } else {
                 match pending.status {
-                    astra_turn_types::UserIntentStatus::AcceptedLocal => "waiting",
-                    astra_turn_types::UserIntentStatus::AcceptedRemote => "received",
-                    astra_turn_types::UserIntentStatus::Applied => "applied",
-                    astra_turn_types::UserIntentStatus::Returned => "returned",
+                    AcceptedLocal => "Pending · ",
+                    AcceptedRemote => "Received · ",
+                    Applied => "Applied · ",
+                    Returned => "Returned · ",
                 }
             };
-            let prefix = format!("{}  {status} · ", idx + 1);
-            let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let preview = deferred_followup_preview(&pending.text, budget);
-            let line = format!("{prefix}{preview}");
-            let style = if idx == 0 { head_style } else { tail_style };
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    style,
-                )),
-                Rect::new(area.x, area.y + 1 + idx as u16, area.width, 1),
-                buf,
-            );
-        }
-        if remaining > 0 {
-            let line = format!("  +{remaining} more");
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    more_style,
-                )),
-                Rect::new(area.x, area.y + 3, area.width, 1),
-                buf,
-            );
-        }
+            (prefix, pending.text.as_str())
+        }));
+        render_input_notice(area, buf, &title, color, previews);
     }
 
     fn render_queued_next_turn_submissions(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        if area.is_empty() {
             return;
         }
-        let mut visible = self.visible_next_turn_submissions();
-        let Some(first) = visible.next() else { return };
-        let second = visible.next();
-        let remaining = if second.is_some() && area.height >= 4 {
-            visible.count()
-        } else {
-            0
+        let mut submissions = self.visible_next_turn_submissions();
+        let Some(first) = submissions.next() else {
+            return;
         };
-        let theme = crate::tui::theme::current();
-        let panel = crate::tui::style::queue_panel_style();
-        for y in area.y..area.y + area.height {
-            buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
-        }
-        let bg = panel.bg.unwrap_or(ratatui::style::Color::Reset);
-        let title_style = Style::default().fg(theme.accent).bg(bg);
-        Widget::render(
-            Line::from(Span::styled(
-                truncate_display(
-                    "Message queued · starts when the current action is ready",
-                    area.width as usize,
-                ),
-                title_style,
-            )),
-            Rect::new(area.x, area.y, area.width, 1),
+        let command = matches!(first, NextTurnSubmission::Interactive(text)
+            if super::slash_dispatch::parse_submission(text).is_command());
+        let title = if command {
+            "Command queued · after current work"
+        } else {
+            "Message queued · next turn"
+        };
+        render_input_notice(
+            area,
             buf,
+            title,
+            super::theme::current().accent,
+            std::iter::once(first)
+                .chain(submissions)
+                .map(|entry| ("", entry.text())),
         );
-
-        let head_style = Style::default()
-            .fg(theme.accent)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
-        let tail_style = panel;
-        let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
-        let preview_rows = (area.height as usize).saturating_sub(1);
-        for (idx, text) in std::iter::once(first)
-            .chain(second)
-            .take(preview_rows)
-            .take(2)
-            .enumerate()
-        {
-            let prefix = format!("{}  queued · ", idx + 1);
-            let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let line = format!("{prefix}{}", deferred_followup_preview(text.text(), budget));
-            let style = if idx == 0 { head_style } else { tail_style };
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    style,
-                )),
-                Rect::new(area.x, area.y + 1 + idx as u16, area.width, 1),
-                buf,
-            );
-        }
-        if remaining > 0 {
-            let line = format!("  +{remaining} more");
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    more_style,
-                )),
-                Rect::new(area.x, area.y + 3, area.width, 1),
-                buf,
-            );
-        }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
@@ -4270,35 +4145,54 @@ fn reconcile_conversation_tab(
     }
 }
 
-fn deferred_followup_preview(text: &str, limit: usize) -> String {
-    let single_line = text.trim().replace('\n', " ⏎ ");
-    let mut preview: String = single_line.chars().take(limit).collect();
-    if single_line.chars().count() > limit {
-        preview.push('…');
+fn input_notice_height(count: usize) -> u16 {
+    if count == 0 {
+        0
+    } else {
+        1 + count.min(3) as u16
     }
-    preview
 }
 
-fn truncate_display(text: &str, max_width: usize) -> String {
-    if text.width() <= max_width {
-        return text.to_string();
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-    let keep = max_width - 1;
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let width = ch.width().unwrap_or(0);
-        if used + width > keep {
-            break;
+fn render_input_notice<'a>(
+    area: Rect,
+    buf: &mut Buffer,
+    title: &str,
+    color: ratatui::style::Color,
+    mut previews: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    let theme = super::theme::current();
+    let rail = super::glyphs::current().live_gutter.to_string();
+    let dim = Style::default().fg(theme.dim);
+    let indent = 2.min(area.width.saturating_sub(1));
+    let width = area.width - indent;
+    let row_area = |row| Rect::new(area.x + indent, area.y + row, width, 1);
+    let heading = Line::styled(title, Style::default().fg(color).bold());
+    Widget::render(heading, row_area(0), buf);
+    if indent > 0 {
+        for y in area.y..area.bottom() {
+            buf.set_string(area.x, y, &rail, dim);
         }
-        out.push(ch);
-        used += width;
     }
-    out.push('…');
-    out
+    let rows = usize::from(area.height.saturating_sub(1).min(2));
+    for (row, (prefix, text)) in previews.by_ref().take(rows).enumerate() {
+        let budget = usize::from(width).saturating_sub(prefix.width());
+        let preview = chat_composer::input_preview(text, budget);
+        let line = Line::from(vec![
+            Span::styled(prefix, dim),
+            Span::styled(preview, Style::default().fg(theme.fg)),
+        ]);
+        Widget::render(line, row_area(row as u16 + 1), buf);
+    }
+    if area.height >= 4 {
+        let remaining = previews.count();
+        if remaining > 0 {
+            Widget::render(
+                Line::styled(format!("+{remaining} more"), dim),
+                row_area(3),
+                buf,
+            );
+        }
+    }
 }
 
 /// Fit whole shortcuts and keep key chords distinct from their labels.

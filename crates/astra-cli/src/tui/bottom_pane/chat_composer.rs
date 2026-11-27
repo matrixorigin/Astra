@@ -1089,7 +1089,7 @@ impl ChatComposer {
             .filter(|_| include_preview)
             .and_then(|index| search.entries.get(index))
             .and_then(|entry| self.history_entry_text(entry))
-            .map(|entry| history_preview(entry, preview_width))
+            .map(|entry| input_preview(entry, preview_width))
             .unwrap_or_default();
         let cursor = opening.width() + display_query.width();
         let dim = Style::default().fg(theme.dim).bg(panel_bg);
@@ -1243,13 +1243,16 @@ impl ChatComposer {
             else {
                 continue;
             };
+            let y = area.y + row as u16;
             let (marker, style) = if index == selected {
-                ("> ", Style::default().fg(theme.accent).bold())
+                let selected = Style::default().bg(theme.selected_bg);
+                buf.set_style(Rect::new(area.x, y, area.width, 1), selected);
+                ("› ", selected.fg(theme.selected_fg).bold())
             } else {
                 ("  ", Style::default().fg(theme.fg))
             };
             let line = Line::styled(format!("{marker}{preview}"), style);
-            buf.set_line(area.x, area.y + row as u16, &line, area.width);
+            buf.set_line(area.x, y, &line, area.width);
             painted[index] = true;
         }
         search.painted.set(painted);
@@ -1337,13 +1340,13 @@ fn history_match_hash(text: &str) -> u64 {
 }
 
 fn suggestion_preview(text: &str, width: usize) -> Option<String> {
-    let preview = history_preview(text, width);
+    let preview = input_preview(text, width);
     let visible = preview.trim_matches(|ch: char| ch.is_whitespace() || ch == '…');
     (visible.width() > 0).then_some(preview)
 }
 
-fn history_preview(text: &str, width: usize) -> String {
-    // Only the visible prefix is needed; a history entry can be large.
+pub(super) fn input_preview(text: &str, width: usize) -> String {
+    // Only the visible prefix is needed; a message can be large.
     let prefix: String = text.graphemes(true).take(width.saturating_add(1)).collect();
     truncate_end(&history_search_display(&prefix), width)
 }

@@ -443,11 +443,23 @@ fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 10));
     assert!(
-        rendered.contains("Message queued"),
+        rendered.contains("Message queued · next turn"),
         "a locally accepted next turn must be visible immediately; got {rendered:?}"
     );
     assert!(rendered.contains("summarize the findings"), "{rendered:?}");
     assert!(rendered.contains("then prepare the patch"), "{rendered:?}");
+    let lines: Vec<_> = rendered.lines().collect();
+    let rail = super::super::glyphs::current().live_gutter;
+    assert!(
+        lines[..3].iter().all(|line| line.starts_with(rail)),
+        "{rendered:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with('╭') && line.ends_with('╮')),
+        "{rendered:?}"
+    );
 
     assert_eq!(
         pane.take_queued_next_turn_submissions()
@@ -477,6 +489,27 @@ fn narrow_active_composer_does_not_reintroduce_key_chrome() {
         !rendered.contains("Ctrl+C stops") && !rendered.contains("Enter queues"),
         "narrow layouts must reduce chrome rather than invent another shorthand; got {rendered:?}"
     );
+}
+
+#[test]
+fn deferred_commands_show_when_they_run() {
+    let mut pane = BottomPane::new();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    assert!(pane.queue_next_turn_submission("/config".into()));
+
+    let text = render_text(&pane, Rect::new(0, 0, 42, 9));
+    assert!(
+        text.contains("Command queued · after current work"),
+        "{text:?}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.trim_end().ends_with("/config")),
+        "{text:?}"
+    );
+    assert!(text.contains("Enter guide · Ctrl+Q queue"), "{text:?}");
 }
 
 #[test]
@@ -597,11 +630,11 @@ fn locally_accepted_intent_does_not_claim_remote_delivery() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Waiting for the current task"),
+        rendered.contains("Guidance pending · current run"),
         "local acknowledgement must not promise an application boundary; got {rendered:?}"
     );
     assert!(
-        rendered.contains("waiting"),
+        !rendered.contains("Guidance received"),
         "intent panel should show the typed local delivery status; got {rendered:?}"
     );
     assert!(
@@ -850,9 +883,14 @@ fn guidance_during_tool_execution_explains_the_real_application_boundary() {
     ));
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-    assert!(rendered.contains("Message received"), "{rendered:?}");
-    assert!(rendered.contains("waiting to take effect"), "{rendered:?}");
-    assert!(rendered.contains("Ctrl+C to stop"), "{rendered:?}");
+    assert!(
+        rendered.contains("Guidance received · current run"),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains("review the latest finding"),
+        "{rendered:?}"
+    );
     assert!(!rendered.contains("Message added"), "{rendered:?}");
     assert!(!rendered.contains("accepted locally"), "{rendered:?}");
 }

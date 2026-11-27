@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -148,6 +149,18 @@ impl PtyAstra {
     fn write(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).expect("write PTY input");
         self.writer.flush().expect("flush PTY input");
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let size = Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+        assert_eq!(result, 0, "resize the controlling terminal");
+        self.screen.screen_mut().set_size(rows, cols);
     }
 
     fn paste_and_submit(&mut self, text: &str) {
@@ -390,6 +403,13 @@ impl PtyAstra {
         self.screen.screen().contents()
     }
 
+    fn record_frame(&self, label: &str) {
+        println!(
+            "ASTRA PTY FRAME {label}\n{}\nASTRA PTY END",
+            self.current_screen().trim_end()
+        );
+    }
+
     fn screen_diagnostic(&self) -> String {
         format!(
             "current screen:\n{}\n\nraw PTY tail:\n{}",
@@ -519,9 +539,24 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
     astra.wait_for_absent("Working", UI_TRANSITION_TIMEOUT);
 
     astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[200~background navigation draft\x1b[201~");
+    astra.wait_for("│› background navigation draft", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b[1;2B"); // Shift+Down opens the background manager.
-    astra.wait_for("Background tasks", UI_TRANSITION_TIMEOUT);
-    astra.write(b"\x1b");
+    astra.wait_for_screen(
+        "background task workspace",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Background tasks")
+                && !screen.contains("background navigation draft")
+                && screen.lines().any(|line| {
+                    line.contains("Task") && line.contains("State") && line.contains("Time")
+                })
+        },
+    );
+    astra.record_frame("Background tasks");
+    astra.write(b"\x1b[1;2B"); // The same shortcut returns to the editor.
+    astra.wait_for("│› background navigation draft", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x15]); // Ctrl+U clears this draft.
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
     astra.paste_and_submit("/tasks");
@@ -562,6 +597,7 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
                     .any(|line| line.contains("Esc list") && !line.contains("S stop"))
         },
     );
+    astra.record_frame("Background task output");
     astra.write(b"\x1b");
     astra.wait_for_screen(
         "completed task remains selectable",
@@ -577,9 +613,10 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b[200~strt tsk\x1b[201~");
     astra.wait_for_screen("fuzzy prompt history", UI_TRANSITION_TIMEOUT, |screen| {
-        screen.contains("> Start the task and ask me what to do next.")
+        screen.contains("› Start the task and ask me what to do next.")
             && screen.contains("History · ↑↓ select · Tab insert")
     });
+    astra.record_frame("Fuzzy history");
     astra.write(b"\t");
     astra.wait_for(
         "│› Start the task and ask me what to do next.",
@@ -756,7 +793,7 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         UI_TRANSITION_TIMEOUT,
         |screen| {
             screen.contains("› first instruction")
-                && !screen.contains("received · first instruction")
+                && !screen.contains("Guidance received · current run")
         },
     );
     release_first.notify_one();
@@ -781,7 +818,7 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         )
     );
     astra.wait_for_screen("second POST accepted", UI_TRANSITION_TIMEOUT, |screen| {
-        screen.contains("received · second instruction")
+        screen.contains("Guidance received · current run") && screen.contains("second instruction")
     });
     let (intent_id, content, event_index) = received.lock().unwrap()[1].clone();
     mock.send_held_stream_event(serde_json::json!({
@@ -795,8 +832,7 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         |screen| {
             screen.contains("› first instruction")
                 && screen.contains("› second instruction")
-                && !screen.contains("received · first instruction")
-                && !screen.contains("received · second instruction")
+                && !screen.contains("Guidance received · current run")
         },
     );
     assert_eq!(
@@ -944,7 +980,24 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
     astra.write(b"\x1b[200~task B\x1b[201~\x11");
     astra.wait_for("task B", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b[200~task C\x1b[201~\x11");
-    astra.wait_for("task C", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "queued inputs and edge-aligned composer",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Message queued · next turn")
+                && screen
+                    .lines()
+                    .any(|line| line.starts_with('▏') && line.trim_end().ends_with("task B"))
+                && screen
+                    .lines()
+                    .any(|line| line.starts_with('▏') && line.trim_end().ends_with("task C"))
+                && screen
+                    .lines()
+                    .any(|line| line.starts_with('╭') && line.ends_with('╮'))
+                && screen.contains("Enter guide · Ctrl+Q queue")
+        },
+    );
+    astra.record_frame("Queue and live composer");
     assert_eq!(
         lookups.load(Ordering::SeqCst),
         0,
@@ -2270,6 +2323,7 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     astra.wait_for_screen("command browser actions", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("Featured") && screen.contains("Enter insert · Esc close")
     });
+    astra.record_frame("Command browser");
     astra.write(b"/");
     astra.wait_for("│› /", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Tab insert", UI_TRANSITION_TIMEOUT);
@@ -2282,26 +2336,50 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
         UI_TRANSITION_TIMEOUT,
         |screen| screen.contains("/session history") && screen.contains("Tab insert"),
     );
+    astra.record_frame("Fuzzy subcommands");
     astra.write(b"\t");
     astra.wait_for("│› /session history", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x15]); // Ctrl+U clears the completed command without running it.
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
-    // A single token stays contiguous in the terminal byte stream even when
-    // ratatui positions separately styled words with cursor movement codes.
-    let draft = "draft_survives_transcript_round_trip";
-    astra.write(draft.as_bytes());
-    astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
+    astra.resize(24, 42);
+    let draft = "检查 patch.rs";
+    astra.write(format!("\x1b[200~{draft}\x1b[201~").as_bytes());
+    astra.wait_for_screen(
+        "42-column composer with CJK",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.lines().any(|line| {
+                line.starts_with('╭') && line.ends_with('╮') && line.chars().count() == 42
+            }) && screen.contains(draft)
+        },
+    );
+    astra.record_frame("42-column composer");
+    astra.resize(30, 100);
+    astra.wait_for_screen("restored wide composer", UI_TRANSITION_TIMEOUT, |screen| {
+        screen
+            .lines()
+            .any(|line| line.starts_with('╭') && line.ends_with('╮') && line.chars().count() == 100)
+            && screen.contains(draft)
+    });
 
     astra.write(&[0x0f]); // Ctrl+O
     astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
     astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Enter details · / search", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Transcript");
 
     astra.write(&[0x0f]); // Ctrl+O
     astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x15]); // Ctrl+U clears the restored draft.
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/context");
+    astra.wait_for_screen("Context inspector", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Context · partial evidence") && screen.contains("Tab focus")
+    });
+    astra.record_frame("Context inspector");
+    astra.write(b"\x1b");
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
@@ -2327,6 +2405,7 @@ async fn config_save_updates_composer_tips_in_the_current_terminal() {
     astra.wait_for("› Show terminal tips", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b");
     astra.wait_for("Save changes?", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Settings save");
     astra.write(b"\r");
     astra.wait_for("Saved config to", UI_TRANSITION_TIMEOUT);
     astra.wait_for_screen(
@@ -2378,6 +2457,7 @@ async fn settled_explain_report_expands_evidence_and_prepares_a_follow_up() {
         "provider reported · in 120 · out 8 tokens",
         UI_TRANSITION_TIMEOUT,
     );
+    astra.record_frame("Explain evidence");
     astra.write(b"a");
     astra.wait_for(
         "About the Explain report for run mock-run-1 and turn mock-run-1-turn",
@@ -2520,6 +2600,7 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     // The Server stream continues only after the real host has accepted and
     // executed its tool request and posted the exact callback.
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
+    astra.record_frame("Tool approval");
     astra.write(b"\r");
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
     assert_committed_mock_write(&mock, home.path());
@@ -3759,6 +3840,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
         screen.contains("Agent runs") || screen.contains("Conversations")
     });
     astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Run navigator");
     astra.select_conversation_run("mock-run-agent-child", 1, None);
     astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);

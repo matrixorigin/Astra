@@ -790,7 +790,6 @@ mod tests {
             for style in [
                 crate::tui::style::user_message_style(),
                 crate::tui::style::composer_surface_style(),
-                crate::tui::style::queue_panel_style(),
             ] {
                 if matches!(expected.as_str(), "plain" | "terminal") {
                     assert!(style.bg.is_none() || style.bg == Some(Color::Reset));

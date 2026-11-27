@@ -148,8 +148,20 @@ pub(crate) fn render_list(
         return;
     }
 
-    let body_y = area.y + 1;
-    let body_h = area.height.saturating_sub(1) as usize;
+    const STATE_WIDTH: usize = 24;
+    const TIME_WIDTH: usize = 8;
+    let width = usize::from(area.width);
+    let columns = width >= 66 && area.height >= 4;
+    let name_width = width.saturating_sub(STATE_WIDTH + TIME_WIDTH + 8);
+    let body_y = area.y + 1 + u16::from(columns);
+    let body_h = usize::from(area.bottom().saturating_sub(body_y));
+    if columns {
+        let header = format!(
+            "  {:<name_width$}  {:<STATE_WIDTH$}  {:>TIME_WIDTH$}",
+            "Task", "State", "Time",
+        );
+        buf.set_line(area.x, area.y + 1, &Line::styled(header, dim), area.width);
+    }
     let entries = background_task_list_entries(rows);
     let selected_entry = entries
         .iter()
@@ -172,107 +184,66 @@ pub(crate) fn render_list(
                 grouped,
             } => {
                 let is_selected = *row_idx == selected;
-                let marker_style = if is_selected {
-                    Style::default()
-                        .fg(theme.selected_fg)
-                        .bg(theme.selected_bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    dim
-                };
+                let marker = if is_selected { "› " } else { "  " };
                 let row_style = if is_selected {
                     Style::default()
                         .fg(theme.selected_fg)
                         .add_modifier(Modifier::BOLD)
-                } else if row.display_priority() == 2 {
-                    dim
                 } else {
                     Style::default().fg(theme.fg)
                 };
+                let status_style = Style::default().fg(row.status.color());
                 visible_row_number += 1;
-                let marker = if is_selected { "› " } else { "  " };
-                let index = format!(
-                    "{visible_row_number}. {} ",
-                    crate::tui::style::status_glyph(row.status.presentation())
-                );
-                let activity = row
-                    .no_recent_output_ms
-                    .map(|ms| format!("  quiet {}", format_elapsed(ms)))
-                    .unwrap_or_default();
-                let control = row
-                    .live_control
-                    .list_label()
-                    .map(|label| format!("  {label}"))
-                    .unwrap_or_default();
-                let ownership = if row.kind == super::types::BackgroundTaskKind::LocalAgent
-                    && !row.run_in_background
-                {
-                    "  foreground"
-                } else {
-                    ""
-                };
-                let event_time = if area.width >= 88 {
-                    row.ended_at_ms
-                        .or(row.started_at_ms)
-                        .and_then(|ms| i64::try_from(ms).ok())
-                        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                        .map(|time| format!("  {}", time.format("%m-%d %H:%MZ")))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let attention = if row.display_priority() == 2 {
-                    "  history"
-                } else {
-                    ""
-                };
-                let width = usize::from(area.width);
-                let elapsed = format_elapsed(row.elapsed_ms);
-                let prefix = if row.live_control == LiveControlState::StaleHandle {
-                    "stale · "
-                } else {
-                    ""
-                };
-                let mut meta = format!(
-                    "{}  {prefix}{}  {elapsed}",
-                    row.kind.as_str(),
-                    row.status.label()
-                );
-                let exit = row
-                    .exit_code
-                    .map(|code| format!("  exit {code}"))
-                    .unwrap_or_default();
-                // Keep a recognizable title alongside status and duration as
-                // the pane narrows. Full identity and facts are in details.
-                let budget = width.saturating_sub(marker.width() + index.width() + 16);
-                for extra in [
-                    exit,
-                    control,
-                    ownership.to_string(),
-                    activity,
-                    event_time,
-                    attention.to_string(),
-                ] {
-                    if meta.width() + extra.width() <= budget {
-                        meta.push_str(&extra);
-                    }
-                }
-                meta.push_str("  ");
                 let title = if *grouped {
                     fanout_slot_title(row)
+                } else if row.title.trim().is_empty() {
+                    row.id.clone()
                 } else {
                     row.title.clone()
                 };
-                let (id, title) =
-                    compact_list_row_text(row, title.as_str(), width, marker, &index, &meta);
-                let line = Line::from(vec![
-                    Span::styled(marker, marker_style),
-                    Span::styled(index, Style::default().fg(row.status.color())),
-                    Span::styled(id, row_style),
-                    Span::styled("  ", dim),
-                    Span::styled(meta, dim),
-                    Span::styled(title, row_style),
-                ]);
+                let label = format!("{visible_row_number}. {title}");
+                let status = if row.live_control == LiveControlState::StaleHandle {
+                    format!("stale · {}", row.status.label())
+                } else if let Some(code) = row.exit_code {
+                    format!("{} · exit {code}", row.status.label())
+                } else {
+                    row.status.label().to_string()
+                };
+                let elapsed = format_elapsed(row.elapsed_ms);
+                let truncate = crate::tui::history_cell::truncate_by_width;
+                let mut spans = vec![Span::styled(marker, Style::default().fg(theme.accent))];
+                if columns {
+                    let label = truncate(&label, name_width);
+                    let remaining = name_width.saturating_sub(label.width());
+                    let kind = format!(" · {}", row.kind.as_str());
+                    let kind = if kind.width() <= remaining {
+                        kind.as_str()
+                    } else {
+                        ""
+                    };
+                    let padding = " ".repeat(remaining.saturating_sub(kind.width()));
+                    let status = truncate(&status, STATE_WIDTH);
+                    let status_pad = " ".repeat(STATE_WIDTH.saturating_sub(status.width()));
+                    spans.extend([
+                        Span::styled(label, row_style),
+                        Span::styled(format!("{kind}{padding}"), dim),
+                        Span::styled(format!("  {status}{status_pad}"), status_style),
+                        Span::styled(format!("  {elapsed:>TIME_WIDTH$}"), dim),
+                    ]);
+                } else {
+                    let mut metadata = if width >= 16 {
+                        format!(" · {}", truncate(&status, width - 12))
+                    } else {
+                        String::new()
+                    };
+                    if width >= 44 && metadata.width() + elapsed.width() + 11 <= width {
+                        metadata.push_str(&format!(" · {elapsed}"));
+                    }
+                    let label = truncate(&label, width.saturating_sub(2 + metadata.width()));
+                    spans.push(Span::styled(label, row_style));
+                    spans.push(Span::styled(metadata, status_style));
+                }
+                let line = Line::from(spans);
                 if is_selected {
                     line.style(Style::default().bg(theme.selected_bg))
                 } else {
@@ -289,37 +260,4 @@ pub(crate) fn render_list(
         }
         buf.set_line(area.x, y, &line, area.width);
     }
-}
-
-fn compact_list_row_text(
-    row: &BackgroundTaskRow,
-    title: &str,
-    width: usize,
-    marker: &str,
-    index: &str,
-    meta: &str,
-) -> (String, String) {
-    let min_title = if width >= 44 {
-        10
-    } else if width >= 34 {
-        6
-    } else {
-        0
-    };
-    let fixed_without_id_or_title = marker.width() + index.width() + 2 + meta.width();
-    let max_id = if width >= 72 {
-        24
-    } else if width >= 44 {
-        14
-    } else {
-        9
-    };
-    let id_budget = width
-        .saturating_sub(fixed_without_id_or_title + min_title)
-        .min(max_id);
-    let id = crate::tui::history_cell::truncate_by_width(&row.id, id_budget);
-    let used = fixed_without_id_or_title + id.width();
-    let title_budget = width.saturating_sub(used);
-    let title = crate::tui::history_cell::truncate_by_width(title, title_budget);
-    (id, title)
 }

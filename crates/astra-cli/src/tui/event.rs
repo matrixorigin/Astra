@@ -166,6 +166,10 @@ pub(super) fn is_text_key(key: &KeyEvent) -> bool {
         if !c.is_control() && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
 }
 
+pub(super) fn is_background_task_manage_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Down && key.modifiers == KeyModifiers::SHIFT
+}
+
 fn map_crossterm_event(event: Event, received_at: Instant) -> Option<TuiEvent> {
     match event {
         // Only forward Press events. Some terminals (kitty keyboard protocol,

@@ -16,7 +16,7 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::history_cell::truncate_by_width;
+use crate::tui::{event::is_text_key, history_cell::truncate_by_width};
 
 use super::view::{
     BottomPaneView, CancellationEvent, ConfigEditDisposition, ViewCompletion, ViewResult,
@@ -220,7 +220,7 @@ impl ConfigEditView {
                     .and_then(|id| filtered.iter().position(|item| item.id == id))
                     .unwrap_or(0);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_text_key(&key) => {
                 self.filter.push(c);
                 self.selected = 0;
             }
@@ -794,14 +794,14 @@ impl InnerEditor for ValueEditor {
                 self.refresh_inline_error();
                 InnerOutcome::Pending
             }
-            KeyCode::Char(c) if self.number.is_none() && !c.is_control() => {
+            KeyCode::Char(c) if self.number.is_none() && is_text_key(&key) => {
                 if self.buffer.len() < 64 {
                     self.buffer.push(c);
                     self.error = None;
                 }
                 InnerOutcome::Pending
             }
-            KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
+            KeyCode::Char(c) if is_text_key(&key) && (c.is_ascii_digit() || c == '-') => {
                 if c != '-'
                     || (self.number.is_some_and(|(min, _, _)| min < 0.0) && self.buffer.is_empty())
                 {
@@ -811,7 +811,8 @@ impl InnerEditor for ValueEditor {
                 InnerOutcome::Pending
             }
             KeyCode::Char('.')
-                if self.number.is_some_and(|(_, _, fraction)| fraction)
+                if is_text_key(&key)
+                    && self.number.is_some_and(|(_, _, fraction)| fraction)
                     && !self.buffer.contains('.') =>
             {
                 self.buffer.push('.');

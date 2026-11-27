@@ -91,11 +91,6 @@ pub(crate) fn composer_surface_style() -> Style {
     surface_style(super::theme::current(), default_bg(), composer_surface_rgb)
 }
 
-/// Background and foreground for the deferred-follow-up queue panel.
-pub(crate) fn queue_panel_style() -> Style {
-    surface_style(super::theme::current(), default_bg(), queue_panel_rgb)
-}
-
 pub(crate) fn footer_surface_style() -> Style {
     // The footer uses terminal defaults rather than an opaque panel.
     Style::default()
@@ -154,21 +149,6 @@ fn composer_surface_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
         ((0, 0, 0), 0.06)
     } else {
         ((84, 111, 145), 0.16)
-    };
-    blend(top, terminal_bg, alpha)
-}
-
-/// Distinct tint for the queue panel. Sits between the raw terminal
-/// background and the composer surface in prominence: more present than
-/// bare bg (so the band reads as a real region, not a gap) but less
-/// lifted than the live composer (so the user's typing surface stays the
-/// focal point). Previously 0.18 white was too close to a black terminal
-/// bg — the panel vanished and the queued content looked unanchored.
-fn queue_panel_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
-    let (top, alpha) = if is_light(terminal_bg) {
-        ((0, 0, 0), 0.10)
-    } else {
-        ((84, 111, 145), 0.10)
     };
     blend(top, terminal_bg, alpha)
 }

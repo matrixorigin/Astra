@@ -112,13 +112,6 @@ impl LiveControlState {
     pub(crate) fn can_stop(self) -> bool {
         matches!(self, Self::Available)
     }
-
-    pub(crate) fn list_label(self) -> Option<&'static str> {
-        match self {
-            Self::Available | Self::StaleHandle => None,
-            Self::UnsupportedInMode => Some("no control"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,10 +1,9 @@
 //! Background task switcher.
 //!
-//! Opened from the status-line task chip. It gives the user a typed,
-//! keyboard-driven view over local background shell tasks promoted by
-//! Ctrl+B, including detail/tail inspection and stop actions.
+//! Opened with Shift+Down or /tasks. The list, details and output share
+//! the task registry and keep the user's conversation draft parked.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::cell::Cell;
 
@@ -83,6 +82,7 @@ impl BackgroundTaskView {
             .min(rows.len().saturating_sub(1));
         let next_selected_id = rows.get(self.selected).map(|row| row.id.as_str());
         if current_selected_id.as_deref() != next_selected_id {
+            self.mode = Mode::List;
             self.detail_scroll.set(0);
         }
         self.rows = rows;
@@ -247,6 +247,16 @@ impl BottomPaneView for BackgroundTaskView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if crate::tui::event::is_background_task_manage_key(&key) {
+            self.completed = true;
+            return;
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return;
+        }
         match self.mode {
             Mode::List => match key.code {
                 KeyCode::Char('i') => self.request_input(),
@@ -343,7 +353,7 @@ impl BottomPaneView for BackgroundTaskView {
             return Some("Esc close".into());
         };
         let mut hints = match self.mode {
-            Mode::List => vec!["Enter details", "Esc close"],
+            Mode::List => vec!["Enter details", "Esc close", "↑↓ select"],
             Mode::Detail => vec!["Esc list"],
         };
         if row.status.can_kill() && row.live_control.can_stop() {
@@ -355,11 +365,14 @@ impl BottomPaneView for BackgroundTaskView {
         if row.kind == BackgroundTaskKind::Shell {
             hints.push("V output");
         }
-        match self.mode {
-            Mode::List => hints.push("↑↓ select"),
-            Mode::Detail => hints.extend(["↑↓ scroll", "Q close"]),
+        if self.mode == Mode::Detail {
+            hints.push("↑↓ scroll");
         }
         Some(hints.join(" · "))
+    }
+
+    fn owns_primary_canvas(&self) -> bool {
+        true
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -628,11 +641,11 @@ mod tests {
         assert!(text.contains("main session"), "{text}");
         assert!(text.contains("monitor"), "{text}");
         assert!(
-            text.find("agent-1").unwrap() < text.find("cloud-1").unwrap(),
+            text.find("review auth flow").unwrap() < text.find("remote plan run").unwrap(),
             "typed rows must retain deterministic identity order: {text}"
         );
         assert!(
-            text.find("cloud-1").unwrap() < text.find("main-1").unwrap(),
+            text.find("remote plan run").unwrap() < text.find("main turn").unwrap(),
             "a status transition must not promote a row and make the list jump: {text}"
         );
     }
@@ -725,7 +738,6 @@ mod tests {
         )]);
 
         let text = render(&view, 48, 3);
-        assert!(text.contains("shell"), "{text}");
         assert!(text.contains("running"), "{text}");
         assert!(text.contains("cargo"), "{text}");
         assert!(
@@ -846,6 +858,10 @@ mod tests {
         // selected task or replacing the live output surface.
         view.handle_key(key(KeyCode::End));
         let bottom = render(&view, 120, 14);
+        assert!(
+            bottom.contains("cargo test --workspace · stale · failed"),
+            "{bottom}"
+        );
         assert!(bottom.contains("output offset 8192 -> 13244"), "{bottom}");
         assert!(bottom.contains("exit 1"), "{bottom}");
 
@@ -865,16 +881,17 @@ mod tests {
         let resized = render(&view, 120, 20);
         assert!(resized.contains("reason exit code 1"), "{resized}");
 
-        // Removing the selected task resets the detail offset for the new
-        // selection rather than showing the replacement from its tail.
+        // Losing the selected task returns to the list. An approval or stop
+        // action must never silently pick up the replacing task's identity.
         view.replace_rows(vec![row("replacement", "running", "replacement task")]);
         let replacement = render(&view, 120, 14);
         assert!(
-            replacement.contains("replacement · running"),
+            replacement.contains("Background tasks") && replacement.contains("replacement task"),
             "{replacement}"
         );
-        view.handle_key(key(KeyCode::Home));
-        assert!(render(&view, 120, 14).contains("replacement · running"));
+        assert!(view.hint_keys().unwrap().contains("Enter details"));
+        view.handle_key(key(KeyCode::Enter));
+        assert!(render(&view, 120, 14).contains("replacement task · running"));
     }
 
     #[test]
@@ -887,7 +904,15 @@ mod tests {
 
         let list = render(&view, 120, 5);
         assert!(
-            list.contains("01-01 00:00Z") && list.contains("history"),
+            list.lines().any(|line| line.contains("Task")
+                && line.contains("State")
+                && line.contains("Time")),
+            "{list}"
+        );
+        assert!(
+            list.lines().any(|line| line.contains("cargo test")
+                && line.contains("completed")
+                && line.trim_end().ends_with("2.0s")),
             "{list}"
         );
         view.handle_key(key(KeyCode::Enter));
@@ -905,7 +930,6 @@ mod tests {
 
         let list = render(&view, 100, 5);
         assert!(list.contains("running"), "{list}");
-        assert!(list.contains("quiet 47.0s"), "{list}");
         assert!(!list.contains("needs input"), "{list}");
 
         view.handle_key(key(KeyCode::Enter));
@@ -928,7 +952,7 @@ mod tests {
 
         view.handle_key(key(KeyCode::Enter));
         let detail = render(&view, 100, 8);
-        assert!(detail.contains("wait · needs input"), "{detail}");
+        assert!(detail.contains(" · needs input"), "{detail}");
         assert!(!detail.contains("waiting_for_input"), "{detail}");
     }
 
@@ -994,11 +1018,15 @@ mod tests {
 
         let list = render(&view, 100, 5);
         assert!(list.contains("1 stopping"), "{list}");
-        assert!(list.contains("shell  stopping"), "{list}");
+        assert!(
+            list.lines()
+                .any(|line| line.contains("long command") && line.contains("stopping")),
+            "{list}"
+        );
 
         view.handle_key(key(KeyCode::Enter));
         let detail = render(&view, 100, 10);
-        assert!(detail.contains("stopping · stopping"), "{detail}");
+        assert!(detail.contains("long command · stopping"), "{detail}");
         assert!(
             detail.contains("Stopping · no output captured yet"),
             "{detail}"
@@ -1131,7 +1159,7 @@ mod tests {
         let detail = render(&view, 80, 12);
         assert!(view.hint_keys().unwrap().contains("S stop"));
         assert!(detail.contains("Latest output"), "{detail}");
-        assert!(detail.contains("task review auth flow"), "{detail}");
+        assert!(detail.contains("review auth flow · running"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('o')));
         assert!(view.take_action_request().is_none());

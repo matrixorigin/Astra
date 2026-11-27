@@ -33,7 +33,7 @@ use super::bottom_pane::{
 };
 use super::chat_widget::UserEvent;
 use super::draw::{active_viewport, do_draw};
-use super::event::{TuiEvent, TuiEventStream};
+use super::event::{TuiEvent, TuiEventStream, is_background_task_manage_key};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
 use super::keymap::{AppAction, AppKeymap};
@@ -3376,13 +3376,6 @@ async fn sync_default_model_after_auth(
     apply_model_after_auth(result, state, pane, widget)
 }
 
-fn is_background_task_manage_key(key: &crossterm::event::KeyEvent) -> bool {
-    key.code == crossterm::event::KeyCode::Down
-        && key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::SHIFT)
-}
-
 fn is_ctrl_b_background_key(key: &crossterm::event::KeyEvent) -> bool {
     key.code == crossterm::event::KeyCode::Char('b')
         && key
@@ -3931,24 +3924,14 @@ fn submission_starts_conversation(text: &str) -> bool {
 /// slash/shell controls keep their ordinary dispatcher semantics. A queued
 /// follow-up neither acquires remote guidance custody nor arms the pre-bind
 /// latch: subsequent Enter may still guide a bound, admitting run.
-fn queue_explicit_active_followup(
-    action: &BottomPaneAction,
-    bottom_pane: &mut BottomPane,
-    chat_widget: &mut chat_widget::ChatWidget,
-) -> bool {
+fn queue_explicit_active_followup(action: &BottomPaneAction, bottom_pane: &mut BottomPane) -> bool {
     let BottomPaneAction::QueueFollowUp(text) = action else {
         return false;
     };
     if !submission_starts_conversation(text) {
         return false;
     }
-    if !bottom_pane.queue_next_turn_submission(text.clone()) {
-        return false;
-    }
-    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-        "Queued for the next turn in this client; starts after a safe handoff.".to_string(),
-    ));
-    true
+    bottom_pane.queue_next_turn_submission(text.clone())
 }
 
 fn followup_release_gate(
@@ -11324,7 +11307,10 @@ pub(crate) async fn run_tui_session(
                             frame_requester.schedule_frame();
                             continue;
                         }
-                        if is_background_task_manage_key(&key) || is_ctrl_b_background_key(&key) {
+                        if is_ctrl_b_background_key(&key)
+                            || (is_background_task_manage_key(&key)
+                                && !bottom_pane.accepts_background_task_rows())
+                        {
                             let _ = force_open_background_task_view(
                                 &mut background_registry,
                                 state.agent_spawner.as_ref(),
@@ -12578,7 +12564,9 @@ pub(crate) async fn run_tui_session(
                                                                 }
                                                                 None => {}
                                                             }
-                                                            if is_background_task_manage_key(&k) {
+                                                            if is_background_task_manage_key(&k)
+                                                                && !bottom_pane.accepts_background_task_rows()
+                                                            {
                                                                 let _ = force_open_background_task_view(
                                                                     &mut background_registry,
                                                                     agent_spawner_for_cancel.as_ref(),
@@ -12587,7 +12575,6 @@ pub(crate) async fn run_tui_session(
                                                                     &frame_requester,
                                                                 )
                                                                 .await;
-                                                                frame_requester.schedule_frame();
                                                                 continue;
                                                             }
                                                             // Ctrl+B backgrounds foreground work without replacing
@@ -12660,10 +12647,8 @@ pub(crate) async fn run_tui_session(
                                                             let action = bottom_pane.handle_session_key_at(k, input_at, chat_widget.history());
                                                             if queue_explicit_active_followup(
                                                                 &action,
-                                                                &mut bottom_pane,
-                                                                &mut chat_widget,
+                                                                &mut bottom_pane
                                                             ) {
-                                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
@@ -12947,12 +12932,6 @@ pub(crate) async fn run_tui_session(
                                                                             guidance_admission_closed,
                                                                         ) {
                                                                             // Preserve order behind a deferred plan or closed run.
-                                                                            if slash_dispatch::parse_submission(&queued_text).is_command() {
-                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-                                                                                    "Command queued until the current task finishes."
-                                                                                ));
-                                                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                                            }
                                                                             bottom_pane.queue_next_turn_submission(queued_text);
                                                                             frame_requester.schedule_frame();
                                                                             continue;
@@ -20328,7 +20307,6 @@ mod tests {
     #[test]
     fn explicit_followup_keeps_guidance_custody_and_admission_separate() {
         let mut pane = explicit_followup_pane();
-        let mut chat = chat_widget::ChatWidget::new("");
         pane.try_accept_user_intent(
             "pending-guidance",
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -20349,9 +20327,7 @@ mod tests {
         ] {
             pane.set_task_status(status);
             let action = explicit_followup_action(&mut pane, "also update docs");
-            assert!(queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(queue_explicit_active_followup(&action, &mut pane));
         }
         assert_eq!(pane.queued_next_turn_submission_count(), 3);
         assert_eq!(pane.pending_user_intent_count(), 1);
@@ -20366,9 +20342,7 @@ mod tests {
         assert!(
             matches!(&guidance, BottomPaneAction::SubmitInput(text) if text == "use the existing helper")
         );
-        assert!(!queue_explicit_active_followup(
-            &guidance, &mut pane, &mut chat
-        ));
+        assert!(!queue_explicit_active_followup(&guidance, &mut pane));
         // Explicit next-turn input does not close current-run guidance.
         assert!(!active_submission_routes_to_next_turn(
             "use the existing helper",
@@ -20389,9 +20363,7 @@ mod tests {
             std::time::Instant::now() - Duration::from_secs(1),
         );
         let action = pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         let mut queue = pane.take_queued_next_turn_submissions();
         queue.push_back(NextTurnSubmission::Interactive("second".into()));
         // A stale paste tail is consumed without creating a new draft.
@@ -20623,9 +20595,7 @@ mod tests {
         pane.queue_next_turn_submission("older fallback".into());
         for text in ["explicit first", "explicit second"] {
             let action = explicit_followup_action(&mut pane, text);
-            assert!(queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(queue_explicit_active_followup(&action, &mut pane));
         }
         let mut followups = VecDeque::new();
         let mut post = pane.take_queued_next_turn_submissions();
@@ -20676,7 +20646,6 @@ mod tests {
             (true, false, false, true),
         ] {
             let mut pane = explicit_followup_pane();
-            let mut chat = chat_widget::ChatWidget::new("");
             pane.try_accept_user_intent(
                 "server-guidance",
                 astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -20685,9 +20654,7 @@ mod tests {
             )
             .unwrap();
             let action = explicit_followup_action(&mut pane, "next task\nwith exact text");
-            assert!(queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(queue_explicit_active_followup(&action, &mut pane));
             pane.composer.set_text("unfinished draft");
             let local = pane.take_client_recoverable_user_intents();
             let restored = settle_followup_submissions(
@@ -20712,9 +20679,7 @@ mod tests {
         let mut pane = explicit_followup_pane();
         let mut chat = chat_widget::ChatWidget::new("");
         let action = explicit_followup_action(&mut pane, "next task");
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         let mut followups = pane.take_queued_next_turn_submissions();
         let gate = FollowupReleaseGate {
             model_catalog_loading: false,
@@ -20754,9 +20719,7 @@ mod tests {
 
         pane.composer.set_text("");
         let action = explicit_followup_action(&mut pane, "another task");
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         followups = pane.take_queued_next_turn_submissions();
         pane.composer.set_text("currently editing");
         assert_eq!(
@@ -20771,7 +20734,6 @@ mod tests {
     fn explicit_followup_preserves_the_position_of_a_delayed_guidance_fence() {
         let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let mut pane = explicit_followup_pane();
-        let mut chat = chat_widget::ChatWidget::new("");
         pane.try_accept_user_intent(
             "in-flight-guidance",
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -20782,9 +20744,7 @@ mod tests {
         control.expect_remote_user_intent_submission("in-flight-guidance");
         let queue_index = pane.queued_next_turn_submission_count();
         let action = explicit_followup_action(&mut pane, "later explicit follow-up");
-        assert!(queue_explicit_active_followup(
-            &action, &mut pane, &mut chat
-        ));
+        assert!(queue_explicit_active_followup(&action, &mut pane));
         assert_eq!(
             control.pending_remote_submission_ids(),
             vec!["in-flight-guidance"]
@@ -20807,13 +20767,10 @@ mod tests {
     #[test]
     fn explicit_followup_leaves_local_controls_in_the_ordinary_dispatcher() {
         let mut pane = explicit_followup_pane();
-        let mut chat = chat_widget::ChatWidget::new("");
         for text in ["/exit", "/stop", "/tasks", "!echo hello", "!echo hello &"] {
             let action = explicit_followup_action(&mut pane, text);
             assert!(matches!(&action, BottomPaneAction::QueueFollowUp(input) if input == text));
-            assert!(!queue_explicit_active_followup(
-                &action, &mut pane, &mut chat
-            ));
+            assert!(!queue_explicit_active_followup(&action, &mut pane));
             assert_eq!(pane.queued_next_turn_submission_count(), 0);
         }
     }
