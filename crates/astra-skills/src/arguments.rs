@@ -97,31 +97,23 @@ pub fn substitute_arguments(
             }
         }
 
-        // Replace $0..$9 (careful not to match inside ${...})
-        for i in (0..=9).rev() {
-            let value = tokens.get(i).map(|s| s.as_str()).unwrap_or("");
-            // Only replace $N that isn't part of ${...}
-            let mut pos = 0;
-            let mut new_result = String::with_capacity(result.len());
-            let bytes = result.as_bytes();
-            while pos < bytes.len() {
-                if bytes[pos] == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == (b'0' + i as u8)
-                {
-                    // Check it's not inside ${...}
-                    if pos + 2 < bytes.len() && bytes[pos + 1] == b'{' {
-                        new_result.push(bytes[pos] as char);
-                        pos += 1;
-                        continue;
-                    }
-                    new_result.push_str(value);
-                    pos += 2;
-                } else {
-                    new_result.push(bytes[pos] as char);
-                    pos += 1;
-                }
+        // Replace $0..$9 in a single pass over the original text so
+        // substituted argument values are never re-expanded, and copy the
+        // surrounding text by `char` so non-ASCII instructions stay intact.
+        let mut new_result = String::with_capacity(result.len());
+        let mut chars = result.char_indices().peekable();
+        while let Some((_, c)) = chars.next() {
+            if c == '$'
+                && let Some(&(_, digit)) = chars.peek()
+                && let Some(index) = digit.to_digit(10)
+            {
+                chars.next();
+                new_result.push_str(tokens.get(index as usize).map(String::as_str).unwrap_or(""));
+                continue;
             }
-            result = new_result;
+            new_result.push(c);
         }
+        result = new_result;
     }
 
     // Replace $ARGUMENTS last to prevent re-expansion of user input
@@ -133,6 +125,20 @@ pub fn substitute_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn substitute_positional_preserves_non_ascii_text() {
+        let text = "检查文件 $0，模式：$1 ✅";
+        let result = substitute_arguments(text, "main.rs 快速", &HashMap::new(), None);
+        assert_eq!(result, "检查文件 main.rs，模式：快速 ✅");
+    }
+
+    #[test]
+    fn substitute_positional_does_not_reexpand_argument_values() {
+        let text = "A: $1, B: $0";
+        let result = substitute_arguments(text, "first $0", &HashMap::new(), None);
+        assert_eq!(result, "A: $0, B: first");
+    }
 
     #[test]
     fn substitute_raw_arguments() {
