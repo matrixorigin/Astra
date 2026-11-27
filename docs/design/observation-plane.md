@@ -143,6 +143,46 @@ Bad diagnostic examples:
 
 Good diagnostics include cause, scope, affected capability, resumability, and next action.
 
+### Investigating model failures and service activity
+
+The default `introspect` summary shows the recent model failure count and latest
+kind. The errors view and local `reflect` fallback expose at most ten failures
+from the current Run's last 512 recorded step events.
+These are observed attempts, not a complete Session history. A missing provider
+request ID or stream reason is unknown. The provider header request ID is
+distinct from Astra's incoming HTTP request ID, physical attempt ID and model
+response ID. Stream reasons distinguish an invalid delimited SSE event from an
+invalid tail after clean HTTP body EOF; neither attributes blame to a gateway,
+provider, proxy or network. Failed-round facts contain no response body,
+reasoning or tool arguments.
+
+For later analysis, use owner-scoped Session facts and structured service logs.
+For example, query `agent_events` with the authenticated owner and Session,
+selecting `JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.error_kind'))` for failure
+events and a bounded time/order window. `reflect` prefers recognized reported
+error kinds across model and tool failures; an invalid reported kind remains
+unknown instead of being guessed from text. When a tool event lacks a kind,
+its bounded output may still support a heuristic classification. For a verified
+synced Journal event of at most 64 KiB with no reported kind, `reflect` can recover
+the typed prefix of its `error` field. The response omits error prose and never
+classifies ordinary `turn_error` content as an error. Existing retention, sync
+lag, redaction and source coverage still apply.
+
+Service access logs use matched route templates, not raw request paths. Fast
+successful health checks, Session Run polls and Edge heartbeats are DEBUG;
+failures, slower calls and other routes remain INFO. The latency measures time
+until response headers, not an SSE stream's lifetime. INFO access lines are
+therefore selected observations, not a complete request count. An external
+request ID that is not a UUID is logged as `sha256:<hex of the echoed ID>`;
+the response still echoes the original ID. A recovery
+warning is one scheduled recovery, not a count of all provider failures. It
+retains runtime-generated Session and Run identities for joining to that Run's
+step facts. Other IDs are logged as SHA-256 hashes for correlation; a
+shared Run ID does not by itself select one physical attempt. Missing records
+remain unknown. Full exchange capture is opt-in. Existing provider-failure
+request artifacts may still contain request content and must be handled according
+to their configured access and retention policies.
+
 ## Trace payload contracts
 
 ### `provider_decision`

@@ -2548,6 +2548,27 @@ fn record_repeated_transport_success_empty_completion(
     true
 }
 
+/// Keep runtime-generated identities directly joinable; hash arbitrary IDs so
+/// a client-supplied Session name cannot put secrets into service logs.
+fn recovery_log_identity(id: Option<&str>) -> std::borrow::Cow<'_, str> {
+    let Some(id) = id else {
+        return std::borrow::Cow::Borrowed("");
+    };
+    let hex = |value: &str| value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let is_generated = (id.len() == 64 && hex(id))
+        || id
+            .strip_prefix("run-")
+            .is_some_and(|value| value.len() == 48 && hex(value))
+        || id
+            .strip_prefix("prv_")
+            .is_some_and(|value| value.len() == 60 && hex(value));
+    if is_generated {
+        std::borrow::Cow::Borrowed(id)
+    } else {
+        crate::server::log_request_id(id)
+    }
+}
+
 /// Admit one logical recovery round after a provider attempt failed before it
 /// produced an executable or user-visible action. This is deliberately
 /// outside the physical transport retry loop: the prior attempt is settled
@@ -2651,7 +2672,7 @@ fn schedule_safe_provider_recovery(
     let text_only = state.hooks.completion_settlement.text_only;
     let interruption = match error.kind {
         astra_core::ErrorKind::ProviderDeadline => "spent its action window",
-        astra_core::ErrorKind::StreamTransport => "lost its provider connection",
+        astra_core::ErrorKind::StreamTransport => "encountered a provider stream error",
         astra_core::ErrorKind::StreamIdle => "stalled before delivery completed",
         _ => unreachable!("safe provider recovery checked the error kind"),
     };
@@ -2680,6 +2701,24 @@ fn schedule_safe_provider_recovery(
             "attempts_remaining": 1,
             "authority": "advisory_evidence_only"
         }),
+    );
+    let reason = details
+        .get("stream_failure_reason")
+        .and_then(serde_json::Value::as_str)
+        .and_then(astra_core::error_kind::validated_stream_failure_reason);
+    let provider_request_id = details
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(astra_core::validated_llm_provider_request_id);
+    tracing::warn!(
+        target: "astra::provider_recovery",
+        session_id = %recovery_log_identity(state.current_session_id.as_deref()),
+        run_id = %recovery_log_identity(state.current_run_id.as_deref()),
+        round = state.current_round_index,
+        error_kind = error.kind.as_str(),
+        stream_failure_reason = reason.unwrap_or(""),
+        provider_request_id = provider_request_id.as_deref().unwrap_or(""),
+        "provider attempt ended before executable or visible delivery; scheduling one capability-aware safe recovery round"
     );
     true
 }
@@ -4190,11 +4229,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Err(error);
             }
             if schedule_safe_provider_recovery(state, &error) {
-                tracing::warn!(
-                    target: "astra::provider_recovery",
-                    error = %error,
-                    "provider attempt ended before executable or visible delivery; scheduling one capability-aware safe recovery round"
-                );
                 host.on_provider_recovery(state, error.kind);
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::ContinueLoop);
@@ -12903,6 +12937,42 @@ mod tests {
             !signal.produced_mutation,
             "an old str_replace must not mask a later read-only round"
         );
+    }
+
+    #[test]
+    fn provider_recovery_log_preserves_generated_identities_without_leaking_custom_names() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let session_id = "a".repeat(64);
+        let work_run_id = format!("run-{}", "b".repeat(48));
+        let provider_run_id = format!("prv_{}", "c".repeat(60));
+        tracing::subscriber::with_default(subscriber, || {
+            for (session, run) in [
+                (&session_id[..], &work_run_id[..]),
+                (&session_id[..], &provider_run_id[..]),
+                ("sk-private-credential", "sk-private-credential"),
+            ] {
+                let mut state = make_state();
+                state.current_session_id = Some(session.into());
+                state.current_run_id = Some(run.into());
+                state.remaining_turns = 3;
+                let error = astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "private")
+                    .with_details_json(serde_json::json!({"partial_full_text":"", "partial_reasoning":"private thinking", "tool_calls":[], "stream_failure_reason":"invalid_sse_frame_json_eof"}).to_string());
+                assert!(schedule_safe_provider_recovery(&mut state, &error));
+            }
+        });
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        for identity in [&session_id, &work_run_id, &provider_run_id] {
+            assert!(output.contains(identity), "{output}");
+        }
+        assert!(output.contains("sha256:"));
+        assert!(!output.contains("sk-private-credential"));
+        assert!(!output.contains("private thinking"));
     }
 
     #[test]

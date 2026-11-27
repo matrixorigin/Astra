@@ -1316,7 +1316,8 @@ async fn process_sse_event_block<H: SseStreamObserver>(
     if accum.stream_complete {
         return Ok(false);
     }
-    let parsed = validated_sse_event(event_str).map_err(stream_protocol_error)?;
+    let parsed =
+        validated_sse_event(event_str).map_err(|error| stream_protocol_error(error.to_string()))?;
     let lifecycle = parsed
         .events
         .first()

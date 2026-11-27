@@ -2,6 +2,29 @@
 
 use serde_json::Value;
 
+/// A content-free parse failure for one SSE event's joined data fields.
+#[derive(Debug)]
+pub struct SseJsonError {
+    pub data_bytes: usize,
+    pub source: serde_json::Error,
+}
+
+impl std::fmt::Display for SseJsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid JSON in SSE event ({} data bytes): {}",
+            self.data_bytes, self.source
+        )
+    }
+}
+
+impl std::error::Error for SseJsonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Parsed JSON payload or stream terminator from one SSE event.
 #[derive(Debug, Default)]
 pub struct SseJsonDrain {
@@ -11,7 +34,7 @@ pub struct SseJsonDrain {
 
 /// Decode a complete SSE event. JSON is parsed after all `data` fields have
 /// been joined, so a multi-line event remains one logical message.
-pub fn validated_sse_event(block: &str) -> Result<SseJsonDrain, String> {
+pub fn validated_sse_event(block: &str) -> Result<SseJsonDrain, SseJsonError> {
     let Some(data) = astra_core::sse_blocks::event_data(block) else {
         return Ok(SseJsonDrain::default());
     };
@@ -24,11 +47,9 @@ pub fn validated_sse_event(block: &str) -> Result<SseJsonDrain, String> {
             stream_finished: true,
         });
     }
-    let value = serde_json::from_str(&data).map_err(|error| {
-        format!(
-            "invalid JSON in SSE event ({} data bytes): {error}",
-            data.len()
-        )
+    let value = serde_json::from_str(&data).map_err(|source| SseJsonError {
+        data_bytes: data.len(),
+        source,
     })?;
     Ok(SseJsonDrain {
         events: vec![value],

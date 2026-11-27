@@ -881,6 +881,15 @@ impl StepRecorder {
             .as_ref()
             .and_then(|value| value.get("qualified_usage"))
             .and_then(|value| astra_turn_types::CanonicalTokenUsage::from_json(value).ok());
+        let stream_reason = (error.kind == astra_core::ErrorKind::StreamTransport)
+            .then(|| details.as_ref()?.get("stream_failure_reason")?.as_str())
+            .flatten()
+            .and_then(astra_core::error_kind::validated_stream_failure_reason);
+        let provider_request_id = details
+            .as_ref()
+            .and_then(|value| value.get("request_id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(astra_core::validated_llm_provider_request_id);
         // The client can return a ledger error after the provider has already
         // completed. Retain that physical truth without granting its response
         // action authority or treating unknown usage as measured zero.
@@ -899,6 +908,8 @@ impl StepRecorder {
                 "dispatch_started": dispatch_started,
                 "provider_completed": provider_succeeded,
                 "deadline_phase": phase,
+                "stream_failure_reason": stream_reason,
+                "provider_request_id": provider_request_id,
                 "qualified_usage": usage,
                 "latency_ms": latency_ms,
             }),

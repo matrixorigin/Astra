@@ -4,30 +4,75 @@
 //! - Fill `request_id` on [`astra_core::ErrorResponse`] bodies, or
 //! - Insert `request_id` on top-level JSON **objects** that omit it (generic errors).
 
-use std::time::Instant;
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{MatchedPath, Request};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use http_body_util::BodyExt;
+use sha2::{Digest, Sha256};
 use tracing::Instrument;
 use uuid::Uuid;
 
 /// Maximum length for a client-supplied `x-request-id` (after trim).
 const MAX_REQUEST_ID_LEN: usize = 128;
 
-/// High-frequency probe paths: skip the `astra.http.access` line to cut log volume (span + headers unchanged).
-fn should_emit_http_access_line(path: &str) -> bool {
-    path != "/health"
+/// Routine successful polling is available at DEBUG; slow or failed calls
+/// remain visible at INFO. This measures response-header latency, not the
+/// lifetime of a streaming response.
+fn quiet_success(
+    method: &axum::http::Method,
+    route: &str,
+    status: axum::http::StatusCode,
+    elapsed: Duration,
+) -> bool {
+    status.is_success()
+        && elapsed < Duration::from_secs(1)
+        && matches!(
+            (method.as_str(), route),
+            ("GET", "/health" | "/sessions/{session_id}/runs") | ("POST", "/agents/edge/heartbeat")
+        )
+}
+
+fn log_method(method: &axum::http::Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => "OTHER",
+    }
 }
 
 /// Populated by [`request_trace_middleware`] for handlers that need explicit access.
 #[derive(Clone, Debug)]
 pub struct RequestTrace {
     pub request_id: String,
+}
+
+impl RequestTrace {
+    pub(crate) fn log_id(&self) -> Cow<'_, str> {
+        log_request_id(&self.request_id)
+    }
+}
+
+/// Keep correlation without placing arbitrary client-provided IDs in logs.
+pub(crate) fn log_request_id(request_id: &str) -> Cow<'_, str> {
+    if request_id.is_empty() || Uuid::parse_str(request_id).is_ok() {
+        Cow::Borrowed(request_id)
+    } else {
+        Cow::Owned(format!(
+            "sha256:{:x}",
+            Sha256::digest(request_id.as_bytes())
+        ))
+    }
 }
 
 fn is_safe_request_id_token(s: &str) -> bool {
@@ -147,30 +192,46 @@ fn try_enrich_json_body(collected: &[u8], request_id: &str) -> Option<Vec<u8>> {
 pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response {
     let request_id = resolve_request_id(req.headers());
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-
-    req.extensions_mut().insert(RequestTrace {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("<unmatched>", MatchedPath::as_str)
+        .to_owned();
+    let trace = RequestTrace {
         request_id: request_id.clone(),
-    });
+    };
+    let log_request_id = trace.log_id();
+    req.extensions_mut().insert(trace.clone());
 
     let span = tracing::info_span!(
         "http.request",
-        request_id = %request_id,
-        http.method = %method.as_str(),
-        http.route = %path,
+        request_id = %log_request_id,
+        http.method = log_method(&method),
+        http.route = %route,
     );
 
     let start = Instant::now();
     let carrier = inbound_carrier(req.headers());
     let mut res = super::run_trace::scope_inbound(carrier, next.run(req).instrument(span)).await;
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let elapsed = start.elapsed();
+    let latency_ms = elapsed.as_secs_f64() * 1000.0;
 
-    if should_emit_http_access_line(path.as_str()) {
+    if quiet_success(&method, &route, res.status(), elapsed) {
+        tracing::debug!(
+            target: "astra.http.access",
+            request_id = %log_request_id,
+            http.method = log_method(&method),
+            http.route = %route,
+            status = res.status().as_u16(),
+            latency_ms,
+            "http request"
+        );
+    } else {
         tracing::info!(
             target: "astra.http.access",
-            request_id = %request_id,
-            http.method = %method.as_str(),
-            http.route = %path,
+            request_id = %log_request_id,
+            http.method = log_method(&method),
+            http.route = %route,
             status = res.status().as_u16(),
             latency_ms,
             "http request"
@@ -243,6 +304,39 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
+    #[derive(Clone, Default)]
+    struct AccessCapture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AccessCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if matches!(
+                event.metadata().target(),
+                "astra.http.access" | "test.request_id"
+            ) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), fields.0));
+            }
+        }
+    }
+
     fn test_app() -> Router {
         Router::new()
             .route(
@@ -277,9 +371,137 @@ mod tests {
     }
 
     #[test]
-    fn health_probe_skips_access_log_line() {
-        assert!(!should_emit_http_access_line("/health"));
-        assert!(should_emit_http_access_line("/api/v1/sessions"));
+    fn only_fast_successful_polling_is_quiet() {
+        use axum::http::Method;
+        let fast = Duration::from_millis(5);
+        let slow = Duration::from_secs(1);
+        assert!(quiet_success(&Method::GET, "/health", StatusCode::OK, fast));
+        assert!(quiet_success(
+            &Method::GET,
+            "/sessions/{session_id}/runs",
+            StatusCode::OK,
+            fast
+        ));
+        assert!(quiet_success(
+            &Method::POST,
+            "/agents/edge/heartbeat",
+            StatusCode::OK,
+            fast
+        ));
+        assert!(!quiet_success(
+            &Method::GET,
+            "/health",
+            StatusCode::SERVICE_UNAVAILABLE,
+            fast
+        ));
+        assert!(!quiet_success(
+            &Method::GET,
+            "/health",
+            StatusCode::OK,
+            slow
+        ));
+        assert!(!quiet_success(
+            &Method::POST,
+            "/health",
+            StatusCode::OK,
+            fast
+        ));
+        assert!(!quiet_success(
+            &Method::GET,
+            "/sessions/{session_id}/runs/admissions",
+            StatusCode::NOT_IMPLEMENTED,
+            fast
+        ));
+    }
+
+    #[tokio::test]
+    async fn routed_access_logs_are_bounded_and_keep_failures() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let capture = AccessCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let app = Router::new()
+            .route(
+                "/sessions/{session_id}/runs",
+                get(|| async { StatusCode::OK }),
+            )
+            .route("/health", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))
+            .layer(axum::middleware::from_fn(request_trace_middleware));
+        async {
+            for (method, path) in [
+                ("GET", "/sessions/private-session/runs"),
+                ("POST", "/sessions/private-session/runs"),
+                ("GET", "/health"),
+                ("GET", "/private-path"),
+            ] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("x-request-id", "sk-private-credential")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.headers()["x-request-id"], "sk-private-credential");
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].0, tracing::Level::DEBUG);
+        assert!(events[0].1.contains("sha256:"));
+        assert!(
+            events[0].1.contains("/sessions/{session_id}/runs"),
+            "{:?}",
+            events[0]
+        );
+        assert!(
+            events[1..]
+                .iter()
+                .all(|event| event.0 == tracing::Level::INFO)
+        );
+        let all = format!("{events:?}");
+        assert!(!all.contains("private-session"));
+        assert!(!all.contains("private-path"));
+        assert!(!all.contains("sk-private-credential"));
+    }
+
+    #[tokio::test]
+    async fn handler_and_access_logs_share_sanitized_request_id() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let capture = AccessCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let app = Router::new()
+            .route("/test", get(|axum::Extension(trace): axum::Extension<RequestTrace>| async move {
+                tracing::info!(target: "test.request_id", request_id = %trace.log_id(), "handler");
+                StatusCode::OK
+            }))
+            .layer(axum::middleware::from_fn(request_trace_middleware));
+        async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/test")
+                        .header("x-request-id", "sk-private-credential")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["x-request-id"], "sk-private-credential");
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let events = capture.0.lock().unwrap();
+        let expected = log_request_id("sk-private-credential");
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.1.contains(expected.as_ref()))
+        );
+        assert!(!format!("{events:?}").contains("sk-private-credential"));
     }
 
     #[tokio::test]

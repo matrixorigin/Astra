@@ -531,7 +531,8 @@ pub(super) async fn collect(
                     block
                 };
                 let Some(block) = block else { break };
-                let parsed = validated_sse_event(&block).map_err(|_| {
+                let parsed = validated_sse_event(&block).map_err(|failure| {
+                    super::note_invalid_sse(&failure, chunk.is_none());
                     error(
                         astra_core::ErrorKind::StreamTransport,
                         "invalid_response_event",

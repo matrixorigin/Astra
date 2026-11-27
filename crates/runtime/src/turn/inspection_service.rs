@@ -247,6 +247,15 @@ pub fn local_reflect_from_snapshot(
         }
     }
 
+    if matches!(
+        facet,
+        ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Errors
+    ) && !snapshot.provider_failures.is_empty()
+    {
+        lines.push(astra_turn_core::introspect::render_provider_failures(
+            snapshot,
+        ));
+    }
     lines.join("\n")
 }
 
