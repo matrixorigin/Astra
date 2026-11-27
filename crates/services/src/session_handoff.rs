@@ -18,7 +18,7 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row};
+use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
