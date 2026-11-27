@@ -1982,8 +1982,8 @@ fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting
         pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
         assert_eq!(pane.composer.text(), "shi");
         let text = render(&pane);
-        assert!(text.contains(&format!("> {expected}")), "{text}");
-        assert_eq!(text.matches("> ship").count(), 1, "{text}");
+        assert!(text.contains(&format!("› {expected}")), "{text}");
+        assert_eq!(text.matches("› ship").count(), 1, "{text}");
     }
 
     assert!(matches!(
