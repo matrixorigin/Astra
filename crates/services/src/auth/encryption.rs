@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::env;
 
 type HmacSha256 = Hmac<Sha256>;
+const PROVIDER_MEMORY_SCOPE_DOMAIN: &str = "astra.workspace-memory-session.v1";
 
 pub(super) fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -20,6 +21,42 @@ pub struct FernetTokenEncryptor {
 }
 
 impl FernetTokenEncryptor {
+    fn provider_memory_scope_value(
+        user: &str,
+        session: &str,
+        provider: &str,
+        workspace: &str,
+    ) -> String {
+        serde_json::json!([user, session, provider, workspace]).to_string()
+    }
+
+    pub(crate) fn sign_provider_memory_scope(
+        &self,
+        user: &str,
+        session: &str,
+        provider: &str,
+        workspace: &str,
+    ) -> String {
+        self.keyed_digest(
+            PROVIDER_MEMORY_SCOPE_DOMAIN,
+            &Self::provider_memory_scope_value(user, session, provider, workspace),
+        )
+    }
+
+    pub(crate) fn verify_provider_memory_scope(
+        &self,
+        user: &str,
+        session: &str,
+        provider: &str,
+        workspace: &str,
+        proof: &str,
+    ) -> bool {
+        self.verify_keyed_digest(
+            PROVIDER_MEMORY_SCOPE_DOMAIN,
+            &Self::provider_memory_scope_value(user, session, provider, workspace),
+            proof,
+        )
+    }
     pub fn from_env() -> Result<Self, String> {
         Self::from_key(None)
     }
@@ -410,4 +447,26 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not valid UTF-8"));
     }
+}
+#[test]
+fn memory_scope_proof_rejects_legacy_scope_signatures_and_identity_substitution() {
+    let key = FernetTokenEncryptor::new("memory-scope-test-key").unwrap();
+    let proof = key.sign_provider_memory_scope("user", "session", "moi", "workspace");
+    assert!(key.verify_provider_memory_scope("user", "session", "moi", "workspace", &proof));
+    for (user, session, provider, workspace) in [
+        ("other", "session", "moi", "workspace"),
+        ("user", "other", "moi", "workspace"),
+        ("user", "session", "other", "workspace"),
+        ("user", "session", "moi", "other"),
+    ] {
+        assert!(!key.verify_provider_memory_scope(user, session, provider, workspace, &proof));
+    }
+    let legacy = key.sign_provider_session_scope("user", "session", "moi", "workspace");
+    assert!(!key.verify_provider_memory_scope("user", "session", "moi", "workspace", &legacy));
+    assert!(!key.verify_provider_session_scope("user", "session", "moi", "workspace", &proof));
+    assert!(
+        !FernetTokenEncryptor::new("other-key")
+            .unwrap()
+            .verify_provider_memory_scope("user", "session", "moi", "workspace", &proof)
+    );
 }

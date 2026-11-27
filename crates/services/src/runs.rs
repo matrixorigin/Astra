@@ -1350,9 +1350,39 @@ pub use astra_turn_types::ProviderRunOwner;
 /// authority. Mutating plan tools still re-check the durable plan binding when
 /// required; callers that do not have this snapshot fall back to the repository
 /// lookup.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionAdmissionFacts {
     pub active_plan_id: Option<String>,
+    pub(crate) provider_scope: Option<crate::session_fork_coordinator::ProviderSessionScopeFacts>,
+}
+
+impl std::fmt::Debug for SessionAdmissionFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionAdmissionFacts")
+            .field("active_plan_id", &self.active_plan_id)
+            .field("provider_scope_loaded", &self.provider_scope.is_some())
+            .finish()
+    }
+}
+
+impl SessionAdmissionFacts {
+    pub fn take_chat_scope_authorization(
+        &mut self,
+        user_id: &str,
+        session_id: &str,
+        owner: Option<&ProviderRunOwner>,
+        encryptor: &crate::auth::FernetTokenEncryptor,
+    ) -> Option<Result<(), crate::SessionForkCoordinatorError>> {
+        let facts = self
+            .provider_scope
+            .take()
+            .filter(|facts| facts.belongs_to(user_id, session_id))?;
+        Some(facts.authorize(
+            owner,
+            Some(encryptor),
+            crate::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
+        ))
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -16124,7 +16154,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
             )
             .await
-            .map(|()| IndependentRunSessionAdmission::Active(None))
+            .map(|()| IndependentRunSessionAdmission::Active(None, None))
         }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
@@ -16133,8 +16163,8 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let session_capture_override = match session_admission {
-            IndependentRunSessionAdmission::Active(capture) => capture,
+        let (session_capture_override, provider_scope) = match session_admission {
+            IndependentRunSessionAdmission::Active(capture, scope) => (capture, scope),
             IndependentRunSessionAdmission::Busy => return Err(RunAdmissionError::SessionBusy),
             IndependentRunSessionAdmission::Inactive => {
                 return Err(RunAdmissionError::SessionInactive);
@@ -16148,15 +16178,25 @@ impl DatabaseRunStateStore {
             .map(|value| serde_json::from_value::<ProviderRunOwner>(value.clone()))
             .transpose()
             .map_err(|error| RunAdmissionError::Persistence(error.to_string()))?;
-        crate::session_fork_coordinator::authorize_provider_fork_session(
-            &mut *tx,
-            &record.user_id,
-            &record.session_id,
-            provider_owner.as_ref(),
-            self.scope_encryptor.as_deref(),
-            crate::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
-        )
-        .await
+        let requirement =
+            crate::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation;
+        if let Some(scope) = provider_scope {
+            scope.authorize(
+                provider_owner.as_ref(),
+                self.scope_encryptor.as_deref(),
+                requirement,
+            )
+        } else {
+            crate::session_fork_coordinator::authorize_provider_fork_session(
+                &mut *tx,
+                &record.user_id,
+                &record.session_id,
+                provider_owner.as_ref(),
+                self.scope_encryptor.as_deref(),
+                requirement,
+            )
+            .await
+        }
         .map_err(|error| RunAdmissionError::Persistence(error.to_string()))?;
         let mut collaborator_event_rows = vec![];
         let mut collaborator_events_on_new_run = false;

@@ -1,3 +1,4 @@
+use astra_tools::memory_tool_contract::MemoryAction;
 use axum::extract::Extension;
 use serde_json::Value;
 
@@ -292,26 +293,43 @@ pub(super) async fn auth_me_handler(
 async fn memory_proxy_call(
     state: &AppState,
     headers: &HeaderMap,
+    operation: MemoryAction,
     method: reqwest::Method,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(headers).await?;
-    memory_proxy_call_for_user(state, &user.user_id, method, endpoint, body).await
+    let principal = state.auth_service.current_principal(headers).await?;
+    memory_proxy_call_for_user(state, &principal, operation, method, endpoint, body).await
 }
 
 async fn memory_proxy_call_for_user(
     state: &AppState,
-    user_id: &str,
+    principal: &astra_services::AuthPrincipal,
+    operation: MemoryAction,
     method: reqwest::Method,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let requires_write = method != reqwest::Method::GET
-        && !endpoint.ends_with("/retrieve")
-        && !endpoint.ends_with("/search");
+    let user_id = &principal.user.user_id;
+    // The authenticated route owns the operation. Record IDs are opaque.
+    let requires_write = astra_tools::memoria::memory_operation_requires_write(operation.as_str());
+    let requires_read = !requires_write || operation == MemoryAction::Reflect;
     let requested_scope = memory_proxy_scope(&body, user_id)?;
-    if let Some(scope) = requested_scope.as_ref() {
+    let moi = matches!(
+        &principal.origin,
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context)
+            if context.provider_id == "moi"
+    );
+    if moi
+        && requested_scope.is_none()
+        && matches!(endpoint, "/v1/memories" | "/v1/memories/retrieve")
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "MOI memory store and retrieve require a workspace-bound session_id",
+        ));
+    }
+    if !moi && let Some(scope) = requested_scope.as_ref() {
         ensure_memory_proxy_session_owner(state, scope).await?;
     }
     let strict_recall_scope = if is_strict_session_recall(endpoint, &body) {
@@ -324,9 +342,20 @@ async fn memory_proxy_call_for_user(
     } else {
         None
     };
-    let authority = resolve_memoria_user_authority(state, user_id, requires_write)
-        .await
-        .map_err(map_memoria_forward_error)?;
+    let authority = resolve_memoria_user_authority(
+        state,
+        user_id,
+        Some((
+            principal,
+            requested_scope
+                .as_ref()
+                .map(|scope| scope.session_id.as_str()),
+        )),
+        requires_read,
+        requires_write,
+    )
+    .await
+    .map_err(map_memoria_forward_error)?;
     let strict_validation_scope = match strict_recall_scope.as_ref() {
         Some(scope) => Some(
             astra_memoria::MemoryScope::new(authority.owner(), &scope.session_id)
@@ -340,17 +369,49 @@ async fn memory_proxy_call_for_user(
         .as_ref()
         .map(|_| strict_session_recall_limit(&body));
 
-    let mut response = forward_memoria_with_authority(state, &authority, method, endpoint, body)
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                target: "astra_runtime::auth",
-                endpoint = endpoint,
-                error = %error,
-                "memory proxy forward failed"
-            );
-            map_memoria_forward_error(MemoriaForwardError::Backend(error))
+    let write_only = matches!(
+        &authority,
+        MemoriaUserAuthority::Scoped {
+            access: astra_services::auth::memoria::MemoryAccess::WriteOnly,
+            ..
+        }
+    );
+    let receipt_args = write_only.then(|| body.clone());
+    let (status, mut response) =
+        forward_memoria_with_authority(state, &authority, method, endpoint, body)
+            .await
+            .map_err(|error| {
+                if write_only {
+                    let status =
+                        parse_memoria_forward_status(&error).unwrap_or(StatusCode::BAD_GATEWAY);
+                    tracing::warn!(target: "astra_runtime::auth", status = status.as_u16(),
+                        "write-only memory proxy request failed");
+                    return error_response(status, "Memory service rejected the write");
+                }
+                tracing::warn!(
+                    target: "astra_runtime::auth",
+                    endpoint = endpoint,
+                    error = %error,
+                    "memory proxy forward failed"
+                );
+                map_memoria_forward_error(MemoriaForwardError::Backend(error))
+            })?;
+    if let Some(args) = receipt_args.as_ref() {
+        let receipt = astra_tools::memoria::memory_write_receipt(
+            operation.as_str(),
+            args,
+            status,
+            &response.to_string(),
+        )
+        .filter(|receipt| receipt.get("error").is_none())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "Memory service did not confirm the write",
+            )
         })?;
+        return Ok(Json(receipt));
+    }
 
     if let Some(scope) = strict_validation_scope.as_ref() {
         if let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope) {
@@ -393,7 +454,7 @@ async fn memory_proxy_call_for_user(
             )
             .await
             {
-                Ok(working) => {
+                Ok((_, working)) => {
                     if let Err(error) =
                         astra_memoria::validate_strict_recall_payload(&working, scope)
                     {
@@ -457,6 +518,7 @@ enum MemoriaUserAuthority {
         key: String,
         owner: String,
         owner_scoped_master: bool,
+        access: astra_services::auth::memoria::MemoryAccess,
     },
     SelfHosted {
         owner: String,
@@ -497,8 +559,9 @@ impl std::fmt::Display for MemoriaForwardError {
 fn require_memoria_consent(
     access: astra_services::auth::memoria::MemoryAccess,
     requires_write: bool,
+    owner_scoped_master: bool,
 ) -> Result<(), MemoriaForwardError> {
-    match access.denial_message(requires_write) {
+    match access.runtime_denial_message(requires_write, owner_scoped_master) {
         Some(message) => Err(MemoriaForwardError::ConsentDenied(message.into())),
         None => Ok(()),
     }
@@ -525,9 +588,11 @@ fn disabled_memoria_authority_error<T>(
 async fn resolve_memoria_user_authority(
     state: &AppState,
     user_id: &str,
+    proxy: Option<(&astra_services::AuthPrincipal, Option<&str>)>,
+    requires_read: bool,
     requires_write: bool,
 ) -> Result<MemoriaUserAuthority, MemoriaForwardError> {
-    if state.memoria_forwarder_is_override {
+    if state.memoria_forwarder_is_override && !user_id.starts_with("external_authorized:moi:") {
         return Ok(MemoriaUserAuthority::Override {
             owner: user_id.to_string(),
         });
@@ -536,10 +601,11 @@ async fn resolve_memoria_user_authority(
         .auth_service
         .memoria_credentials()
         .ok_or(MemoriaForwardError::Unconfigured)?;
-    let resolution = resolver
-        .resolve_runtime(user_id)
-        .await
-        .map_err(MemoriaForwardError::Backend)?;
+    let resolution = match proxy {
+        Some((principal, session)) => resolver.resolve_runtime_for_proxy(principal, session).await,
+        None => resolver.resolve_runtime(user_id).await,
+    }
+    .map_err(MemoriaForwardError::Backend)?;
     let disabled_error =
         disabled_memoria_authority_error(&resolution, resolver.provider.web_url.is_some());
     match crate::turn::cloud::memoria_compact::select_memoria_authority(
@@ -547,12 +613,18 @@ async fn resolve_memoria_user_authority(
         state.memoria_self_hosted_fallback_enabled,
     ) {
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Scoped(credential) => {
-            require_memoria_consent(credential.access, requires_write)?;
+            if requires_read {
+                require_memoria_consent(credential.access, false, credential.owner_scoped_master)?;
+            }
+            if requires_write {
+                require_memoria_consent(credential.access, true, credential.owner_scoped_master)?;
+            }
             Ok(MemoriaUserAuthority::Scoped {
                 base_url: resolver.provider.base_url,
                 key: credential.key,
                 owner: credential.owner,
                 owner_scoped_master: credential.owner_scoped_master,
+                access: credential.access,
             })
         }
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::SelfHosted => {
@@ -572,7 +644,7 @@ async fn forward_memoria_with_authority(
     method: reqwest::Method,
     endpoint: &str,
     mut body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<(StatusCode, serde_json::Value), String> {
     if matches!(
         authority,
         MemoriaUserAuthority::Override { .. } | MemoriaUserAuthority::SelfHosted { .. }
@@ -587,13 +659,15 @@ async fn forward_memoria_with_authority(
         return state
             .memoria_forwarder
             .forward(method, endpoint, body)
-            .await;
+            .await
+            .map(|response| (StatusCode::OK, response));
     }
     let MemoriaUserAuthority::Scoped {
         base_url,
         key,
         owner,
         owner_scoped_master,
+        ..
     } = authority
     else {
         unreachable!("non-scoped authorities return through the configured forwarder")
@@ -641,9 +715,11 @@ async fn forward_memoria_with_authority(
         return Err(format!("Memoria error {status}: {bounded}"));
     }
     if text.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+        return Ok((status, serde_json::json!({})));
     }
-    serde_json::from_str(&text).map_err(|error| format!("Memoria parse error: {error}"))
+    serde_json::from_str(&text)
+        .map(|body| (status, body))
+        .map_err(|error| format!("Memoria parse error: {error}"))
 }
 
 async fn forward_memoria_for_user(
@@ -654,9 +730,12 @@ async fn forward_memoria_for_user(
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, MemoriaForwardError> {
-    let authority = resolve_memoria_user_authority(state, user_id, requires_write).await?;
+    let authority =
+        resolve_memoria_user_authority(state, user_id, None, !requires_write, requires_write)
+            .await?;
     forward_memoria_with_authority(state, &authority, method, endpoint, body)
         .await
+        .map(|(_, body)| body)
         .map_err(MemoriaForwardError::Backend)
 }
 
@@ -785,25 +864,9 @@ fn normalize_exact_memory_purge_receipt(
     response: serde_json::Value,
     memory_ids: &[String],
 ) -> Result<serde_json::Value, &'static str> {
-    let Some(deleted_count) = response
-        .get("purged")
-        .or_else(|| response.get("deleted_count"))
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Err("memory backend did not return a confirmed purge count");
-    };
-    let requested_count = u64::try_from(memory_ids.len()).unwrap_or(u64::MAX);
-    if deleted_count > requested_count {
-        return Err("memory backend returned a purge count larger than the exact request");
-    }
-    let unresolved_count = requested_count.saturating_sub(deleted_count);
-    let status = if unresolved_count == 0 {
-        "completed"
-    } else if deleted_count == 0 {
-        "not_found"
-    } else {
-        "partial"
-    };
+    let requested_count = memory_ids.len() as u64;
+    let (deleted_count, status) = astra_memoria::exact_purge_outcome(&response, requested_count)?;
+    let unresolved_count = requested_count - deleted_count;
     let message = match status {
         "completed" => format!(
             "memory_purge: backend confirmed all {deleted_count} exact entries were removed"
@@ -892,6 +955,7 @@ pub(super) async fn memory_proxy_store_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Remember,
         reqwest::Method::POST,
         "/v1/memories",
         body,
@@ -907,6 +971,7 @@ pub(super) async fn memory_proxy_retrieve_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Recall,
         reqwest::Method::POST,
         "/v1/memories/retrieve",
         body,
@@ -922,6 +987,7 @@ pub(super) async fn memory_proxy_search_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Recall,
         reqwest::Method::POST,
         "/v1/memories/search",
         body,
@@ -934,7 +1000,7 @@ pub(super) async fn memory_proxy_purge_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state.auth_service.current_principal(&headers).await?;
     let memory_ids = exact_memory_ids_for_user_purge(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let reason = body
@@ -948,15 +1014,17 @@ pub(super) async fn memory_proxy_purge_handler(
                 "memory purge requires a non-empty reason",
             )
         })?;
+    let mut request = serde_json::json!({ "memory_ids": memory_ids, "reason": reason });
+    if let Some(session_id) = body.get("session_id") {
+        request["session_id"] = session_id.clone();
+    }
     let response = memory_proxy_call_for_user(
         &state,
-        &user.user_id,
+        &principal,
+        MemoryAction::Forget,
         reqwest::Method::POST,
         "/v1/memories/purge",
-        serde_json::json!({
-            "memory_ids": memory_ids.clone(),
-            "reason": reason,
-        }),
+        request,
     )
     .await?
     .0;
@@ -974,6 +1042,7 @@ pub(super) async fn memory_proxy_expand_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Expand,
         reqwest::Method::GET,
         &format!("/v1/memories/{memory_id}"),
         serde_json::json!({}),
@@ -989,6 +1058,7 @@ pub(super) async fn memory_proxy_correct_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Update,
         reqwest::Method::POST,
         "/v1/memories/correct",
         body,
@@ -1006,6 +1076,7 @@ pub(super) async fn memory_proxy_correct_by_id_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Update,
         reqwest::Method::PUT,
         &format!("/v1/memories/{memory_id}/correct"),
         body,
@@ -1023,6 +1094,7 @@ pub(super) async fn memory_proxy_feedback_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Feedback,
         reqwest::Method::POST,
         &format!("/v1/memories/{memory_id}/feedback"),
         body,
@@ -1039,6 +1111,7 @@ pub(super) async fn memory_proxy_delete_by_id_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Forget,
         reqwest::Method::DELETE,
         &format!("/v1/memories/{memory_id}"),
         serde_json::json!({}),
@@ -1053,6 +1126,7 @@ pub(super) async fn memory_proxy_profile_handler(
     memory_proxy_call(
         &state,
         &headers,
+        MemoryAction::Profile,
         reqwest::Method::GET,
         "/v1/profiles/me",
         serde_json::json!({}),
@@ -1065,7 +1139,15 @@ pub(super) async fn memory_proxy_reflect_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, reqwest::Method::POST, "/v1/reflect", body).await
+    memory_proxy_call(
+        &state,
+        &headers,
+        MemoryAction::Reflect,
+        reqwest::Method::POST,
+        "/v1/reflect",
+        body,
+    )
+    .await
 }
 
 async fn memoria_management_proxy_call(
@@ -1290,7 +1372,7 @@ mod tests {
             (MemoryAccess::None, true),
             (MemoryAccess::ReadOnly, true),
         ] {
-            let error = require_memoria_consent(access, write).unwrap_err();
+            let error = require_memoria_consent(access, write, false).unwrap_err();
             let (status, body) = map_memoria_forward_error(error);
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(body.detail, access.denial_message(write).unwrap());
@@ -1302,8 +1384,8 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.detail, "A completely different localized message");
         assert_eq!(body.error_code.as_deref(), Some("memory_consent_denied"));
-        assert!(require_memoria_consent(MemoryAccess::ReadOnly, false).is_ok());
-        assert!(require_memoria_consent(MemoryAccess::ReadWrite, true).is_ok());
+        assert!(require_memoria_consent(MemoryAccess::ReadOnly, false, false).is_ok());
+        assert!(require_memoria_consent(MemoryAccess::ReadWrite, true, false).is_ok());
     }
 
     #[test]
@@ -1537,6 +1619,59 @@ mod tests {
 
         assert!(normalize_exact_memory_purge_receipt(json!({}), &ids).is_err());
         assert!(normalize_exact_memory_purge_receipt(json!({"purged": 2}), &ids).is_err());
+    }
+
+    #[tokio::test]
+    async fn cloud_gateway_projects_actual_server_purge_receipts() {
+        use astra_tools::memoria::MemoriaToolGateway;
+        use axum::{Json, Router, routing::post};
+        use serde_json::Value;
+
+        let app = Router::new()
+            .route("/memory/snapshots", post(|| async { StatusCode::CREATED }))
+            .route(
+                "/memory/purge",
+                post(|Json(body): Json<Value>| async move {
+                    let ids = exact_memory_ids_for_user_purge(&body).unwrap();
+                    let matched = ids.iter().filter(|id| id.starts_with("found")).count();
+                    Json(
+                        normalize_exact_memory_purge_receipt(json!({"purged":matched}), &ids)
+                            .unwrap(),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = MemoriaToolGateway::new(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            Some("test".into()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (ids, status, deleted) in [
+            (["absent1", "absent2"], "not_found", 0),
+            (["found1", "absent2"], "partial", 1),
+            (["found1", "found2"], "completed", 2),
+        ] {
+            let session = format!("server-purge-projection-{status}");
+            MemoriaToolGateway::record_seen(&session, ids.map(str::to_owned));
+            let result = gateway
+                .call(
+                    "forget",
+                    &json!({"session_id":session,"memory_ids":ids,"reason":"test exact removal"}),
+                )
+                .await;
+            assert_eq!(
+                serde_json::from_str::<Value>(&result).unwrap(),
+                json!({
+                    "status":status, "requested_count":2, "deleted_count":deleted, "unresolved_count":2-deleted
+                })
+            );
+            assert_eq!(
+                MemoriaToolGateway::seen_snapshot(&session).len(),
+                if deleted == 2 { 0 } else { 2 }
+            );
+            MemoriaToolGateway::reset_session_process_state(&session);
+        }
+        server.abort();
     }
 
     #[test]

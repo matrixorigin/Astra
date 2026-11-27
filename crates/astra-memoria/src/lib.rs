@@ -346,6 +346,52 @@ pub fn confirmed_memory_id(response: &serde_json::Value) -> Result<String, Strin
     Ok(id.to_string())
 }
 
+/// Interpret a settled exact purge from Memoria or the Server proxy. Only a
+/// count matching the distinct requested identities confirms the whole set.
+pub fn exact_purge_outcome(
+    response: &serde_json::Value,
+    requested: u64,
+) -> Result<(u64, &'static str), &'static str> {
+    let deleted = response
+        .get("purged")
+        .or_else(|| response.get("deleted_count"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("memory backend did not return a confirmed purge count")?;
+    let unresolved = requested
+        .checked_sub(deleted)
+        .ok_or("memory backend returned a purge count larger than the exact request")?;
+    let outcome = if deleted == 0 {
+        "not_found"
+    } else if unresolved == 0 {
+        "completed"
+    } else {
+        "partial"
+    };
+    if requested == 0
+        || response.get("error").is_some_and(|v| !v.is_null())
+        || response
+            .get("success")
+            .is_some_and(|v| v.as_bool() != Some(true))
+        || response.get("status").is_some_and(|v| {
+            !matches!(v.as_str(), Some("ok" | "success" | "deleted")) && v.as_str() != Some(outcome)
+        })
+        || [
+            ("deleted_count", deleted),
+            ("requested_count", requested),
+            ("unresolved_count", unresolved),
+        ]
+        .iter()
+        .any(|(key, count)| {
+            response
+                .get(key)
+                .is_some_and(|v| v.as_u64() != Some(*count))
+        })
+    {
+        return Err("memory backend returned an inconsistent exact purge receipt");
+    }
+    Ok((deleted, outcome))
+}
+
 /// Validate a receipt returned by any transport, including non-HTTP ports.
 pub fn validate_memory_id(id: &str) -> Result<(), String> {
     if id.trim().is_empty() || id.trim() != id {
@@ -387,6 +433,16 @@ pub trait MemoriaPort: Send + Sync {
         Err("Memoria transport does not support authenticated owner rebinding".to_string())
     }
 
+    /// Bind the canonical Session identity as well as its authenticated user.
+    /// User-scoped providers resolve any retained workspace binding afresh.
+    fn bind_session(
+        &self,
+        user_id: &str,
+        _session_id: &str,
+    ) -> Result<Arc<dyn MemoriaPort>, String> {
+        self.bind_owner(user_id)
+    }
+
     /// Resolve the authority used by a prompt-facing memory tool operation.
     /// Runtime-only ports may leave this unsupported; concrete HTTP and
     /// user-scoped ports return an owner-bound transport.
@@ -395,6 +451,25 @@ pub trait MemoriaPort: Send + Sync {
         _write: bool,
     ) -> Result<Option<MemoriaToolTransport>, String> {
         Ok(None)
+    }
+
+    /// Resolve compound operations that both reveal stored memory and mutate it.
+    /// Providers may override this to check both grants in one fresh snapshot.
+    /// The default requires matching owner/backend identities across both checks.
+    async fn resolve_read_write_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        let Some(read) = self.resolve_tool_transport(false).await? else {
+            return Ok(None);
+        };
+        let Some(write) = self.resolve_tool_transport(true).await? else {
+            return Ok(None);
+        };
+        if read.owner_user_id != write.owner_user_id
+            || read.base_url != write.base_url
+            || read.owner_scoped_master != write.owner_scoped_master
+        {
+            return Err("memory_scope_violation: read and write authority differ".into());
+        }
+        Ok(Some(write))
     }
 
     /// Resolve observer write authority at dispatch. Implementations may

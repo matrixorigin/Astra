@@ -664,7 +664,7 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
         .iter()
         .rev()
         .find(|message| message["role"] == "assistant")
-        .is_some_and(|message| message[OVERSIZED_TERMINAL_MARKER] == true)
+        .is_some_and(terminal_context_omitted)
     {
         // The original was already captured before its Context replacement.
         return;
@@ -690,6 +690,9 @@ const OVERSIZED_TERMINAL_DETAIL: &str = "Some response context was too large to 
 const OVERSIZED_TERMINAL_CONTEXT: &str =
     "[The preceding assistant response exceeded the context limit and was omitted.]";
 const OVERSIZED_TERMINAL_MARKER: &str = "_astra_omitted_terminal_response";
+pub(crate) fn terminal_context_omitted(message: &serde_json::Value) -> bool {
+    message[OVERSIZED_TERMINAL_MARKER] == true
+}
 
 fn terminal_message_fits(state: &AgenticLoopState, message: &serde_json::Value) -> bool {
     // A terminal answer is a separate segment, but it shares the same

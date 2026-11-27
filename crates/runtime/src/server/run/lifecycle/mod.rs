@@ -11,7 +11,7 @@ mod admission;
 mod cancellation;
 mod execution_resume;
 mod persistence;
-pub(crate) use persistence::server_input_source_event_id;
+pub(crate) use persistence::{TurnObserverTasks, server_input_source_event_id};
 mod projection;
 pub(crate) mod run_state;
 mod tool_outcome_cache;
@@ -6246,6 +6246,7 @@ pub struct AgenticRunLifecycleService {
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<ProgressEvent>>>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
+    observer_tasks: Arc<TurnObserverTasks>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
@@ -6400,6 +6401,7 @@ impl AgenticRunLifecycleService {
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
             observer_worker: None,
+            observer_tasks: Default::default(),
             auxiliary_event_writer: None,
             trace_ingestion: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
@@ -6829,6 +6831,11 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::AgentBindingService>,
     ) -> Self {
         self.agent_binding_service = service;
+        self
+    }
+
+    pub(crate) fn with_observer_tasks(mut self, owner: Arc<TurnObserverTasks>) -> Self {
+        self.observer_tasks = owner;
         self
     }
 
@@ -7916,6 +7923,7 @@ impl AgenticRunLifecycleService {
     }
 
     async fn stop_background_tasks_for_shutdown_impl(&self, timeout: std::time::Duration) -> bool {
+        self.observer_tasks.stop();
         // The preceding passive drain already persisted a graceful-shutdown
         // checkpoint. Do not reuse the user-cancel flag/token here: doing so
         // would turn a recoverable server restart into a durable user-cancelled
@@ -12312,7 +12320,7 @@ impl AgenticRunLifecycleService {
         builder = builder.with_memoria_client(
             self.memory_extraction_service
                 .as_ref()
-                .and_then(|svc| svc.memoria_client_for_owner(user_id).ok()),
+                .and_then(|svc| svc.memoria_client_for_session(user_id, session_id).ok()),
         );
 
         if let Some(pool) = &self.shared_pool {
@@ -12464,7 +12472,7 @@ impl AgenticRunLifecycleService {
             Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
         let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
-            match svc.scoped_to_owner(user_id) {
+            match svc.scoped_to_session(user_id, session_id) {
                 Ok(scoped) => Some(scoped),
                 Err(error) => {
                     tracing::error!(
@@ -12975,7 +12983,7 @@ impl AgenticRunLifecycleService {
         if let Some(memoria_port) = self
             .memory_extraction_service
             .as_ref()
-            .and_then(|service| service.memoria_client_for_owner(user_id).ok())
+            .and_then(|service| service.memoria_client_for_session(user_id, session_id).ok())
         {
             executor = executor.with_memoria_port(memoria_port);
         }
@@ -14517,6 +14525,7 @@ impl AgenticRunLifecycleService {
             owner_pod_id: self.run_engine.execution_owner_pod_id().map(str::to_owned),
             user_message,
             observer_worker: self.observer_worker.clone(),
+            observer_tasks: self.observer_tasks.clone(),
             metrics_registry: self.metrics_registry.clone(),
         };
 
@@ -15904,9 +15913,19 @@ impl AgenticRunLifecycleService {
     async fn authorize_fork_session_request(
         &self,
         user_id: &str,
-        request: &ChatRequestData,
+        request: &mut ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         if let Some(session_id) = &request.session_id {
+            if let Some(result) = request.session_admission_facts.as_mut().and_then(|facts| {
+                facts.take_chat_scope_authorization(
+                    user_id,
+                    session_id,
+                    request.provider_run_owner.as_ref(),
+                    &self.encryptor,
+                )
+            }) {
+                return result.map_err(Self::chat_scope_error);
+            }
             self.authorize_fork_session_id(
                 user_id,
                 session_id,
@@ -15916,6 +15935,19 @@ impl AgenticRunLifecycleService {
             .await?;
         }
         Ok(())
+    }
+
+    fn chat_scope_error(
+        error: astra_services::SessionForkCoordinatorError,
+    ) -> (StatusCode, Json<ErrorResponse>) {
+        match error {
+            astra_services::SessionForkCoordinatorError::Forbidden => error_response_coded(
+                StatusCode::FORBIDDEN,
+                "Session fork is outside the authorized scope",
+                "session_fork_forbidden",
+            ),
+            error => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
     }
 
     async fn authorize_fork_session_id(
@@ -15935,14 +15967,7 @@ impl AgenticRunLifecycleService {
                 requirement,
             )
             .await
-            .map_err(|error| match error {
-                astra_services::SessionForkCoordinatorError::Forbidden => error_response_coded(
-                    StatusCode::FORBIDDEN,
-                    "Session fork is outside the authorized scope",
-                    "session_fork_forbidden",
-                ),
-                error => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            })?;
+            .map_err(Self::chat_scope_error)?;
         } else if provider_owner.is_some() {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -16010,11 +16035,11 @@ impl AgenticRunLifecycleService {
     async fn stream_chat_with_session_impl(
         &self,
         user_id: String,
-        request: ChatRequestData,
+        mut request: ChatRequestData,
         create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
-        self.authorize_fork_session_request(&user_id, &request)
+        self.authorize_fork_session_request(&user_id, &mut request)
             .await?;
         self.validate_attached_session_cursor(&user_id, &request)?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
@@ -16120,14 +16145,14 @@ impl AgenticRunLifecycleService {
     async fn prepare_new_owned_execution(
         &self,
         user_id: String,
-        request: ChatRequestData,
+        mut request: ChatRequestData,
         mut start_identity: Option<RunStartIdempotency>,
         streaming: bool,
         create_session: Option<astra_services::runs::ChatSessionCreation<'_>>,
     ) -> Result<NewRunPreparation, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
         if !streaming {
-            self.authorize_fork_session_request(&user_id, &request)
+            self.authorize_fork_session_request(&user_id, &mut request)
                 .await?;
         }
         // Provider task fingerprints describe the original request, not the
@@ -25474,7 +25499,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // makes direct pause/resume admission truthful even when the parent
         // lives in a different process-local run map.
         let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
-            match svc.scoped_to_owner(&config.user_id) {
+            match svc.scoped_to_session(&config.user_id, &config.session_id) {
                 Ok(scoped) => Some(scoped),
                 Err(error) => {
                     tracing::error!(
@@ -25608,7 +25633,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .with_interaction_mode(Some(config.interaction_mode));
 
         builder = builder.with_memoria_client(self.memory_extraction_service.as_ref()
-            .and_then(|svc| svc.memoria_client_for_owner(&config.user_id).ok()));
+            .and_then(|svc| svc.memoria_client_for_session(&config.user_id, &config.session_id).ok()));
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -25855,7 +25880,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(memoria_port) = self
                 .memory_extraction_service
                 .as_ref()
-                .and_then(|service| service.memoria_client_for_owner(&config.user_id).ok())
+                .and_then(|service| service.memoria_client_for_session(&config.user_id, &config.session_id).ok())
             {
                 executor = executor.with_memoria_port(memoria_port);
             }

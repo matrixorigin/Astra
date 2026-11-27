@@ -201,7 +201,7 @@ pub use runtime_scaffolding::{
     mark_append_only_runtime_authority_policy, mark_runtime_owned_message,
     parse_append_only_runtime_authority_frame, render_append_only_runtime_authority_frame,
     runtime_authority_kind, runtime_authority_lifetime, runtime_message_delivery,
-    runtime_message_delivery_from_provenance, runtime_owned_message,
+    runtime_message_delivery_from_provenance, runtime_owned_message, tool_result_count,
 };
 pub use semantic_read_cache::{
     SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_CONDITION_ACK_METADATA_KEY,

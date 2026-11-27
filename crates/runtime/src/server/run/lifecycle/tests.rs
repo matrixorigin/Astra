@@ -3570,7 +3570,7 @@ async fn attached_stream_event_detaches_after_disconnect() {
 #[tokio::test]
 async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3591,7 +3591,7 @@ async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached(
         );
         assert_eq!(
             rx.recv().await.unwrap(),
-            json!({"type": "text_delta", "content": "queued"})
+            json!({"type": "text_delta", "content": "scheduled"})
         );
         delivery.await;
     }
@@ -3602,7 +3602,7 @@ async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached(
 #[tokio::test]
 async fn attached_stream_publication_survives_full_queue_before_terminal() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3641,7 +3641,7 @@ async fn attached_stream_publication_survives_full_queue_before_terminal() {
 #[tokio::test]
 async fn attached_stream_never_drops_a_tool_terminal_while_the_observer_is_attached() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3670,7 +3670,7 @@ async fn attached_stream_never_drops_a_tool_terminal_while_the_observer_is_attac
 #[tokio::test]
 async fn attached_stream_never_drops_applied_guidance_behind_progress() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "reasoning_delta", "content": "queued"}))
+    tx.send(json!({"type": "reasoning_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3864,7 +3864,7 @@ async fn attached_terminal_recovers_latest_context_without_provider_usage() {
 #[tokio::test]
 async fn attached_stream_never_silently_drops_a_repair_gap() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3890,7 +3890,7 @@ async fn attached_stream_never_silently_drops_a_repair_gap() {
 #[tokio::test]
 async fn attached_stream_closes_a_stalled_interaction_lane_for_durable_replay() {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -36086,6 +36086,96 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
             event["event_type"] == "run_finished" || event["type"] == "run_finished"
         }),
         "short Explain turn did not emit run_finished: {events:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(history_work)]
+async fn ephemeral_observer_burst_delivers_terminal_and_releases_run_resources() {
+    use astra_turn_core::contracts::TurnObserverOutcome;
+    #[derive(Default)]
+    struct HeldObserver {
+        active: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl TurnObserverWorker for HeldObserver {
+        async fn run(&self, _: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _active = Active(self.active.clone());
+            std::future::pending().await
+        }
+    }
+    let (service, _llm) = terminal_test_service().await;
+    assert!(service.shared_pool.is_none());
+    let observer = Arc::new(HeldObserver::default());
+    let metrics = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    let service = service
+        .with_observer_worker(observer.clone())
+        .with_metrics_registry(metrics.clone());
+    // Independent Sessions all finish while the first four observers remain
+    // blocked. Exercise production lifecycle and its terminal event stream.
+    for _ in 0..8 {
+        let mut request = test_request("hello");
+        request.interactive_client = true;
+        let mut stream = ok(service.stream_chat("user-1".into(), request).await);
+        let mut events = stream.event_rx.take().unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut terminal = false;
+            while let Some(event) = events.recv().await {
+                terminal |= (event["event_type"] == "run_finished"
+                    || event["type"] == "run_finished")
+                    && chat_stream_event_status(&event) == Some(STATUS_COMPLETED);
+            }
+            terminal
+        })
+        .await
+        .expect("terminal stream cannot await optional observation");
+        assert!(terminal);
+    }
+    assert!(
+        service.drain_background_tasks(Duration::from_secs(5)).await,
+        "run-owned terminal projections and cleanup must drain with held observers"
+    );
+    assert!(service.approval_channels.lock().await.is_empty());
+    assert!(service.user_prompt_channels.lock().await.is_empty());
+    assert!(service.progress_channels.lock().await.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observer.active.load(Ordering::SeqCst) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 4);
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("outcome=\"dropped_full\"} 4")
+    );
+    assert!(
+        service
+            .stop_background_tasks_for_shutdown_impl(Duration::from_secs(5))
+            .await
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observer.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must cancel process-owned observations");
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("outcome=\"cancelled\"} 4")
     );
 }
 

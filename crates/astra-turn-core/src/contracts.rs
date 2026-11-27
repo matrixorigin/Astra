@@ -2,6 +2,8 @@ use async_trait::async_trait;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnObserverRequest {
+    /// Extract only facts independently supported by the isolated user message.
+    pub standalone_guidance: bool,
     pub user_id: String,
     pub session_id: String,
     pub messages: Vec<serde_json::Map<String, serde_json::Value>>,
@@ -20,6 +22,11 @@ pub enum TurnObserverOutcome {
 
 #[async_trait]
 pub trait TurnObserverWorker: Send + Sync {
+    /// Deployment configuration only; user authority is resolved afresh by run.
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String>;
 }
 

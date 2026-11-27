@@ -2091,6 +2091,8 @@ pub(crate) struct DurableUserIntentState {
 #[derive(Default)]
 pub struct UserIntentState {
     durable: DurableUserIntentState,
+    /// Local evidence only. A recovered Run begins a new window at its next acknowledgement.
+    pub(crate) observer_guidance: Option<super::observer_guidance::ObserverGuidanceBoundary>,
     /// Process-local readiness hint for this provider's durable intent lane.
     /// It is not an applied cursor or a second input queue.
     pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,

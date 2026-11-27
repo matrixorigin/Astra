@@ -74,6 +74,12 @@ macro_rules! current_thread_matrix_test {
 }
 
 matrix_test! {
+    e2e_matrix_guidance_isolates_a_confirmation_after_omitted_tool_output, 4,
+    "live MatrixOne + scripted provider; send only the user confirmation for standalone extraction after tool output",
+    journey_stream_persistence::run_guidance_isolates_a_confirmation_after_omitted_tool_output
+}
+
+matrix_test! {
     e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution, 2,
     "live MatrixOne + scripted provider; real schema rejection and corrected child execution",
     journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, false

@@ -32,7 +32,9 @@ memory write before the assistant claims storage. Conversation-only scope and
 explicit tool bans remain authoritative; they do not grant permission to persist.
 If persistence was requested but cannot be performed under those constraints,
 the assistant must distinguish acknowledgment from an actual stored memory.
-A write receipt proves storage, not a later-session recall that has not run.
+A completed correction must return a valid identifier for the corrected memory.
+An accepted or queued correction remains pending. A write receipt proves storage,
+not a later-session recall that has not run.
 
 ## Loading policy
 
@@ -86,7 +88,7 @@ Trusted self-hosted deployments may explicitly enable `MEMORIA_SELF_HOSTED_MASTE
 
 Turn observation uses the same composition-owned `MemoriaPort` template as
 prompt recall and session memory. Each queued observation binds the authenticated
-Astra owner, checks write admission, and resolves fresh write transport before
+Astra Session and resolves current write authority and transport before
 sending `/v1/observe`. The transport supplies the Memoria owner and authentication
 scheme, with exactly one `X-User-Id` header; the worker must not derive them from
 the request user ID or fall back to a deployment master key. Denied/read-only access skips observation; authority
@@ -95,8 +97,7 @@ lookup failures and grants revoked after admission fail closed.
 Transport resolution performs fresh authority lookup without allocating an HTTP
 client. HTTP memory operations construct their client from the resolved transport;
 the observer keeps its own 10-second connect / 30-second request timeout and
-no-redirect policy. Admission and the fresh send-time authority check remain
-separate.
+no-redirect policy. The Server resolves its session-bound observer transport once per dispatch.
 
 Observer run metrics distinguish `success` (backend accepted the request), `not_configured`
 (no authority template), `access_disabled` (write admission denied), `empty`, and
@@ -108,9 +109,8 @@ rate series and has no success-ratio alert.
 
 Setting a deployment master key alone no longer enables the observer. Self-hosted
 local-account fallback additionally requires `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`
-and the existing eligible-account checks. If `memoria_credentials()` supplies no
-authority template, observation reports `not_configured`; it does not use the
-master key directly.
+and the existing eligible-account checks. The dispatcher skips workers without an authority template. A direct call to an
+unconfigured worker reports `not_configured`.
 Provider request authentication does not itself grant memory access. A provider
 without a canonical memory binding remains disabled until an explicit identity
 and memory-authority integration is established.
@@ -261,3 +261,187 @@ that prohibits tools must not create Work through automatic admission. Ordinary
 conversation-only acknowledgment needs no lookup or storage caveat. The compact
 resident memory surface supports remember/recall; select the full memory contract
 and use its invocation carrier for operations such as forget or update.
+
+## MOI request identity bridge
+
+MOI memory is workspace-isolated personal memory. The same user in different
+MOI workspaces has different memory owners; different users in the same
+workspace remain isolated. Native UC login retains its separate account-level
+namespace. This does not introduce shared workspace memory.
+
+With UC built-in memory explicitly enabled, MOI HMAC and MOI Edge-token
+principals resolve memory authority through the configured `moi` provider's
+authenticated `resolve_memory_identity` callback. The request carries the IAM
+`external_subject` and `provider_scope_id`. The response must bind the same
+subject and workspace, the exact configured UC `issuer`, the mapped `uc_subject`
+and an explicit `memory_access` decision. An omitted or mismatched identity,
+workspace or grant fails closed before UC/Memoria access.
+
+MOI decides `memory.read` and `memory.write` independently through current
+workspace IAM. The grant is `none`, `read_only`, `write_only` or `read_write`;
+write permission alone never enables reads, and read permission alone never
+enables observation or maintenance. Session-end consolidation also reads working
+memory: preparing or reusing its frozen snapshot requires fresh `memory.read`,
+in addition to write admission and the fresh write checks on later mutations.
+Write-only observation and saves remain allowed; consolidation waits for the
+read grant rather than reading through a write-authorized deployment transport.
+Reflection also requires both grants because candidate responses can contain
+existing memory content. The canonical port resolves this compound requirement;
+MOI checks both grants against one fresh workspace/identity resolution. Generic
+ports must return matching backend/owner identities for their read/write checks.
+
+Ordinary explicit mutations (`remember`, `update`, `forget`, `feedback`) return
+gateway-owned receipts, not raw backend records. A deduplicated store or a
+correction can otherwise return metadata inherited from an existing memory,
+exposing it through write-only authority. Receipts retain confirmed memory IDs,
+purge counts, newly created snapshot/feedback identifiers and bounded status
+categories. Backend warning text is replaced by a local purge warning, and
+mutation HTTP errors retain their structured status/remediation without the
+upstream body. Pending/partial statuses remain distinguishable from completed
+writes. Empty success responses retain their existing operation semantics;
+`remember` still requires an exact nonempty memory ID. This projection is shared
+by direct and Server-proxy tools for every grant; it adds no read request or
+authorization lookup. Reading a resulting record requires a separate authorized
+read operation. Reflection remains the compound read/write operation above.
+The tool gateway resolves write authority again after a pre-operation safety
+snapshot for forget and update. It uses the fresh credential only when the
+owner, endpoint and credential scheme still match the snapshotted scope.
+
+An active account, permission to chat,
+a provider signature or an old UI capability projection is insufficient.
+MOI seeds both grants once for eligible existing ordinary Roles without an
+explicit memory policy. MOI also preselects both in the new-role form. API
+callers supply their own complete policy. Administrators can remove either
+grant, and the backfill preserves explicit policies. Where built-in memory is
+configured, an eligible default Role can therefore authorize automatic
+observation without a separate permission change. Every operation resolves
+fresh authority. An admitted grant also requires the existing live UC
+account-status check. No decision is retained as a background capability, and
+no denial or dependency failure selects unrestricted deployment credentials.
+
+The workspace comes from the canonical Session's immutable provider binding,
+created from verified HMAC or MOI runtime-token context. Edge registration
+tokens retain their existing prohibition on provider Session creation; they
+may access only a compatible same-owner, same-workspace bound Session.
+Session creation stores its `ProviderRunOwner` and a server-keyed memory proof binding
+user, Session, provider and workspace. Its signing domain is separate from the
+older provider Session proof: historical client-supplied metadata plus an old
+signature cannot prove a new memory boundary. Public metadata creation and updates
+cannot supply or remove these reserved fields. The resolver verifies the proof
+on every memory authority lookup. Chat admission must also verify the retained
+workspace, including the Edge-token path, so transcript content cannot cross
+workspace boundaries. A tool argument or the user's latest request cannot
+select this workspace.
+
+Fork creation retains the workspace identity only after verifying the parent's
+binding and signs the child's own binding. Recovery verifies the child identity
+and active canonical fork manifest; a legacy manifest alone is insufficient.
+Old Sessions without the new binding remain ineligible for workspace memory,
+and a new fork cannot turn their historical transcript into authorized memory.
+Existing conversation access is distinct from eligibility to extract memory.
+There is no implicit backfill, history copy or migration from account-level
+memory. Requests that target a Session must use a newly bound Session.
+
+Memory owners use the `mws_` prefix and a base64url SHA-256 digest of the ordered
+JSON tuple `["astra.workspace-memory.v1", provider_id, workspace_id, issuer,
+uc_subject]`. The 47-byte owner is stable, bounded and distinct from native UC's
+`uc_` namespace. Session/Run user IDs are unchanged. Owner-scoped Memoria
+transport is reused; the callback returns no long-lived user credential.
+
+Observation, explicit memory tools and session-end maintenance use the same
+Session-bound resolver. Per-process extraction services are cached by both
+user and Session, retaining separate bound transports and rejecting extraction
+requests for another Session. A new operation or recovery attempt rechecks the
+current grant. Native UC, local-account and scoped-key login paths retain their
+existing selection contracts.
+
+The companion MOI callback must be deployed before this path is used. An older
+MOI endpoint does not implement `resolve_memory_identity` and rejects it with
+HTTP 400; adding a workspace parameter alone does not make that endpoint
+compatible. Compare the two services' effective UC issuers byte for byte,
+including any trailing slash. Cross-project acceptance must exercise the actual
+MOI product path, user/workspace isolation and revocation, rather than treating
+fixtures or passing CI as end-to-end readiness.
+
+Observation acceptance proves that an observation was accepted, not that memory
+was recalled or injected into a subsequent conversation. This change does not
+wire automatic prompt recall: retained prefetch helpers have no production
+caller. Explicit memory-tool recall verifies that narrower operation only.
+The broader cross-session-memory issue remains open until a new conversation
+recalls nonempty memory into model context.
+
+Close, memory-status and finalize retain request-bound HMAC verification of
+method/path/body and the Session's provider scope. Each lifecycle operation
+requires a fresh signature. Edge tokens retain their own owner namespace and
+cannot control an HMAC-created Session merely by sharing its IAM subject.
+The memory proxy retains its user-token authentication contract. Store and
+retrieve bind the supplied Session to the verified MOI token workspace.
+Workspace-wide proxy operations without a Session use the verified token's
+workspace and still check current IAM grants. Reflection needs both grants,
+and write-only responses expose bounded receipts. The legacy Session update
+route also verifies the workspace before closing a memory-bound Session.
+For a fresh independent Run in an existing MOI Edge Session, chat preflight
+checks the scope from the owned Session read. Run insertion checks it again
+from the locked Session row. Neither check resolves memory IAM grants.
+Status and finalize verify the existing Session and workspace in one read.
+The MOI caller must invoke close/finalize for session-end maintenance.
+
+The identity callback has a two-second request deadline including response-body
+reads, and an 8 KiB response limit for success/error and chunked bodies.
+Endpoint-specific pools preserve proxy and no-redirect policies; credentials
+remain request-local and identity/grant decisions are not cached. Other
+provider actions retain their 30-second deadline and 8 MiB response limit.
+A MOI observation resolves the Session binding, workspace IAM grants and UC
+account status at dispatch. The authority lookup has a ten-second deadline,
+and the Memoria request has a separate 30-second deadline.
+
+After the owning Server settles a Run, it can send one best-effort observation
+using bounded public conversation evidence. A new Run can retain the
+verified adjacent public exchange from its Session to preserve the meaning of
+a reply. If a tool, a history rewrite or the byte limit makes the adjacent
+exchange unusable, the new Run sends only its current user input to
+`POST /v1/observe/standalone`. The extractor can retain an independent
+preference and discard a confirmation whose referent is missing. Consecutive
+user inputs stay together. If acknowledged guidance follows a public assistant
+reply, the observer sends the exchange as one content string containing
+ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
+the confirmation and its referent together. The complete opening or guided
+exchange, including role framing, must fit Memoria's 6,000-byte UTF-8 extraction window. The optional final answer is
+omitted if adding it would exceed the window.
+Exchanges over 500 characters use `POST /v1/observe/complete`. An older
+Memoria rejects that optional request and the Run still completes.
+After a tool or a restored guidance boundary, Astra sends only the newly
+acknowledged user guidance to `POST /v1/observe/standalone`. Subsequent guidance in the same window
+can add context when the user inputs are consecutive. If an assistant reply
+intervenes between those inputs, Astra skips the observation because a later
+confirmation may refer to that reply. Memoria asks its extractor whether the complete user text
+stands on its own and accepts only a verbatim result. Omitted tool output,
+earlier requests and assistant answers are excluded. Missing or failed
+extraction cannot create a raw memory. This endpoint also requires a
+Memoria version that supports it. Guidance
+batches are located by their acknowledged identities. A bounded fingerprint
+of the public predecessors detects changes across history rewrites, while
+compaction of unrelated history preserves the observation. A subsequent tool call
+ends the previous guidance window. A current memory call or missing tool evidence skips
+observation. A final answer over 500 characters or without a matching guidance
+owner is omitted. Tool results and private model state are excluded. Four process-owned
+slots bound concurrent work. Saturation, shutdown and dispatch
+errors can lose an observation; later turns are eligible independently.
+Observation performs no catalog discovery, claim, receipt or replay. The
+existing durable session-end governance lifecycle continues separately.
+
+Exact memory deletion reports `not_found`, `partial` or `completed` from the
+confirmed removal count and the number of distinct requested identities.
+Only full confirmation clears those identities from the local recall selection.
+A pending receipt leaves the selection available. An empty or inconsistent
+terminal receipt cannot confirm an exact deletion.
+
+MOI built-in read-only grants use product-neutral remediation, while scoped
+Memoria logins retain their Connected apps instructions. Authority failures expose
+only stable allowlisted categories (service credentials, timeout, transport,
+unavailable, invalid response, upstream rejection), never provider body text.
+The callback's explicit identity denial is HTTP 403 with error code
+`moi_memory_identity_denied`; the resolver returns `Denied` for that exact pair.
+Service-authentication failures, unclassified 403 responses, dependency failures
+and malformed payloads remain authority errors. A denied account must not be
+reported as a backend outage, nor may an outage be converted into consent denial.

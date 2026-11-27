@@ -13,7 +13,10 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU8, Ordering},
+};
 
 #[derive(Clone)]
 struct AuthorityPort {
@@ -24,6 +27,7 @@ struct AuthorityPort {
     transport_missing: bool,
     master: bool,
     calls: Arc<Mutex<Vec<String>>>,
+    changing_grant: Option<Arc<AtomicU8>>,
 }
 
 #[async_trait]
@@ -45,6 +49,9 @@ impl MemoriaPort for AuthorityPort {
         assert!(write);
         assert!(self.bound_owner.is_some());
         self.calls.lock().unwrap().push("admit-write".into());
+        if let Some(grant) = &self.changing_grant {
+            return Ok(grant.load(Ordering::SeqCst) != 1);
+        }
         self.allowed.clone()
     }
     async fn resolve_tool_transport(
@@ -53,6 +60,13 @@ impl MemoriaPort for AuthorityPort {
     ) -> Result<Option<MemoriaToolTransport>, String> {
         assert!(write);
         self.calls.lock().unwrap().push("resolve-write".into());
+        if self
+            .changing_grant
+            .as_ref()
+            .is_some_and(|grant| grant.load(Ordering::SeqCst) == 0)
+        {
+            std::future::pending::<()>().await;
+        }
         if let Some(error) = &self.transport_error {
             return Err(error.clone());
         }
@@ -133,11 +147,13 @@ fn port(base_url: String) -> AuthorityPort {
         transport_missing: false,
         master: false,
         calls: Arc::default(),
+        changing_grant: None,
     }
 }
 
 fn request(user_id: &str) -> TurnObserverRequest {
     TurnObserverRequest {
+        standalone_guidance: false,
         user_id: user_id.into(),
         session_id: format!("session-{user_id}"),
         messages: vec![
@@ -274,6 +290,21 @@ async fn observer_missing_port_and_empty_input_are_not_success() {
 }
 
 #[tokio::test]
+async fn complete_observation_is_not_retried_on_an_older_memoria() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(url))));
+    let mut long = request("astra-a");
+    long.messages[0].insert("content".into(), json!("界".repeat(501)));
+    assert!(worker.run(long).await.unwrap_err().contains("404"));
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::Observed
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn observer_reports_backend_rejection_without_response_body() {
     let (url, requests, server) = backend(StatusCode::FORBIDDEN).await;
     let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(url))));
@@ -349,9 +380,85 @@ async fn observer_connection_error_is_classified_without_url_or_credential() {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let endpoint = format!("http://{}", socket.local_addr().unwrap());
-    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(endpoint))));
-    assert_eq!(
-        worker.run(request("astra-a")).await.unwrap_err(),
-        "memoria observer connection failed"
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(endpoint.clone()))));
+    let error = worker.run(request("astra-a")).await.unwrap_err();
+    // A bound, non-listening socket may reject the connection or time it out,
+    // depending on the host network stack. Both must remain classified and
+    // sanitized; the OS behavior is not an application protocol contract.
+    assert!(
+        matches!(
+            error.as_str(),
+            "memoria observer connection failed" | "memoria observer request timed out"
+        ),
+        "unexpected network failure category: {error}"
     );
+    assert!(!error.contains(&endpoint));
+    assert!(!error.contains("synthetic-scoped-key"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn observer_retry_after_authority_timeout_resolves_current_grant() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let mut authority = port(url);
+    let grant = Arc::new(AtomicU8::new(0));
+    authority.changing_grant = Some(grant.clone());
+    let calls = authority.calls.clone();
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(authority)));
+    let started = tokio::time::Instant::now();
+    assert!(
+        worker
+            .run(request("astra-a"))
+            .await
+            .unwrap_err()
+            .contains("authority lookup timed out")
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+    assert!(requests.lock().unwrap().is_empty());
+    grant.store(1, Ordering::SeqCst);
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::AccessDisabled
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a revoked retry cannot reuse old authority"
+    );
+    grant.store(2, Ordering::SeqCst);
+    tokio::time::resume();
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::Observed
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "bind:astra-a",
+            "admit-write",
+            "resolve-write",
+            "bind:astra-a",
+            "admit-write",
+            "bind:astra-a",
+            "admit-write",
+            "resolve-write"
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn observer_checks_current_authority_for_a_prepared_request() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let mut authority = port(url);
+    let grant = Arc::new(AtomicU8::new(2));
+    authority.changing_grant = Some(grant.clone());
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(authority)));
+    let prepared = request("astra-a");
+    grant.store(1, Ordering::SeqCst);
+    assert_eq!(
+        worker.run(prepared).await.unwrap(),
+        TurnObserverOutcome::AccessDisabled
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    server.abort();
 }

@@ -307,6 +307,28 @@ impl TurnObserverWorker for RecordingObserverWorker {
     }
 }
 
+async fn assert_public_turn_observed(worker: &RecordingObserverWorker, answer: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let requests = worker.requests.lock().await;
+            if !requests.is_empty() {
+                assert_eq!(requests.len(), 1);
+                let messages = &requests[0].messages;
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0]["role"], "user");
+                assert_eq!(messages[1]["role"], "assistant");
+                assert!(messages[1]["content"].as_str().unwrap().contains(answer));
+                assert!(messages.iter().all(|message| message.len() == 2));
+                break;
+            }
+            drop(requests);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed Run must dispatch its public turn");
+}
+
 #[derive(Clone, Debug)]
 struct NoopAuxiliaryEventWriter;
 
@@ -1448,29 +1470,7 @@ let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Ar
                 .is_some_and(|content| content.contains("Financial analysis completed"))
         }));
 
-        let ow = observer_worker.clone();
-        poll_until(
-            || {
-                let ow = ow.clone();
-                async move { !ow.requests.lock().await.is_empty() }
-            },
-            5,
-        )
-        .await;
-        let requests = observer_worker.requests.lock().await;
-        let skill_result = requests
-            .first()
-            .expect("observer receives the skill follow-up round")
-            .messages
-            .iter()
-            .find(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some(call_id_for(&events, "skill", |args| args["skill_name"] == "financial-analysis").as_str())
-            })
-            .and_then(|message| message.get("content").and_then(Value::as_str))
-            .expect("skill instructions reach the follow-up model round");
-        assert!(skill_result.contains("Use the user-provided financial analysis workflow."));
-        assert!(skill_result.contains("<skill-loaded name=\"financial-analysis\"/>"));
-        drop(requests);
+        assert_public_turn_observed(&observer_worker, "Financial analysis completed").await;
 
         let calls = calls.lock().await;
         assert!(
@@ -3541,7 +3541,7 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
             "tool_calls"
         };
         ProviderResponse::OpenAi(
-            json!({"choices":[{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":calls},"finish_reason":finish}],"usage":{"prompt_tokens":input,"completion_tokens":output,"total_tokens":input+output}}),
+            json!({"choices":[{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":calls},"finish_reason":finish}],"usage":{"prompt_tokens":input,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"completion_tokens":output,"total_tokens":input+output}}),
         )
     }
     let complex_args = json!({"path":"/file0", "options":{"encoding":"utf-8","line_numbers":true,"range":[1,100]},"metadata":{"tags":["rust","source"],"nested":{"deep":{"value":42}}}});
@@ -3674,17 +3674,9 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
     assert!(usage.len() >= 4);
     assert_eq!(usage.last().unwrap()["input_tokens"], 228);
     assert_eq!(usage.last().unwrap()["output_tokens"], 34);
-    poll_until(
-        || {
-            let observer = observer.clone();
-            async move { !observer.requests.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-    let observer_requests = observer.requests.lock().await;
-    assert_eq!(observer_requests.len(), 1);
-    let messages = &observer_requests[0].messages;
+    assert_public_turn_observed(&observer, "Completed the file analysis.").await;
+    let wire = gateway.requests.lock().await;
+    let messages = wire.last().unwrap().body["messages"].as_array().unwrap();
     let first_batch = messages
         .iter()
         .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
@@ -3694,10 +3686,10 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
             .iter()
             .map(|call| call["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        find_events(&events, "tool_call")
+        outputs
             .iter()
             .take(5)
-            .map(|event| event["tool_call"]["id"].as_str().unwrap())
+            .map(|(id, _)| id.as_str())
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -3712,9 +3704,9 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         .collect::<Vec<_>>();
     assert_eq!(
         result_ids,
-        find_events(&events, "tool_call")
+        outputs
             .iter()
-            .map(|event| event["tool_call"]["id"].as_str().unwrap())
+            .map(|(id, _)| id.as_str())
             .collect::<Vec<_>>()
     );
     assert!(messages.iter().all(|message| {
@@ -3725,6 +3717,7 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
                 .and_then(Value::as_array)
                 .is_some_and(|calls| !calls.is_empty())
     }));
+    drop(wire);
     poll_until(
         || {
             let ledger = ledger.clone();
@@ -3752,7 +3745,8 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
             assert!(content.contains("50000 chars"));
             // Artifact custody uses the canonical invocation id; provider
             // wire ids are restored only in the outgoing tool-call envelope.
-            let canonical_id = first_batch[3]["id"].as_str().unwrap();
+            let calls = find_events(&events, "tool_call");
+            let canonical_id = calls[3]["tool_call"]["id"].as_str().unwrap();
             assert!(content.contains(&format!("Tool result id: {canonical_id}")));
             assert!(content.contains(&"y".repeat(128)));
             assert!(content.len() < output.len());
@@ -3792,30 +3786,16 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "intercepted skill should not fall through to edge tool execution"
     );
 
-    let ow = observer_worker.clone();
-    poll_until(
-        || {
-            let ow = ow.clone();
-            async move { !ow.requests.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let requests = observer_worker.requests.lock().await;
-    assert_eq!(requests.len(), 1, "expected one observer request");
-    let result = requests[0]
-        .messages
+    assert_public_turn_observed(&observer_worker, "I used the skill instructions.").await;
+    let wire = gateway.requests.lock().await;
+    let result = wire[1].body["messages"]
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str)
-                == Some(
-                    call_id_for(&events, "skill", |args| args["skill_name"] == "test-skill")
-                        .as_str(),
-                )
-        })
-        .and_then(|message| message.get("content").and_then(Value::as_str))
-        .unwrap_or("");
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "tc-skill-1")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
     assert!(
         result.contains("<skill-loaded name=\"test-skill\"/>"),
         "skill result should be injected into the turn: {result}"
@@ -3829,14 +3809,6 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     assert_eq!(terminals.len(), 1);
     assert_eq!(terminals[0]["llm_rounds"], 2);
     assert_eq!(terminals[0]["tool_calls_count"], 1);
-    let wire = gateway.requests.lock().await;
-    let delivered = wire[1].body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "tc-skill-1")
-        .unwrap();
-    assert_eq!(delivered["content"], result);
     drop(wire);
     let text_events = find_events(&events, "text_delta");
     assert!(
@@ -3941,17 +3913,15 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         terminals[0]
     );
 
-    let requests = observer_worker.requests.lock().await;
-    assert_eq!(
-        requests.len(),
-        1,
-        "one Server loop should emit one observation"
+    assert_public_turn_observed(&observer_worker, "The server completed the skill round.").await;
+    assert!(
+        gateway.requests.lock().await[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["tool_call_id"] == "tc-cli-server-skill")
     );
-    assert!(requests[0].messages.iter().any(|message| {
-        message.get("tool_call_id").and_then(Value::as_str)
-            == Some(call_id_for(&events, "skill", |_| true).as_str())
-    }));
-    drop(requests);
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(std::time::Duration::from_secs(5), server)
@@ -3996,36 +3966,18 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "unknown skill should fail in interception, not as an edge tool"
     );
 
-    let ow = observer_worker.clone();
-    poll_until(
-        || {
-            let ow = ow.clone();
-            async move { !ow.requests.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let requests = observer_worker.requests.lock().await;
-    assert_eq!(requests.len(), 1, "expected one observer request");
-    let result = requests[0]
-        .messages
+    assert_public_turn_observed(&observer_worker, "The skill was unavailable.").await;
+    let wire = gateway.requests.lock().await;
+    let result = wire[1].body["messages"]
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str)
-                == Some(
-                    call_id_for(&events, "skill", |args| {
-                        args["skill_name"] == "missing-skill"
-                    })
-                    .as_str(),
-                )
-        })
-        .and_then(|message| message.get("content").and_then(Value::as_str))
-        .unwrap_or("");
-    assert!(
-        result.contains("Unknown skill") || result.contains("unknown skill"),
-        "unknown skill should surface a clear error: {result}"
-    );
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "tc-skill-unknown")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(result.to_ascii_lowercase().contains("unknown skill"));
+    drop(wire);
 
     gateway.assert_complete();
     inference.assert_quiescent();
@@ -5682,30 +5634,15 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "the repeated investigation should reach its final answer"
     );
 
-    let ow = observer_worker.clone();
-    poll_until(
-        move || {
-            let ow = ow.clone();
-            async move { !ow.requests.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let requests = observer_worker.requests.lock().await;
-    assert_eq!(
-        requests.len(),
-        1,
-        "observer should fire once for the completed turn"
-    );
-    // Repetition is advisory evidence, not an execution boundary. The fourth
-    // identical call must complete so a valid investigation is never stopped
-    // merely because its tool shape repeats.
-    let tool_result_count = requests[0]
-        .messages
+    assert_public_turn_observed(&observer_worker, "Done reviewing.").await;
+    let wire = gateway.requests.lock().await;
+    let tool_result_count = wire.last().unwrap().body["messages"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter(|message| message["role"] == "tool")
         .count();
+    drop(wire);
     assert_eq!(
         tool_result_count, 4,
         "circuit-breaker advice must not abort a repeated but otherwise valid tool phase; got {tool_result_count}"

@@ -210,7 +210,7 @@ If `reasoning_offering_id` is not set, the server applies its governed default a
 
 ### Memoria
 
-- `MEMORIA_BASE_URL`, `MEMORIA_MASTER_KEY` — Memoria endpoint and deployment master secret. Configuring the secret alone does not grant end-user memory access.
+- `MEMORIA_BASE_URL`, `MEMORIA_MASTER_KEY` — Memoria endpoint and deployment master secret. Configuring the secret alone does not grant end-user memory access. Server automatic observation requires a nonblank endpoint, deployment key, website, or issuer. Set `MEMORIA_BASE_URL` explicitly to enable observation on a deployment that uses the default loopback endpoint. Enabling observation applies to subsequent eligible completions.
 - `MEMORIA_SELF_HOSTED_MASTER_ACCESS` — exact value `1` explicitly allows active local password accounts with no scoped binding or retained Memoria identity to use owner-scoped master authentication when `MEMORIA_WEB_URL` is unset. Existing scoped owner/consent always wins; disconnect, inactive/deleted accounts and lookup errors never fall back. Requires a Memoria release containing `matrixorigin/Memoria#250` (available in 0.5.2, not 0.5.1). The Server default remains disabled; the self-hosted all-in-one example explicitly enables it with a compatible pinned image. Existing env files are not automatically upgraded.
 - `MEMORIA_ISSUER` — stable identity issuer URL; defaults to normalized `MEMORIA_BASE_URL`. Changing the issuer creates a different identity namespace. Keep it stable when changing only the service transport address.
 - `MEMORIA_WEB_URL` — Server-owned browser sign-in website, advertised through `GET /auth/methods`. Unset preserves password login. Requires HTTPS except for explicit loopback development URLs. The CLI does not read this environment variable.

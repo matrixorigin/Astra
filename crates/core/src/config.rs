@@ -971,6 +971,7 @@ pub struct AppSettings {
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
+    memoria_base_url_explicit: bool,
     /// Optional UC native-client integration. Absent for Memoria/self-hosting.
     pub uc_native: Option<UcNativeSettings>,
     pub runtime_root_secret: String,
@@ -1005,6 +1006,23 @@ impl fmt::Debug for AppSettings {
 }
 
 impl AppSettings {
+    /// Automatic observation requires a deployed integration. The implicit
+    /// local endpoint still serves explicit credential and tool workflows.
+    pub fn has_memoria_observation_config(&self) -> bool {
+        let endpoint = self.memoria.base_url.trim();
+        let explicit_endpoint = !endpoint.is_empty()
+            && (self.memoria_base_url_explicit || endpoint != DEFAULT_MEMORIA_URL);
+        explicit_endpoint
+            || [
+                self.memoria.master_key.as_deref(),
+                self.memoria.web_url.as_deref(),
+                self.memoria.issuer.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty())
+    }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         if !explicit_env_config_requested()? && std::env::var_os("ASTRA_SERVER_CONFIG").is_none() {
             dotenvy::dotenv().ok();
@@ -1146,6 +1164,8 @@ impl AppSettings {
                 issuer: lookup("MEMORIA_ISSUER"),
                 web_url: lookup("MEMORIA_WEB_URL"),
             },
+            memoria_base_url_explicit: lookup("MEMORIA_BASE_URL")
+                .is_some_and(|url| !url.trim().is_empty()),
             uc_native: UcNativeSettings::from_lookup(&lookup)?,
             runtime_root_secret: required_value(
                 &lookup,
@@ -1821,6 +1841,33 @@ mod tests {
         settings.web_url = None;
         settings.master_key = None;
         assert!(!settings.allows_self_hosted_master_fallback());
+    }
+
+    #[test]
+    fn implicit_memoria_endpoint_does_not_enable_automatic_observation() {
+        let mut values = HashMap::from([("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into())]);
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(!settings.has_memoria_observation_config());
+
+        values.insert("MEMORIA_BASE_URL".into(), DEFAULT_MEMORIA_URL.into());
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert_eq!(settings.memoria.base_url, DEFAULT_MEMORIA_URL);
+        assert!(settings.has_memoria_observation_config());
+    }
+
+    #[test]
+    fn blank_memoria_configuration_leaves_automatic_observation_idle() {
+        let mut values = HashMap::from([("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into())]);
+        for variable in [
+            "MEMORIA_BASE_URL",
+            "MEMORIA_MASTER_KEY",
+            "MEMORIA_WEB_URL",
+            "MEMORIA_ISSUER",
+        ] {
+            values.insert(variable.into(), "  ".into());
+            let settings = AppSettings::from_map(&values).unwrap();
+            assert!(!settings.has_memoria_observation_config(), "{variable}");
+        }
     }
 
     #[test]

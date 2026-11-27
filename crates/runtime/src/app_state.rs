@@ -97,6 +97,7 @@ impl MemoriaHealth {
 #[derive(Clone)]
 pub(crate) struct TurnPersistenceState {
     pub(crate) observer_worker: Arc<dyn TurnObserverWorker>,
+    pub(crate) observer_tasks: Arc<crate::server::run::lifecycle::TurnObserverTasks>,
     pub(crate) auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
 }
 
@@ -104,6 +105,7 @@ impl Default for TurnPersistenceState {
     fn default() -> Self {
         Self {
             observer_worker: Arc::new(NoopTurnObserverWorker),
+            observer_tasks: Default::default(),
             auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
         }
     }
@@ -1402,12 +1404,12 @@ mod tests {
         ledger
             .lock()
             .await
-            .insert("req-1".into(), serde_json::json!({ "status": "queued" }));
+            .insert("req-1".into(), serde_json::json!({ "status": "scheduled" }));
 
         let snapshot = state.edge_callback_ledger();
         assert_eq!(
             snapshot.lock().await.get("req-1"),
-            Some(&serde_json::json!({ "status": "queued" }))
+            Some(&serde_json::json!({ "status": "scheduled" }))
         );
     }
 

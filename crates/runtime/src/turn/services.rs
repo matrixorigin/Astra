@@ -8,6 +8,11 @@ use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 use sqlx::Acquire;
 
+// Includes all fresh authority dependencies (MOI mapping, UC service token and
+// account status). Each completed Run resolves current authority independently.
+// The backend send retains its independent 30-second request timeout.
+const OBSERVER_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;
 
@@ -268,6 +273,10 @@ impl DatabaseTraceEventWriter {
 
 #[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     async fn run(&self, _request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         Ok(TurnObserverOutcome::NotConfigured)
     }
@@ -275,6 +284,10 @@ impl TurnObserverWorker for NoopTurnObserverWorker {
 
 #[async_trait]
 impl TurnObserverWorker for DatabaseTurnObserverWorker {
+    fn is_configured(&self) -> bool {
+        self.memoria_port.is_some()
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         if request.messages.is_empty() {
             return Ok(TurnObserverOutcome::Empty);
@@ -282,7 +295,7 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let Some(template) = self.memoria_port.as_ref() else {
             return Ok(TurnObserverOutcome::NotConfigured);
         };
-        let port = template.bind_owner(&request.user_id)?;
+        let port = template.bind_session(&request.user_id, &request.session_id)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -290,19 +303,41 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
+        // Resolve fresh write authority before serializing the optional body.
+        // A denied/revoked grant never falls back to deployment credentials.
+        let transport = tokio::time::timeout(
+            OBSERVER_AUTHORITY_TIMEOUT,
+            port.resolve_observer_transport(),
+        )
+        .await
+        .map_err(|_| "memoria observer authority lookup timed out".to_string())??;
+        let Some(transport) = transport else {
+            return Ok(TurnObserverOutcome::AccessDisabled);
+        };
         // Serialize exactly once, then retain and send that same byte buffer.
         // Calling `.json(...)` here as well would hide the queue's actual byte
         // weight behind a second serializer-owned allocation.
         let payload = encode_memory_extraction_observe_payload(&request)?;
         let queue_reservation = reserve_memory_extraction_payload(&payload);
-        // Resolve fresh write authority after preparation, just as memory tools
-        // do. A denied/revoked grant never falls back to deployment credentials.
-        let Some(transport) = port.resolve_observer_transport().await? else {
-            return Ok(TurnObserverOutcome::AccessDisabled);
+        // Older servers reject the distinct route before writing any partial evidence.
+        let endpoint = if request.standalone_guidance {
+            "observe/standalone"
+        } else if request.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| {
+                    s.chars()
+                        .nth(crate::turn::agentic_loop::observer_guidance::OBSERVER_MESSAGE_CHARS)
+                        .is_some()
+                })
+        }) {
+            "observe/complete"
+        } else {
+            "observe"
         };
         let response = client
             .post(format!(
-                "{}/v1/observe",
+                "{}/v1/{endpoint}",
                 transport.base_url.trim_end_matches('/')
             ))
             .header("Authorization", transport.authorization_header())
@@ -485,6 +520,7 @@ mod tests {
     async fn noop_observer_reports_not_configured() {
         let outcome = NoopTurnObserverWorker
             .run(TurnObserverRequest {
+                standalone_guidance: false,
                 user_id: "test-owner".into(),
                 session_id: "test-session".into(),
                 messages: vec![],
@@ -505,6 +541,7 @@ mod tests {
     #[serial_test::serial(history_work)]
     fn memory_extraction_queue_uses_the_single_http_body_and_releases_it() {
         let request = TurnObserverRequest {
+            standalone_guidance: false,
             user_id: "user-1".to_string(),
             session_id: "session-1".to_string(),
             messages: vec![

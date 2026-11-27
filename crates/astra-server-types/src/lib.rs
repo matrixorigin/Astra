@@ -2220,7 +2220,9 @@ impl From<AdminUserRoleRecord> for AdminUserRoleResponse {
 impl From<SessionRecord> for SessionResponse {
     fn from(value: SessionRecord) -> Self {
         let mut metadata = value.metadata;
-        metadata.remove(astra_services::auth::session::PROVIDER_SCOPE_PROOF_KEY);
+        for key in astra_services::auth::session::PROVIDER_SCOPE_METADATA_KEYS {
+            metadata.remove(key);
+        }
         Self {
             session_id: value.session_id,
             user_id: value.user_id,

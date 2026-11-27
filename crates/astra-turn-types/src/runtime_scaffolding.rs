@@ -239,18 +239,36 @@ pub fn is_runtime_owned_message(message: &Value) -> bool {
 pub fn is_human_user_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
         && !is_runtime_owned_message(message)
-        && message
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .is_none()
-        && !message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            })
+        && tool_result_count(message) == 0
+}
+
+/// Count provider tool results without reading result bodies. A single
+/// user-role envelope can carry results for multiple parallel calls.
+#[must_use]
+pub fn tool_result_count(message: &Value) -> usize {
+    match message.get("role").and_then(Value::as_str) {
+        Some("tool") => 1,
+        Some("user") => {
+            let blocks = message
+                .get("content")
+                .and_then(Value::as_array)
+                .map_or(0, |blocks| {
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                        })
+                        .count()
+                });
+            blocks.max(usize::from(
+                message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .is_some(),
+            ))
+        }
+        _ => 0,
+    }
 }
 
 #[must_use]
@@ -544,6 +562,17 @@ mod tests {
         ] {
             assert!(!is_human_user_message(&message));
         }
+    }
+
+    #[test]
+    fn parallel_tool_results_share_one_provider_user_message() {
+        let message = json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"one","content":"first"},
+            {"type":"text","text":"other block"},
+            {"type":"tool_result","tool_use_id":"two","content":"second"}
+        ]});
+        assert_eq!(tool_result_count(&message), 2);
+        assert!(!is_human_user_message(&message));
     }
 
     #[test]

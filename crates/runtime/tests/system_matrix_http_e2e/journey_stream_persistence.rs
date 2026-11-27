@@ -1148,6 +1148,124 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     first.ctx.close().await;
 }
 
+pub async fn run_guidance_isolates_a_confirmation_after_omitted_tool_output() {
+    const OPENING: &str = "I prefer Rust. Have a child check the project language.";
+    const TASK: &str = "Identify the project language.";
+    const QUESTION: &str = "Should I use it instead?";
+    const REPLY: &str = "Yes, that is correct.";
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let child = ReleaseProviderGatesOnDrop(vec![std::sync::Arc::new(tokio::sync::Notify::new())]);
+    let parent = ProviderScript::new(
+        "parent asks before the child completes",
+        |r| {
+            r.body["stream"] == true
+                && r.body["messages"].as_array().is_some_and(|ms| {
+                    ms.iter()
+                        .any(|m| m["role"] == "user" && m["content"] == OPENING)
+                })
+        },
+        vec![
+            native_search_response("select-agent", "agent"),
+            native_invoke_response(
+                "spawn-check",
+                "agent",
+                json!({
+                    "action":"spawn", "description":"Check language", "prompt":TASK
+                }),
+            ),
+            native_text_response(QUESTION),
+            native_text_response("Understood."),
+            native_text_response("Understood."),
+        ],
+    );
+    ctx.install_native_provider(
+        &b.auth_header,
+        vec![
+            parent,
+            native_child_script(
+                format!("mock-{}", ctx.suffix),
+                OPENING,
+                TASK,
+                gated_native_delta(
+                    json!({"content":"Child check complete."}),
+                    "stop",
+                    child.0[0].clone(),
+                ),
+            ),
+        ],
+    )
+    .await;
+    let request = Request::post("/chat/stream")
+        .header("authorization", &b.auth_header).header("content-type","application/json")
+        .body(Body::from(json!({
+            "message":OPENING,"explain":true,"session_id":ctx.session_id,"model_selection":seeded_model_selection(ctx),
+            "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
+        }).to_string())).unwrap();
+    let response = ctx.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    // This wait is emitted after the question has entered canonical history.
+    let run_id = loop {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                let events = parse_sse_events(&String::from_utf8_lossy(&bytes));
+                let phases: Vec<_> = events.iter().filter_map(|e| e["label"].as_str()).collect();
+                panic!("parent did not reach child wait; observed phases {phases:?}")
+            })
+            .expect("parent must wait after asking the question")
+            .unwrap();
+        bytes.extend_from_slice(&chunk);
+        if let Some(event) = parse_sse_events(&String::from_utf8_lossy(&bytes))
+            .iter()
+            .find(|e| {
+                e["type"] == "explain_analyze"
+                    && e["kind"] == "wait"
+                    && e["transition"] == "started"
+                    && e["node_id"]
+                        .as_str()
+                        .is_some_and(|id| id.contains("/children/wait/"))
+            })
+        {
+            break event["run_id"].as_str().unwrap().to_owned();
+        }
+    };
+    let (status, receipt) = post_json(
+        &ctx.app,
+        &format!("/chat/runs/{run_id}/intents"),
+        Some(&b.auth_header),
+        json!({"intent_id":"confirm-language","delivery":"guide_current_run",
+        "input":{"content":REPLY}}),
+    )
+    .await;
+    assert!(status.is_success(), "{receipt}");
+    child.0[0].notify_one();
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .unwrap()
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    assert!(String::from_utf8_lossy(&bytes).contains("Understood."));
+    assert!(
+        ctx.app_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
+    let observations = ctx.memoria.observations.lock().await;
+    let root = observations
+        .iter()
+        .find(|o| o["session_id"] == ctx.session_id)
+        .unwrap();
+    assert_eq!(root["fixture_observe_route"], "/v1/observe/standalone");
+    assert_eq!(root["messages"], json!([{"role":"user","content":REPLY}]));
+    drop(observations);
+    ctx.close().await;
+}
+
 pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(explain: bool) {
     let b = bootstrap().await;
     let ctx = &b.ctx;

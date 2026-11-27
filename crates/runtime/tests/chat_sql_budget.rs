@@ -9,7 +9,10 @@ mod test_support;
 use harness::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+#[path = "support/sql_capture.rs"]
+mod sql_capture;
+use sql_capture::{ObservedSql, SqlCapture};
+use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 
 /// The run drain does not own the detached observer. Its completion counter is
@@ -105,7 +108,7 @@ async fn sql_budget_rejects_skipped_failed_or_dropped_observations() {
         ("astra_turn_observer_runs_total", "empty"),
         ("astra_turn_observer_runs_total", "error"),
         ("astra_turn_observer_dispatches_total", "dropped_full"),
-        ("astra_turn_observer_dispatches_total", "skipped_empty"),
+        ("astra_turn_observer_dispatches_total", "skipped_ineligible"),
     ] {
         for successes in [0, 1] {
             let registry = observer_metrics(1, successes);
@@ -140,36 +143,6 @@ async fn prime_chat_pool(ctx: &MatrixE2eCtx) {
     .await
     .expect("initialize and return the chat-pool reserve before SQL capture");
 }
-
-#[derive(Default)]
-struct Statement(String, f64);
-
-impl tracing::field::Visit for Statement {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "db.statement" && !value.trim().is_empty() {
-            self.0 = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        } else if field.name() == "summary" && self.0.is_empty() {
-            self.0 = value.to_owned();
-        }
-    }
-
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        if field.name() == "elapsed_secs" {
-            self.1 = value;
-        }
-    }
-
-    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-}
-
-struct ObservedSql {
-    sql: String,
-    elapsed: std::time::Duration,
-    finished_at: std::time::Instant,
-}
-
-#[derive(Clone, Default)]
-struct SqlCapture(Arc<Mutex<Option<Vec<ObservedSql>>>>);
 
 // This ordinary-chat probe owns sequential opening/terminal transactions.
 // If a scenario introduces overlapping transactions, report the ambiguity
@@ -214,31 +187,44 @@ fn transaction_windows(samples: &[ObservedSql]) -> Value {
     json!({"windows":windows,"open_transaction":active.is_some()})
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() != "sqlx::query" {
-            return;
-        }
-        let mut guard = self.0.lock().unwrap();
-        if let Some(statements) = guard.as_mut() {
-            let mut statement = Statement::default();
-            event.record(&mut statement);
-            statements.push(ObservedSql {
-                sql: statement.0,
-                elapsed: std::time::Duration::from_secs_f64(statement.1),
-                finished_at: std::time::Instant::now(),
-            });
-        }
+const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, last_guidance_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
+
+// The real shared control reader batches concurrently active Runs. Match its
+// exact statement for 1..=8 keys, including ordinal and candidate-IN cardinality,
+// rather than classifying any SELECT against agent_runs as periodic work.
+fn is_control_observation_sql(sql: &str) -> bool {
+    if !sql.starts_with("SELECT requested.ordinal, run_id,") {
+        return false;
     }
+    (1..=8).any(|slots| {
+        let rows = (0..slots)
+            .map(|i| format!("ROW({i},?,?)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let candidates = vec!["?"; slots].join(",");
+        sql == CONTROL_OBSERVATION_SQL
+            .replace("FROM (VALUES ROW(0,?,?))", &format!("FROM (VALUES {rows})"))
+            .replace("run_id IN (?)", &format!("run_id IN ({candidates})"))
+    })
 }
 
-fn is_control_observation_sql(sql: &str) -> bool {
-    sql.starts_with("SELECT requested.ordinal, ")
-        && sql.contains(" FROM (VALUES ROW(")
-        && sql.contains(
-            " LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id",
-        )
-        && sql.contains(" AS cancellation_requested")
+#[test]
+fn batched_control_accounting_requires_the_exact_eight_session_contract() {
+    assert!(is_control_observation_sql(CONTROL_OBSERVATION_SQL));
+    let batch = CONTROL_OBSERVATION_SQL
+        .replace("ROW(0,?,?)", "ROW(0,?,?),ROW(1,?,?)")
+        .replace("run_id IN (?)", "run_id IN (?,?)");
+    assert!(is_control_observation_sql(&batch));
+    assert!(!is_control_observation_sql(
+        &batch.replace("IN (?,?)", "IN (?)")
+    ));
+    assert!(!is_control_observation_sql(&format!(
+        "{batch} UNION ALL SELECT 1"
+    )));
+    assert!(!is_control_observation_sql(&batch.replace(
+        "last_event_idx, last_guidance_event_idx,",
+        "last_event_idx,"
+    )));
 }
 
 // The account/session snapshot is cached for 30 seconds. A slow fixture can
@@ -705,25 +691,363 @@ async fn ordinary_chat_releases_session_locks_before_waiting_for_the_provider() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
+    assert_guided_observation(
+        "I prefer Python.",
+        "Actually I prefer Rust, not Python.",
+        "Understood, I will use the new preference.",
+        Some("first-recall"),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn additive_guidance_preserves_the_opening_preference() {
+    assert_guided_observation(
+        "I prefer Rust; implement the task.",
+        "Use two workers.",
+        "OK, using two workers.",
+        None,
+        Some("I prefer Rust; implement the task.\n\nUse two workers."),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn corrected_preference_reaches_observer_with_its_original_context() {
+    assert_guided_observation(
+        "I prefer Python.",
+        "Actually, use Rust instead.",
+        "Understood.",
+        None,
+        Some("I prefer Python.\n\nActually, use Rust instead."),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn guidance_answering_an_ordinary_tool_result_requires_standalone_extraction() {
+    assert_guided_observation(
+        "I prefer Bash. Look up an alternative tool for recalling facts.",
+        "Actually, use that tool instead.",
+        "Understood.",
+        Some("discover-memory"),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn long_additive_guidance_preserves_both_complete_inputs() {
+    let opening = "Document the project requirements. "
+        .repeat(9)
+        .trim_end()
+        .to_owned();
+    const CORRECTION: &str = concat!(
+        "Correction: use Python as the project language. Keep the requirements, ",
+        "the deployment schedule and the team handoff in the release notes. ",
+        "Keep this correction with the original request so the next session ",
+        "can recover the full context."
+    );
+    let correction = concat!(
+        "Record each verified implementation decision. ",
+        "Document its owner and date. "
+    );
+    let guidance = format!("{CORRECTION} {}", correction.repeat(6))
+        .trim_end()
+        .to_owned();
+    assert!(guidance.chars().count() > 500);
+    let expected = format!("{opening}\n\n{guidance}");
+    assert!(expected.chars().count() > 500);
+    assert_guided_observation(&opening, &guidance, "Understood.", None, Some(&expected)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn standalone_guidance_after_an_ordinary_tool_reaches_extraction() {
+    let correction = "Actually I prefer Rust; use Rust for this project.";
+    assert_guided_observation(
+        "Read the tool catalog.",
+        correction,
+        "Understood.",
+        Some("discover-memory"),
+        None,
+    )
+    .await;
+}
+
+async fn assert_guided_observation(
+    opening: &str,
+    guidance: &str,
+    final_answer: &str,
+    result_id: Option<&'static str>,
+    expected_input: Option<&str>,
+) {
+    use tokio::sync::Notify;
+    let b = bootstrap().await;
+    let entered = Arc::new(Notify::new());
+    let signal = entered.clone();
+    let release = Arc::new(Notify::new());
+    let call = |id, name, args: Value| {
+        answer(
+            json!({"role":"assistant","content":"","tool_calls":[{
+                "id":id, "type":"function", "function":{"name":name, "arguments":args.to_string()}
+            }]}),
+            "tool_calls",
+        )
+    };
+    // Hold inference until the public guidance request commits.
+    let seen_result = move |body: &Value| {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool" && result_id.is_some_and(|id| m["tool_call_id"] == id))
+    };
+    let guidance_match = guidance.to_owned();
+    let guided = |needle: &str, body: &Value| {
+        body["messages"].as_array().unwrap().iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(needle))
+        })
+    };
+    let discovery = call(
+        "discover-memory",
+        "tool_search",
+        json!({"query":"select:memory"}),
+    );
+    let recall = call(
+        "first-recall",
+        "invoke_tool",
+        json!({
+            "name":"memory", "arguments":{"action":"recall","query":"language preference"}
+        }),
+    );
+    let original_response = json!({"choices":[{
+        "index":0, "delta":{"content":"Original answer."}, "finish_reason":"stop"
+    }]});
+    let mut scripts = Vec::new();
+    if result_id.is_some() {
+        let guidance_match = guidance_match.clone();
+        scripts.push(ProviderScript::new(
+            "produce the preceding tool result",
+            move |r| {
+                r.body["stream"] == true
+                    && !seen_result(&r.body)
+                    && !guided(&guidance_match, &r.body)
+            },
+            if result_id == Some("first-recall") {
+                vec![discovery, recall]
+            } else {
+                vec![discovery]
+            },
+        ));
+    }
+    let wait_guidance = guidance_match.clone();
+    scripts.extend([
+        ProviderScript::new(
+            "await user guidance",
+            move |r| {
+                let matches = r.body["stream"] == true
+                    && (result_id.is_none() || seen_result(&r.body))
+                    && !guided(&wait_guidance, &r.body);
+                if matches {
+                    signal.notify_one();
+                }
+                matches
+            },
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![
+                    format!("data: {original_response}\n\n").into_bytes(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+                release_before_chunk: Some((0, release.clone())),
+            }],
+        ),
+        ProviderScript::new(
+            "answer acknowledged guidance",
+            move |r| r.body["stream"] == true && guided(&guidance_match, &r.body),
+            vec![answer(
+                json!({"role":"assistant","content":final_answer}),
+                "stop",
+            )],
+        ),
+    ]);
+    b.ctx.install_native_provider(&b.auth_header, scripts).await;
+    let request = axum::http::Request::post("/chat/stream")
+        .header("authorization", &b.auth_header)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"message":opening, "session_id": b.ctx.session_id,
+               "model_selection":seeded_model_selection(&b.ctx)})
+            .to_string(),
+        ))
+        .unwrap();
+    let app = b.ctx.app.clone();
+    let chat = tokio::spawn(async move { collect_full_sse_stream(&app, request, 30).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+        .await
+        .expect("provider reached the controlled guidance boundary");
+    if let Some(id) = result_id {
+        let provider_requests = b.ctx.native_provider_requests().await;
+        let result = provider_requests
+            .iter()
+            .filter_map(|r| r.body["messages"].as_array())
+            .flatten()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+            .unwrap();
+        assert!(
+            result["content"]
+                .to_string()
+                .contains(if id == "first-recall" {
+                    "Private recall result"
+                } else {
+                    "memory"
+                }),
+            "preceding tool result did not reach the model: {}",
+            result["content"]
+        );
+    }
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL")
+        .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
+    let (status, receipt) = post_json(&b.ctx.app,&format!("/chat/runs/{run_id}/intents"),Some(&b.auth_header),
+        json!({"intent_id":"correct-preference","delivery":"guide_current_run","input":{"content":guidance}})).await;
+    assert!(status.is_success(), "{receipt}");
+    release.notify_one();
+    let (status, body) = chat.await.unwrap();
+    assert!(
+        status.is_success() && body.contains(final_answer),
+        "guided run did not finish: {body}"
+    );
+    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+    let observations = b.ctx.memoria.observations.lock().await;
+    assert_eq!(observations.len(), 1);
+    let (path, messages) = match expected_input {
+        Some(expected) => (
+            if expected.chars().count() > 500 {
+                "/v1/observe/complete"
+            } else {
+                "/v1/observe"
+            },
+            json!([{"role":"user","content":expected},{"role":"assistant","content":final_answer}]),
+        ),
+        None => (
+            "/v1/observe/standalone",
+            json!([{"role":"user","content":guidance}]),
+        ),
+    };
+    assert_eq!(observations[0]["fixture_observe_route"], path);
+    assert_eq!(observations[0]["messages"], messages);
+    drop(observations);
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn long_answer_preserves_the_complete_public_user_preference() {
+    let b = bootstrap().await;
+    let preference = format!(
+        "I prefer Rust for this project. {}",
+        "Include supporting documentation. ".repeat(18)
+    )
+    .trim_end()
+    .to_owned();
+    assert!(preference.chars().count() > 500);
+    let long_answer = "界".repeat(501);
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "answer user preference",
+                |r| r.body["stream"] == true,
+                vec![answer(
+                    json!({"role":"assistant","content":long_answer}),
+                    "stop",
+                )],
+            )],
+        )
+        .await;
+    let request = axum::http::Request::post("/chat/stream")
+        .header("authorization", &b.auth_header)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"message":preference,"session_id": b.ctx.session_id,
+            "model_selection":seeded_model_selection(&b.ctx)})
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+    assert!(status.is_success() && body.contains(&long_answer));
+    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+    let observations = b.ctx.memoria.observations.lock().await;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0]["fixture_observe_route"],
+        "/v1/observe/complete"
+    );
+    assert_eq!(
+        observations[0]["messages"],
+        json!([{"role":"user","content":preference}])
+    );
+    drop(observations);
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
 async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
+    assert_readonly_scenario_budgets(&[
+        ("ordinary", 0, false, false),
+        ("discovery", 1, false, false),
+        ("discovery", 3, false, false),
+        ("agent_list", 1, false, false),
+        ("agent_list", 3, false, false),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
+async fn warm_chat_and_readonly_rounds_have_bounded_total_sql() {
+    assert_readonly_scenario_budgets(&[
+        ("ordinary", 0, true, false),
+        ("agent_list", 3, true, false),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
+async fn held_chat_and_readonly_rounds_have_bounded_total_sql() {
+    assert_readonly_scenario_budgets(&[
+        ("ordinary", 0, false, true),
+        ("agent_list", 3, false, true),
+    ])
+    .await;
+}
+
+// Each group retains its ordinary baseline and exact SQL comparison. Separate
+// test processes keep nine schema/fixture lifecycles from sharing one timeout;
+// each group retains the strict-online-ci 60-second limit.
+async fn assert_readonly_scenario_budgets(scenarios: &[(&str, usize, bool, bool)]) {
+    const WARM_INPUT: &str = "Remember the first turn.";
+    const WARM_REPLY: &str = "Warm context ready.";
     require_system_e2e_env();
     let capture = SqlCapture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .expect("this integration binary owns its SQL subscriber");
 
     let mut budgets = Vec::new();
-    for (scenario, readonly_rounds, warm_context, held_for_control) in [
-        ("ordinary", 0, false, false),
-        ("discovery", 1, false, false),
-        ("discovery", 3, false, false),
-        ("agent_list", 1, false, false),
-        ("agent_list", 3, false, false),
-        ("ordinary", 0, true, false),
-        ("agent_list", 3, true, false),
-        ("ordinary", 0, false, true),
-        ("agent_list", 3, false, true),
-    ] {
+    for &(scenario, readonly_rounds, warm_context, held_for_control) in scenarios {
         let executes_agent = scenario == "agent_list";
         let tool_call_count = readonly_rounds + usize::from(executes_agent);
         let b = bootstrap().await;
@@ -770,10 +1094,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         if warm_context {
             responses.insert(
                 0,
-                answer(
-                    json!({"role":"assistant", "content":"Warm context ready."}),
-                    "stop",
-                ),
+                answer(json!({"role":"assistant", "content":WARM_REPLY}), "stop"),
             );
         }
         let release = Arc::new(tokio::sync::Notify::new());
@@ -835,7 +1156,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
                     json!({
-                        "message":"Remember the first turn.", "session_id":b.ctx.session_id,
+                        "message":WARM_INPUT, "session_id":b.ctx.session_id,
                         "model_selection":seeded_model_selection(&b.ctx)
                     })
                     .to_string(),
@@ -848,7 +1169,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .iter()
                 .find(|event| event["type"] == "run_finished" && event["status"] == "completed")
                 .expect(&body);
-            assert!(body.contains("Warm context ready."), "{body}");
+            assert!(body.contains(WARM_REPLY), "{body}");
             // Shutdown drain would reject the measured turn. The complete SSE
             // response settles the warm-up turn; separately await its observer.
             wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
@@ -958,6 +1279,22 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         .await;
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
+        let observations = b.ctx.memoria.observations.lock().await;
+        assert_eq!(observations.len(), 1 + usize::from(warm_context));
+        let messages = observations.last().unwrap()["messages"].as_array().unwrap();
+        let mut expected_messages = Vec::new();
+        if warm_context {
+            expected_messages.extend([
+                json!({"role":"user","content":WARM_INPUT}),
+                json!({"role":"assistant","content":WARM_REPLY}),
+            ]);
+        }
+        expected_messages.extend([
+            json!({"role":"user","content":message}),
+            json!({"role":"assistant","content":"Discovery complete."}),
+        ]);
+        assert_eq!(messages, &expected_messages);
+        drop(observations);
         // Explicit cold-replay verification follows the ordinary request's
         // complete drain and stopped SQL capture; it is not ordinary execution.
         let run_id = events

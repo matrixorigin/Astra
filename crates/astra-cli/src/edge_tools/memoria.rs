@@ -365,7 +365,10 @@ mod circuit_contract_tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/memory/correct/real-memory-id"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "completed"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "memory_id": "corrected-memory-id",
+                "content": "replacement",
+            })))
             .mount(&server)
             .await;
 
@@ -400,7 +403,10 @@ mod circuit_contract_tests {
             )
             .await;
         let value: Value = serde_json::from_str(&output).unwrap();
-        assert!(value.get("error").is_none(), "valid update failed: {value}");
+        assert_eq!(
+            value,
+            json!({"status": "completed", "memory_id": "corrected-memory-id"})
+        );
         assert!(!executor.memoria_circuit.is_degraded());
     }
 }

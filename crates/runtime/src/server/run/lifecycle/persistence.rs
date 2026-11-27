@@ -33,7 +33,6 @@ use astra_services::{
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
 use astra_turn_core::contracts::{TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker};
-use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::TraceContext;
 use astra_turn_types::{SessionCursorV1, transcript_content_hash, transcript_payload_identity};
 
@@ -41,6 +40,9 @@ use astra_turn_types::{SessionCursorV1, transcript_content_hash, transcript_payl
 use crate::MatrixOneSettings;
 use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
 use crate::turn::agentic_loop::host::AgenticLoopState;
+use crate::turn::agentic_loop::observer_guidance::{
+    OBSERVER_DIALOGUE_BYTES, OBSERVER_EXCHANGE_BYTES, OBSERVER_MESSAGE_CHARS,
+};
 #[cfg(test)]
 use crate::{DatabaseEventService, EventCreateRequestData, EventService};
 use astra_services::storage::admit_session_event_write;
@@ -50,41 +52,8 @@ use super::{
     persist_turn_diagnostics_journal,
 };
 
-const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
 const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
-static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-struct TurnObserverAsyncPermit;
-
-impl Drop for TurnObserverAsyncPermit {
-    fn drop(&mut self) {
-        TURN_OBSERVER_ASYNC_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-fn try_acquire_turn_observer_async_permit(limit: usize) -> Option<TurnObserverAsyncPermit> {
-    if limit == 0 {
-        return None;
-    }
-
-    let mut current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire);
-    loop {
-        if current >= limit {
-            return None;
-        }
-        match TURN_OBSERVER_ASYNC_IN_FLIGHT.compare_exchange_weak(
-            current,
-            current + 1,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(TurnObserverAsyncPermit),
-            Err(observed) => current = observed,
-        }
-    }
-}
 
 fn register_turn_observer_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
     registry.register_counter(
@@ -129,6 +98,44 @@ fn record_turn_observer_run_metrics(
     );
 }
 
+/// Process-owned, bounded optional work. Tasks retain requests, never loop state
+/// or workspace cleanup. Overload and cancellation are explicit metric outcomes.
+pub(crate) struct TurnObserverTasks {
+    slots: Arc<tokio::sync::Semaphore>,
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+}
+
+impl Default for TurnObserverTasks {
+    fn default() -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            tasks: Default::default(),
+        }
+    }
+}
+
+impl TurnObserverTasks {
+    pub(crate) fn stop(&self) {
+        self.slots.close();
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .abort_all();
+    }
+}
+
+struct ObserverCancellationMetric {
+    metrics: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    completed: bool,
+}
+impl Drop for ObserverCancellationMetric {
+    fn drop(&mut self) {
+        if !self.completed {
+            record_turn_observer_run_metrics(self.metrics.as_ref(), "async", "cancelled");
+        }
+    }
+}
+
 /// Bundles all handles needed by post-loop best-effort persistence calls.
 ///
 /// Root execution shares canonical transcript settlement, derived hooks and
@@ -144,6 +151,7 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) owner_pod_id: Option<String>,
     pub(crate) user_message: String,
     pub(crate) observer_worker: Option<Arc<dyn TurnObserverWorker>>,
+    pub(crate) observer_tasks: Arc<TurnObserverTasks>,
     pub(crate) metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 }
 
@@ -192,49 +200,28 @@ impl PostLoopPersistContext {
 
         crate::turn::agentic_loop::finalization::persist_completed_context_trace(state).await;
 
-        // The remaining consumers all read the immutable completed loop state
-        // and write independent sinks. The writes are awaited together;
-        // their completion is not the streaming terminal-delivery boundary.
-        let observer_dispatch = async {
-            let Some(worker) = self.observer_worker.clone() else {
-                return Ok(());
-            };
+        if loop_success
+            && let Some(worker) = self
+                .observer_worker
+                .as_ref()
+                .filter(|worker| worker.is_configured())
+        {
             fire_server_loop_observer(
-                worker,
+                &self.observer_tasks,
+                worker.clone(),
                 &self.user_id,
                 &self.session_id,
+                &self.user_message,
                 state,
                 self.metrics_registry.clone(),
-            )
-            .await
-        };
-        let session_end = crate::skills::hooks::fire_session_end(
-            &state.skills.session_event_hooks,
-            state.current_session_id.as_deref().unwrap_or(""),
-        );
-        let (observer_result, ()) = tokio::join!(observer_dispatch, session_end);
-        let Err(error) = observer_result else {
-            return Ok(());
-        };
-
-        // Use loop_success to conditionally log severity
-        if loop_success {
-            tracing::warn!(
-                session_id = %self.session_id,
-                run_id = %self.run_id,
-                error = %error,
-                "post-loop persistence completed with errors"
-            );
-        } else {
-            tracing::error!(
-                session_id = %self.session_id,
-                run_id = %self.run_id,
-                error = %error,
-                "post-loop persistence failed on failed run"
             );
         }
-
-        Err(format!("observer fire failed: {error}"))
+        crate::skills::hooks::fire_session_end(
+            &state.skills.session_event_hooks,
+            state.current_session_id.as_deref().unwrap_or(""),
+        )
+        .await;
+        Ok(())
     }
 
     /// Persist the raw conversation atomically under the current Run owner.
@@ -2337,79 +2324,226 @@ async fn append_session_transcript_items_in_tx(
 /// Fire the Memoria observer after the server-driven loop completes.
 /// This sends the conversation messages to the Memoria `/v1/observe` endpoint
 /// for cross-session knowledge extraction.
-async fn fire_server_loop_observer(
+fn fire_server_loop_observer(
+    owner: &TurnObserverTasks,
     observer_worker: Arc<dyn TurnObserverWorker>,
     user_id: &str,
     session_id: &str,
+    user_message: &str,
     state: &AgenticLoopState,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-) -> Result<(), String> {
-    fire_server_loop_observer_with_async_limit(
-        observer_worker,
-        user_id,
-        session_id,
-        state,
-        metrics_registry,
-        DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-    )
-    .await
-}
-
-async fn fire_server_loop_observer_with_async_limit(
-    observer_worker: Arc<dyn TurnObserverWorker>,
-    user_id: &str,
-    session_id: &str,
-    state: &AgenticLoopState,
-    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    async_concurrency_limit: usize,
-) -> Result<(), String> {
-    let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
-        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "none", "skipped_empty");
-        return Ok(());
+) {
+    // Reserve capacity before copying any transcript. No queue of blocked runs
+    // or requests is retained outside the four process-owned slots.
+    let permit = match owner.slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(error) => {
+            let outcome = match error {
+                tokio::sync::TryAcquireError::Closed => "stopped",
+                tokio::sync::TryAcquireError::NoPermits => "dropped_full",
+            };
+            record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", outcome);
+            return;
+        }
     };
-
-    let Some(permit) = try_acquire_turn_observer_async_permit(async_concurrency_limit) else {
-        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "dropped_full");
-        tracing::warn!(
-            session_id = %session_id,
-            concurrency_limit = async_concurrency_limit,
-            "server-loop observer async concurrency full; durable turn was saved but observer evidence was not scheduled"
+    let Some(request) =
+        build_server_loop_observer_request(user_id, session_id, user_message, state)
+    else {
+        record_turn_observer_dispatch_metrics(
+            metrics_registry.as_ref(),
+            "async",
+            "skipped_ineligible",
         );
-        return Err(format!(
-            "observer capacity exhausted for session {session_id}; evidence requires retry"
-        ));
+        return;
+    };
+    let mut tasks = owner
+        .tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A permit may have been obtained just before shutdown closed admission.
+    // Serialize this check/spawn with stop's abort_all so no task escapes it.
+    if owner.slots.is_closed() {
+        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "stopped");
+        return;
+    }
+    while tasks.try_join_next().is_some() {}
+    let cancellation = ObserverCancellationMetric {
+        metrics: metrics_registry.clone(),
+        completed: false,
     };
     record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "scheduled");
-    let queue_reservation = reserve_server_observer_request(&request);
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        let _queue_reservation = queue_reservation;
+    let reservation = reserve_server_observer_request(&request);
+    tasks.spawn(async move {
+        let _reservation = reservation;
         let _permit = permit;
-        run_server_loop_observer_request(
+        let mut cancellation = cancellation;
+        let session = request.session_id.clone();
+        let _result = run_server_loop_observer_request(
             observer_worker.as_ref(),
-            &session_id,
+            &session,
             request,
             "async",
             metrics_registry.as_ref(),
         )
         .await;
+        // run_server_loop_observer_request records success/denial/timeout/error.
+        cancellation.completed = true;
     });
-    Ok(())
+}
+
+/// Retain the adjacent public exchange so the extractor can interpret a reply
+/// with its context. Do not cross tool or rewritten history boundaries.
+fn observer_preceding_exchange<'a>(
+    state: &'a AgenticLoopState,
+    session_id: &str,
+    current_input: &str,
+) -> Result<Option<(&'a str, &'a str)>, ()> {
+    use astra_turn_types::{is_human_user_message, is_runtime_owned_message, model_replay_origin};
+    let index = state
+        .messages
+        .iter()
+        .rposition(is_human_user_message)
+        .ok_or(())?;
+    if state.messages[index]["content"].as_str().map(str::trim) != Some(current_input.trim()) {
+        return Err(());
+    }
+    let history = &state.messages[..index];
+    if state.session_turn <= 1
+        && history.iter().all(|m| {
+            matches!(m["role"].as_str(), Some("system" | "developer"))
+                || is_runtime_owned_message(m)
+        })
+    {
+        return Ok(None);
+    }
+    let (prior_assistant, earlier) = history.split_last().ok_or(())?;
+    let reply = prior_assistant["content"].as_str().ok_or(())?.trim();
+    if prior_assistant["role"] != "assistant" || reply.is_empty() {
+        return Err(());
+    }
+
+    // Check the public evidence regardless of how the assistant ended its
+    // reply. A trailing instruction can follow the question being answered.
+    let prior_user = earlier.last().ok_or(())?;
+    if !is_human_user_message(prior_user)
+        || is_runtime_owned_message(prior_assistant)
+        || prior_assistant.get("tool_calls").is_some()
+        || prior_assistant.get("function_call").is_some()
+        || crate::turn::agentic_loop::finalization::terminal_context_omitted(prior_assistant)
+    {
+        return Err(());
+    }
+    for value in [prior_user, prior_assistant] {
+        if value
+            .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+            .is_some()
+        {
+            let origin = model_replay_origin(value).ok_or(())?;
+            if origin.runtime_generated || origin.session_id != session_id {
+                return Err(());
+            }
+        }
+    }
+    let opening = prior_user["content"].as_str().ok_or(())?.trim();
+    if opening.is_empty() {
+        return Err(());
+    }
+    Ok(Some((opening, reply)))
 }
 
 fn build_server_loop_observer_request(
     user_id: &str,
     session_id: &str,
+    user_message: &str,
     state: &AgenticLoopState,
 ) -> Option<TurnObserverRequest> {
-    let messages: Vec<serde_json::Map<String, serde_json::Value>> =
-        filter_memory_operation_turns(&state.messages)
-            .iter()
-            .filter_map(|m| m.as_object().cloned())
-            .collect();
-
-    if messages.is_empty() {
+    let calls = &state.stall.tool_call_records;
+    if calls.len() != state.total_tool_calls as usize {
         return None;
+    }
+
+    let applied = state.user_intents.applied_user_intents();
+    let mut answer = state.final_text.as_str();
+    if answer.chars().nth(OBSERVER_MESSAGE_CHARS).is_some() {
+        answer = "";
+    }
+    let mut first_tool = 0;
+    if let Some(last) = applied.last() {
+        let boundary = state.user_intents.observer_guidance.as_ref()?;
+        if state.canonical_turn_chain_id.as_deref() != Some(last.intent_id.as_str()) {
+            return None;
+        }
+        // Guidance acknowledgement already owns the user evidence. An absent
+        // or stale assistant message cannot invalidate that independent input.
+        if !answer.is_empty()
+            && !state.messages.last().is_some_and(|message| {
+                message["role"] == "assistant"
+                    && message["content"].as_str() == Some(answer)
+                    && astra_turn_types::turn_message_provenance(message)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|stamp| stamp.turn_chain_id == last.intent_id)
+            })
+        {
+            answer = "";
+        }
+        first_tool = boundary.settled_tool_count;
+    }
+    if calls
+        .get(first_tool..)?
+        .iter()
+        .any(|call| call.name == "memory")
+    {
+        return None;
+    }
+
+    let content = if applied.is_empty() {
+        if user_message.len() > OBSERVER_DIALOGUE_BYTES || user_message.trim().is_empty() {
+            return None;
+        }
+        user_message.to_owned()
+    } else {
+        state.guided_observer_content(user_message)?
+    };
+    let message = |role, content: String| {
+        serde_json::Map::from_iter([
+            ("role".to_owned(), serde_json::Value::from(role)),
+            ("content".to_owned(), serde_json::Value::String(content)),
+        ])
+    };
+    let mut standalone_guidance = state
+        .user_intents
+        .observer_guidance
+        .as_ref()
+        .is_some_and(|w| w.standalone);
+    let mut messages = Vec::with_capacity(4);
+    let mut evidence_bytes = "[user]: \n".len() + content.len();
+    if applied.is_empty() {
+        match observer_preceding_exchange(state, session_id, user_message) {
+            Ok(Some((opening, reply))) => {
+                evidence_bytes += "[user]: \n[assistant]: \n".len() + opening.len() + reply.len();
+                if evidence_bytes <= OBSERVER_EXCHANGE_BYTES {
+                    messages.push(message("user", opening.to_owned()));
+                    messages.push(message("assistant", reply.to_owned()));
+                } else {
+                    standalone_guidance = true;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => standalone_guidance = true,
+        }
+    }
+    // Only the extractor can tell if a user statement stands on its own.
+    // Never send omitted history or the current answer as substitute evidence.
+    if standalone_guidance
+        || answer.trim().is_empty()
+        || evidence_bytes + "[assistant]: \n".len() + answer.len() > OBSERVER_EXCHANGE_BYTES
+    {
+        answer = "";
+    }
+    messages.push(message("user", content));
+    if !answer.is_empty() {
+        messages.push(message("assistant", answer.to_owned()));
     }
 
     let turn_count = if state.session_turn > 0 {
@@ -2418,6 +2552,7 @@ fn build_server_loop_observer_request(
         state.max_turns.saturating_sub(state.remaining_turns) as u32
     } as i64;
     Some(TurnObserverRequest {
+        standalone_guidance,
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         messages,
@@ -2432,8 +2567,12 @@ async fn run_server_loop_observer_request(
     request: TurnObserverRequest,
     mode: &'static str,
     metrics_registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-) {
-    let outcome = match observer_worker.run(request).await {
+) -> Result<TurnObserverOutcome, String> {
+    let result = tokio::time::timeout(Duration::from_secs(60), observer_worker.run(request))
+        .await
+        .map_err(|_| "memoria observer attempt timed out".to_string())
+        .and_then(|result| result);
+    let outcome = match &result {
         Ok(TurnObserverOutcome::Observed) => "success",
         Ok(TurnObserverOutcome::NotConfigured) => "not_configured",
         Ok(TurnObserverOutcome::AccessDisabled) => "access_disabled",
@@ -2447,6 +2586,7 @@ async fn run_server_loop_observer_request(
         }
     };
     record_turn_observer_run_metrics(metrics_registry, mode, outcome);
+    result
 }
 
 pub(crate) fn build_run_turn_complete_event_with_interruption(
@@ -2712,6 +2852,7 @@ mod tests {
 
             user_message: "work".to_string(),
             observer_worker: None,
+            observer_tasks: Default::default(),
             metrics_registry: None,
         }
     }
@@ -3083,6 +3224,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial(history_work)]
+    async fn ephemeral_burst_does_not_hold_cleanup_and_cancellation_releases_capacity() {
+        let worker = Arc::new(CaptureObserverWorker::new(true));
+        let dispatcher = Arc::new(TurnObserverTasks::default());
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        registry.register_counter("astra_turn_observer_runs_total", "test");
+        registry.register_counter("astra_turn_observer_dispatches_total", "test");
+        for index in 0..32 {
+            let mut persist = test_post_loop_persist_context(&format!("ephemeral-{index}"));
+            persist.observer_worker = Some(worker.clone());
+            persist.observer_tasks = dispatcher.clone();
+            persist.metrics_registry = Some(registry.clone());
+            let state = observer_test_state();
+            // This is the post-terminal boundary called before workspace/state
+            // cleanup. It must return while accepted observers remain held.
+            let dispatched = tokio::time::timeout(
+                Duration::from_secs(1),
+                persist.run_after_core(&state, true, Ok(())),
+            )
+            .await
+            .expect("optional memory must not hold run cleanup");
+            dispatched.expect("observation overload cannot fail completed Run cleanup");
+            drop(state);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.calls.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(worker.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(dispatcher.slots.available_permits(), 0);
+        assert!(
+            registry
+                .render_prometheus()
+                .contains("outcome=\"dropped_full\"} 28")
+        );
+        dispatcher.stop();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatcher.slots.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            registry
+                .render_prometheus()
+                .contains("outcome=\"cancelled\"} 4")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_observation_times_out_while_another_session_finishes() {
+        let mut held = test_post_loop_persist_context("held");
+        let mut healthy = test_post_loop_persist_context("healthy");
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        let worker = Arc::new(CaptureObserverWorker::new(false));
+        held.metrics_registry = Some(registry.clone());
+        healthy.metrics_registry = Some(registry.clone());
+        healthy.observer_tasks = held.observer_tasks.clone();
+        held.observer_worker = Some(Arc::new(CaptureObserverWorker::new(true)));
+        healthy.observer_worker = Some(worker.clone());
+        let state = observer_test_state();
+        held.run_after_core(&state, true, Ok(())).await.unwrap();
+        healthy.run_after_core(&state, false, Ok(())).await.unwrap();
+        healthy.run_after_core(&state, true, Ok(())).await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(worker.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(held.observer_tasks.slots.available_permits(), 3);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(held.observer_tasks.slots.available_permits(), 4);
+        let metrics = registry.render_prometheus();
+        assert!(metrics.contains(r#"mode="async",outcome="success"} 1"#));
+        assert!(metrics.contains(r#"mode="async",outcome="error"} 1"#));
+    }
+
     struct CaptureObserverWorker {
         calls: AtomicUsize,
         requests: std::sync::Mutex<Vec<TurnObserverRequest>>,
@@ -3100,10 +3321,6 @@ mod tests {
                 release: Notify::new(),
                 block_until_released,
             }
-        }
-
-        fn call_count(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
         }
     }
 
@@ -3126,170 +3343,30 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             json!({"role": "assistant", "content": "world"}),
         ];
-        state.session_turn = 3;
+        state.final_text = "world".into();
+        state.session_turn = 1;
         state.max_turns = 12;
         state.remaining_turns = 8;
         state
-    }
-
-    async fn wait_for_observer_calls(worker: &CaptureObserverWorker, expected: usize) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            if worker.call_count() >= expected {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "observer call count did not reach {expected}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_for_observer_in_flight(expected: usize) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            let current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(Ordering::SeqCst);
-            if current == expected {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "observer in-flight count stayed at {current}, expected {expected}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_async_does_not_block_caller() {
-        let observer = Arc::new(CaptureObserverWorker::new(true));
-        let started = observer.started.notified();
-        let state = observer_test_state();
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            fire_server_loop_observer_with_async_limit(
-                observer.clone(),
-                "user-1",
-                "session-1",
-                &state,
-                None,
-                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-            ),
-        )
-        .await
-        .expect("async observer dispatch should return without waiting for worker")
-        .expect("available observer capacity should schedule the worker");
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), started)
-            .await
-            .expect("spawned observer should start");
-        wait_for_observer_calls(observer.as_ref(), 1).await;
-        observer.release.notify_waiters();
-        wait_for_observer_in_flight(0).await;
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_async_limit_reports_saturation_without_blocking() {
-        let first = Arc::new(CaptureObserverWorker::new(true));
-        let second = Arc::new(CaptureObserverWorker::new(false));
-        let first_started = first.started.notified();
-        let state = observer_test_state();
-
-        fire_server_loop_observer_with_async_limit(
-            first.clone(),
-            "user-1",
-            "session-1",
-            &state,
-            None,
-            1,
-        )
-        .await
-        .expect("first observer should acquire the only permit");
-        tokio::time::timeout(std::time::Duration::from_millis(500), first_started)
-            .await
-            .expect("first observer should start");
-        wait_for_observer_calls(first.as_ref(), 1).await;
-        wait_for_observer_in_flight(1).await;
-
-        let saturated = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            fire_server_loop_observer_with_async_limit(
-                second.clone(),
-                "user-1",
-                "session-2",
-                &state,
-                None,
-                1,
-            ),
-        )
-        .await
-        .expect("full async observer pool should report without blocking");
-        assert!(
-            saturated.is_err(),
-            "saturation must be visible to the persistence caller"
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert_eq!(second.call_count(), 0);
-        first.release.notify_waiters();
-        wait_for_observer_in_flight(0).await;
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_metrics_stay_low_cardinality() {
-        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
-        let observer = Arc::new(CaptureObserverWorker::new(false));
-        let state = observer_test_state();
-
-        fire_server_loop_observer_with_async_limit(
-            observer.clone(),
-            "user-1",
-            "session-1",
-            &state,
-            Some(registry.clone()),
-            DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-        )
-        .await
-        .expect("available observer capacity should schedule the worker");
-        wait_for_observer_calls(observer.as_ref(), 1).await;
-
-        let rendered = registry.render_prometheus();
-        assert!(
-            rendered.contains(
-                "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"scheduled\"} 1"
-            ),
-            "{rendered}"
-        );
-        assert!(
-            rendered
-                .contains("astra_turn_observer_runs_total{mode=\"async\",outcome=\"success\"} 1"),
-            "{rendered}"
-        );
-        assert!(
-            !rendered.contains("user_id=")
-                && !rendered.contains("session_id=")
-                && !rendered.contains("run_id="),
-            "observer metrics must stay low-cardinality: {rendered}"
-        );
     }
 
     #[tokio::test]
     async fn server_loop_observer_unconfigured_is_not_reported_as_success_or_denial() {
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
         let worker = crate::DatabaseTurnObserverWorker::new(None);
-        let request =
-            build_server_loop_observer_request("user-1", "session-1", &observer_test_state())
-                .unwrap();
-        run_server_loop_observer_request(&worker, "session-1", request, "async", Some(&registry))
-            .await;
+        let request = build_server_loop_observer_request(
+            "user-1",
+            "session-1",
+            "hello",
+            &observer_test_state(),
+        )
+        .unwrap();
+        run_server_loop_observer_request(&worker, "session-1", request, "durable", Some(&registry))
+            .await
+            .unwrap();
         let rendered = registry.render_prometheus();
         assert!(rendered.contains(
-            "astra_turn_observer_runs_total{mode=\"async\",outcome=\"not_configured\"} 1"
+            "astra_turn_observer_runs_total{mode=\"durable\",outcome=\"not_configured\"} 1"
         ));
         assert!(!rendered.contains("outcome=\"success\""));
         assert!(!rendered.contains("outcome=\"access_disabled\""));
@@ -3298,13 +3375,115 @@ mod tests {
     #[test]
     fn server_loop_observer_request_uses_session_turn_count() {
         let state = observer_test_state();
-        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+        let request = build_server_loop_observer_request("user-1", "session-1", "hello", &state)
             .expect("observer request");
 
         assert_eq!(request.user_id, "user-1");
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.turn_count, 3);
+        assert_eq!(request.turn_count, 1);
+    }
+
+    #[test]
+    fn server_loop_observer_retains_the_immediate_public_question_for_a_new_run() {
+        let mut state = observer_test_state();
+        state.messages = vec![
+            json!({"role":"user","content":"I prefer Rust."}),
+            json!({"role":"assistant","content":"Use Go instead?"}),
+            json!({"role":"user","content":"Yes."}),
+            json!({"role":"assistant","content":"Okay."}),
+        ];
+        state.final_text = "Okay.".into();
+        let build = |state: &AgenticLoopState| {
+            build_server_loop_observer_request("owner", "session", "Yes.", state)
+        };
+        let request = build(&state).unwrap();
+        let dialogue = request
+            .messages
+            .iter()
+            .map(|message| message["content"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dialogue,
+            ["I prefer Rust.", "Use Go instead?", "Yes.", "Okay."]
+        );
+        state.messages[1]["content"] = json!("Use Go instead? Reply yes or no.");
+        let request = build(&state).unwrap();
+        assert_eq!(
+            request.messages[1]["content"],
+            "Use Go instead? Reply yes or no."
+        );
+        state
+            .messages
+            .insert(1, json!({"role":"tool","content":"private tool payload"}));
+        let isolated = build(&state).unwrap();
+        assert!(isolated.standalone_guidance);
+        assert_eq!(
+            json!(isolated.messages),
+            json!([{"role":"user","content":"Yes."}])
+        );
+    }
+
+    #[test]
+    fn observer_isolates_current_input_when_previous_evidence_is_unusable() {
+        for input in ["I prefer Rust for new projects.", "Use that one."] {
+            let mut state = observer_test_state();
+            state.session_turn = 2;
+            for previous in [
+                vec![
+                    json!({"role":"assistant","tool_calls":[{"function":{"name":"tool_search"}}]}),
+                    json!({"role":"tool","content":"private result"}),
+                    json!({"role":"assistant","content":"Which one?"}),
+                ],
+                vec![json!({"role":"assistant","content":"界".repeat(2000)})],
+                vec![
+                    json!({"role":"assistant","content":"rewritten", "_astra_omitted_terminal_response":true}),
+                ],
+                vec![json!({"role":"assistant","content":"unverified",
+                            (astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD):{}})],
+                vec![],
+            ] {
+                state.messages = vec![json!({"role":"user","content":"Previous request."})];
+                state.messages.extend(previous);
+                state.messages.push(json!({"role":"user","content":input}));
+                state
+                    .messages
+                    .push(json!({"role":"assistant","content":state.final_text}));
+                let request = build_server_loop_observer_request("u", "s", input, &state).unwrap();
+                assert!(request.standalone_guidance);
+                assert_eq!(
+                    json!(request.messages),
+                    json!([{"role":"user","content":input}])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observer_gives_the_full_extraction_budget_to_required_evidence() {
+        let mut state = observer_test_state();
+        let input = "Yes.";
+        let available = OBSERVER_EXCHANGE_BYTES - "[user]: x\n[assistant]: \n[user]: Yes.\n".len();
+        for (length, fits) in [(available, true), (available + 1, false)] {
+            let reply = "x".repeat(length);
+            state.messages = vec![
+                json!({"role":"user","content":"x"}),
+                json!({"role":"assistant","content":reply}),
+                json!({"role":"user","content":input}),
+            ];
+            let request = build_server_loop_observer_request("u", "s", input, &state).unwrap();
+            assert_eq!(request.standalone_guidance, !fits);
+            if fits {
+                assert_eq!(request.messages.len(), 3);
+                assert_eq!(request.messages[1]["content"], reply);
+                assert_eq!(request.messages[2]["content"], input);
+            } else {
+                assert_eq!(
+                    json!(request.messages),
+                    json!([{"role":"user","content":input}])
+                );
+            }
+        }
     }
 
     #[test]
@@ -3315,7 +3494,8 @@ mod tests {
                 {"type":"reasoning_text", "text":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}
             ]}]
         });
-        let request = build_server_loop_observer_request("user-1", "session-1", &state).unwrap();
+        let request =
+            build_server_loop_observer_request("user-1", "session-1", "hello", &state).unwrap();
         let payload = serde_json::to_string(&request.messages).unwrap();
         assert!(!payload.contains("_astra_responses"));
         assert!(!payload.contains("reasoning_text"));
@@ -3334,22 +3514,348 @@ mod tests {
             json!({"role":"user","content":"Remember the release date."}),
             json!({
                 "role":"assistant",
-                "tool_calls":[{"function":{"name":"memory","arguments":"{}"}}]
+                "tool_calls":[{"id":"memory-call","function":{"name":"memory","arguments":"{}"}}]
             }),
-            json!({"role":"tool","name":"memory","content":"{\"memory_id\":\"m1\"}"}),
+            json!({"role":"tool","tool_call_id":"memory-call","content":"{\"memory_id\":\"m1\"}"}),
             json!({"role":"assistant","content":"Stored. Memory m1 is active."}),
             json!({"role":"user","content":"Rust ownership prevents data races."}),
             json!({"role":"assistant","content":"That is a useful fact."}),
         ];
 
-        let request = build_server_loop_observer_request("user-1", "session-1", &state)
-            .expect("ordinary turn should remain observable");
-        assert_eq!(request.messages.len(), 2);
+        state.final_text = "That is a useful fact.".into();
+        let input = "Rust ownership prevents data races.";
+        let build = |state: &AgenticLoopState| {
+            build_server_loop_observer_request("user-1", "session-1", input, state)
+        };
+        let request = build(&state).unwrap();
+        assert!(request.standalone_guidance);
         assert_eq!(
-            request.messages[0]["content"],
-            "Rust ownership prevents data races."
+            json!(request.messages),
+            json!([{"role":"user","content":input}])
         );
-        assert_eq!(request.messages[1]["content"], "That is a useful fact.");
+        state.total_tool_calls = 1;
+        assert!(build(&state).is_none(), "missing tool evidence");
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "memory".into(),
+                ..Default::default()
+            });
+        assert!(
+            build(&state).is_none(),
+            "memory tool evidence survives compaction"
+        );
+        state.stall.tool_call_records[0].name = "tool_search".into();
+        let limit = "界".repeat(500);
+        state.messages = vec![json!({"role":"user","content":limit})];
+        state.final_text = limit.clone();
+        let bounded =
+            build_server_loop_observer_request("user-1", "session-1", &limit, &state).unwrap();
+        assert_eq!(bounded.messages[0]["content"], limit);
+        assert_eq!(bounded.messages[1]["content"], limit);
+        let correction = format!("{limit} – actually, cancel that.");
+        assert_eq!(
+            build_server_loop_observer_request("user-1", "session-1", &correction, &state)
+                .unwrap()
+                .messages[0]["content"],
+            correction
+        );
+        let exact = "x".repeat(OBSERVER_DIALOGUE_BYTES);
+        let exact_request = build_server_loop_observer_request("u", "s", &exact, &state).unwrap();
+        assert_eq!(exact_request.messages.len(), 1);
+        assert_eq!(exact_request.messages[0]["content"], exact);
+        assert!(build_server_loop_observer_request("u", "s", &(exact + "x"), &state).is_none());
+        state.final_text = correction;
+        let request = build(&state).unwrap();
+        assert_eq!(
+            serde_json::json!(request.messages),
+            json!([{"role":"user","content":input}])
+        );
+    }
+
+    #[test]
+    fn server_loop_observer_preserves_contiguous_acknowledged_user_evidence() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+        let mut state = observer_test_state();
+        state.message = "old opening".into();
+        state.messages = vec![json!({"role":"user","content":state.message})];
+        let mut host = MockHost::new(vec![]);
+        let intent = |index, input| QueuedUserIntent {
+            intent_id: format!("intent-{index}"),
+            event_index: index,
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            input,
+        };
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(1, json!("old guidance"))]);
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[
+                intent(2, json!("Keep Rust.")),
+                intent(
+                    3,
+                    crate::turn::run_control::runtime_notification_input("private runtime update"),
+                ),
+                intent(4, json!("Remove Python.")),
+            ],
+        );
+        let build = |state: &AgenticLoopState| {
+            build_server_loop_observer_request("user", "session", "old opening", state)
+        };
+        let expected = "old opening\n\nold guidance\n\nKeep Rust.\n\nRemove Python.";
+        assert_eq!(
+            json!(build(&state).unwrap().messages),
+            json!([{"role":"user","content":expected}]),
+            "omit the stale answer predating the acknowledged input"
+        );
+        state.final_text = "Applied both corrections.".into();
+        state.push_prompt_history_message(json!({"role":"assistant","content":state.final_text}));
+        assert_eq!(
+            json!(build(&state).unwrap().messages),
+            json!([
+                {"role":"user","content":expected}, {"role":"assistant","content":state.final_text}
+            ])
+        );
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[intent(5, json!("Recall the original preference."))],
+        );
+        state.total_tool_calls = 1;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "memory".into(),
+                ..Default::default()
+            });
+        assert!(build(&state).is_none());
+        // The next two batches start after memory. The second must preserve
+        // the first without reviving any earlier input or excluded tool result.
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(6, json!("Use Rust."))]);
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(7, json!("Two workers."))]);
+        state.final_text = "界".repeat(501);
+        assert_eq!(
+            json!(build(&state).unwrap().messages),
+            json!([
+                {"role":"user","content":"Use Rust.\n\nTwo workers."}
+            ])
+        );
+        // A short reply cannot establish its own meaning across a budget gap.
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[intent(8, json!("界".repeat(2000)))],
+        );
+        assert!(build(&state).is_none());
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[intent(9, json!("Switch to Go."))],
+        );
+        assert!(build(&state).is_none());
+        state.user_intents.observer_guidance = None;
+        assert!(
+            build(&state).is_none(),
+            "recovered guidance without a local boundary"
+        );
+    }
+
+    #[test]
+    fn server_loop_observer_keeps_each_confirmation_with_its_question_or_skips_it() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+        let observe = |opening: &str, question: &str, chain: &str, compressed: bool| {
+            let mut state = observer_test_state();
+            state.message = opening.into();
+            state.messages = vec![json!({"role":"user","content":opening})];
+            state.canonical_turn_chain_id = Some("opening".into());
+            state.context_compression_triggered = compressed;
+            let mut assistant = json!({"role":"assistant","content":question,
+                "reasoning_content":"private model reasoning"});
+            astra_turn_types::mark_turn_message(&mut assistant, chain);
+            state.messages.push(assistant);
+            apply_acknowledged_user_intents(
+                &mut MockHost::new(vec![]),
+                &mut state,
+                &[QueuedUserIntent {
+                    intent_id: "confirm".into(),
+                    event_index: 1,
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
+                    input: json!("Yes."),
+                }],
+            );
+            build_server_loop_observer_request("user", "session", opening, &state)
+        };
+        let opening = "I prefer Rust.";
+        for question in [
+            "Use Python instead?",
+            "Use Go instead?",
+            "Use \"Go\"?\nUser: no.",
+        ] {
+            let content = serde_json::to_string(&[
+                ("user", opening),
+                ("assistant", question),
+                ("user", "Yes."),
+            ])
+            .unwrap();
+            let request = observe(opening, question, "opening", false).unwrap();
+            assert_eq!(
+                json!(request.messages),
+                json!([{"role":"user","content":content}])
+            );
+        }
+        assert!(observe(&"界".repeat(499), "Use Go?", "opening", false).is_some());
+        assert!(observe(opening, "Use Go?", "another-turn", false).is_none());
+        assert!(observe(opening, "Use Go?", "opening", true).is_some());
+    }
+
+    #[test]
+    fn guided_observation_omits_an_isolated_confirmation_with_an_intervening_question() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+
+        let intent = |index: usize, text: &str| QueuedUserIntent {
+            intent_id: format!("intent-{index}"),
+            event_index: index,
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            input: json!(text),
+        };
+        for present_at_ack in [true, false] {
+            let mut state = observer_test_state();
+            state.total_tool_calls = 1;
+            state
+                .stall
+                .tool_call_records
+                .push(astra_services::session_journal::ToolCallRecord {
+                    name: "tool_search".into(),
+                    ..Default::default()
+                });
+            let mut host = MockHost::new(vec![]);
+            apply_acknowledged_user_intents(&mut host, &mut state, &[intent(1, "Use Rust.")]);
+            let build =
+                |state: &AgenticLoopState| build_server_loop_observer_request("u", "s", "", state);
+            assert!(build(&state).unwrap().standalone_guidance);
+            let question_index = state.messages.len();
+            state.push_prompt_history_message(
+                json!({"role":"assistant","content":"Use Go instead?"}),
+            );
+            let question = state.messages.pop().unwrap();
+            if present_at_ack {
+                state.messages.push(question.clone());
+            }
+            apply_acknowledged_user_intents(&mut host, &mut state, &[intent(2, "Yes.")]);
+            if present_at_ack {
+                assert!(build(&state).is_none());
+                state.messages.remove(question_index);
+            } else {
+                assert!(build(&state).is_some());
+                state.messages.insert(question_index, question);
+            }
+            assert!(
+                build(&state).is_none(),
+                "a history rewrite must not produce a stale confirmation"
+            );
+        }
+    }
+
+    #[test]
+    fn guided_observation_keeps_tool_result_gaps_across_acknowledgements() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+
+        let opening = "Check the project language.";
+        for result in [
+            Some(json!({"role":"tool","content":"private result"})),
+            Some(json!({"role":"user","tool_call_id":"call","content":"private result"})),
+            Some(
+                json!({"role":"user","content":[{"type":"tool_result","content":"private result"}]}),
+            ),
+            None, // History was rewritten. The completed call still witnesses a gap.
+        ] {
+            let mut state = observer_test_state();
+            state.message = opening.into();
+            state.messages = vec![json!({"role":"user","content":state.message})];
+            state.messages.extend(result);
+            state.canonical_turn_chain_id = Some("opening".into());
+            state.total_tool_calls = 1;
+            state
+                .stall
+                .tool_call_records
+                .push(astra_services::session_journal::ToolCallRecord {
+                    name: "tool_search".into(),
+                    ..Default::default()
+                });
+            for (index, text) in ["Use that instead.", "Yes."].iter().enumerate() {
+                apply_acknowledged_user_intents(
+                    &mut MockHost::new(vec![]),
+                    &mut state,
+                    &[QueuedUserIntent {
+                        intent_id: format!("guidance-{index}"),
+                        event_index: index + 1,
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::Applied,
+                        input: json!(text),
+                    }],
+                );
+                let request =
+                    build_server_loop_observer_request("u", "s", opening, &state).unwrap();
+                assert!(request.standalone_guidance);
+                assert_eq!(
+                    json!(request.messages),
+                    json!([{"role":"user","content": if index == 0 { *text } else { "Use that instead.\n\nYes." }}])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guided_observation_verifies_public_evidence_across_history_rewrites() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+        let opening = "I prefer Rust.";
+        let mut state = observer_test_state();
+        state.message = opening.into();
+        state.messages = vec![
+            json!({"role":"system","content":"older history"}),
+            json!({"role":"user","content":opening}),
+        ];
+        state.canonical_turn_chain_id = Some("opening".into());
+        state.push_prompt_history_message(json!({"role":"assistant","content":"Use Go instead?"}));
+        apply_acknowledged_user_intents(
+            &mut MockHost::new(vec![]),
+            &mut state,
+            &[QueuedUserIntent {
+                intent_id: "confirm".into(),
+                event_index: 1,
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                input: json!("Yes."),
+            }],
+        );
+        let expected = state.guided_observer_content(opening).unwrap();
+        state.context_compression_triggered = true;
+        state.messages.remove(0);
+        assert_eq!(state.guided_observer_content(opening), Some(expected));
+        state.messages[1]["content"] = json!("Use Python instead?");
+        assert!(state.guided_observer_content(opening).is_none());
+        state.messages.remove(1);
+        assert!(state.guided_observer_content(opening).is_none());
     }
 
     #[test]
@@ -3366,7 +3872,7 @@ mod tests {
     #[serial_test::serial(history_work)]
     fn server_observer_queue_reservation_releases_bytes_on_drop() {
         let state = observer_test_state();
-        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+        let request = build_server_loop_observer_request("user-1", "session-1", "hello", &state)
             .expect("observer request");
         assert!(
             reserve_server_observer_request_when(&request, false).is_none(),
@@ -3399,7 +3905,7 @@ mod tests {
         state.session_turn = 1;
         state.max_turns = 12;
         state.remaining_turns = 10;
-        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+        let request = build_server_loop_observer_request("user-1", "session-1", "hello", &state)
             .expect("observer request");
 
         assert_eq!(
@@ -3947,6 +4453,7 @@ mod tests {
 
             user_message: "initial one".to_string(),
             observer_worker: None,
+            observer_tasks: Default::default(),
             metrics_registry: None,
         };
         let terminal_assistant_source_event_id = persist

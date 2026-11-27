@@ -1297,18 +1297,32 @@ pub(crate) async fn update_session_handler(
     headers: HeaderMap,
     Json(request): Json<SessionUpdateRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state.auth_service.current_principal(&headers).await?;
+    // This existing update route uses legacy bearer authentication. Its
+    // close transition can schedule memory maintenance, just like /close.
+    let provider_owner = match principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context)
+            if context.provider_id == "moi" && request.status.as_deref() == Some("closed") =>
+        {
+            Some(astra_services::runs::ProviderRunOwner {
+                provider_id: context.provider_id,
+                provider_scope_id: context.provider_scope_id,
+            })
+        }
+        _ => None,
+    };
     let session = state
         .session_service
-        .update_session(
+        .update_session_with_provider_scope(
             session_id,
-            user.user_id,
+            principal.user.user_id,
             SessionUpdateRequestData {
                 title: request.title,
                 metadata: request.metadata,
                 metadata_patch: request.metadata_patch,
                 status: request.status,
             },
+            provider_owner.as_ref(),
         )
         .await?;
     Ok(Json(SessionResponse::from(session)))
@@ -1828,24 +1842,91 @@ pub(crate) async fn delete_session_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Lifecycle requests use the same verified principal and retained provider
+/// scope as conversation admission. An edge token keeps its own namespace;
+/// it cannot close a request-signed Session merely by sharing the IAM subject.
+async fn session_lifecycle_user(
+    state: &AppState,
+    session_id: &str,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    route: &'static str,
+    body: &Bytes,
+) -> Result<astra_services::AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+    let auth = state
+        .auth_service
+        .current_principal_for_request_with_provenance(
+            headers,
+            external_request_descriptor(method, uri, headers, route, body),
+        )
+        .await?;
+    let user = auth.principal.user.clone();
+    if let Some(owner) = fork_provider_scope(&auth, true)? {
+        let pool = state.shared_pool.as_ref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider session authority is unavailable",
+            )
+        })?;
+        astra_services::session_fork_coordinator::authorize_existing_provider_session(
+            pool.get(),
+            &user.user_id,
+            session_id,
+            &owner,
+            Some(&state.fernet_encryptor),
+        )
+        .await
+        .map_err(|error| match error {
+            astra_services::SessionForkCoordinatorError::NotFound => error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            ),
+            error => session_fork_http_error(error),
+        })?;
+    } else {
+        state
+            .session_service
+            .get_session(session_id.to_owned(), user.user_id.clone())
+            .await?;
+    }
+    Ok(user)
+}
+
 pub(crate) async fn close_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let owner_id = user.user_id.clone();
+    let auth = state
+        .auth_service
+        .current_principal_for_request_with_provenance(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/sessions/{session_id}/close",
+                &body,
+            ),
+        )
+        .await?;
+    let provider_owner = fork_provider_scope(&auth, true)?;
     let session = state
         .session_service
-        .update_session(
+        .update_session_with_provider_scope(
             session_id.clone(),
-            owner_id.clone(),
+            auth.principal.user.user_id,
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
                 metadata_patch: None,
                 status: Some("closed".to_string()),
             },
+            provider_owner.as_ref(),
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
@@ -1857,13 +1938,21 @@ pub(crate) async fn close_session_handler(
 pub(crate) async fn session_memory_status_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    state
-        .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
-        .await?;
+    let user = session_lifecycle_user(
+        &state,
+        &session_id,
+        &method,
+        &uri,
+        &headers,
+        "/sessions/{session_id}/memory/status",
+        &body,
+    )
+    .await?;
     let pool = state.shared_pool.clone().ok_or_else(|| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1881,13 +1970,21 @@ pub(crate) async fn session_memory_status_handler(
 pub(crate) async fn finalize_session_memory_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    state
-        .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
-        .await?;
+    let user = session_lifecycle_user(
+        &state,
+        &session_id,
+        &method,
+        &uri,
+        &headers,
+        "/sessions/{session_id}/memory/finalize",
+        &body,
+    )
+    .await?;
     let resolver = state.auth_service.memoria_credentials().ok_or_else(|| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1897,7 +1994,8 @@ pub(crate) async fn finalize_session_memory_handler(
     let mut port = crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
         resolver,
         user.user_id.clone(),
-    );
+    )
+    .with_session(&session_id);
     if state.memoria_self_hosted_fallback_enabled
         && let Some(key) = state.memoria_master_key.clone()
     {
@@ -2629,14 +2727,15 @@ fn fork_provider_scope(
 ) -> Result<Option<astra_services::runs::ProviderRunOwner>, (StatusCode, Json<ErrorResponse>)> {
     match &auth.principal.origin {
         astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
+            let owner = astra_services::runs::ProviderRunOwner {
+                provider_id: context.provider_id.clone(),
+                provider_scope_id: context.provider_scope_id.clone(),
+            };
             match auth.mechanism {
-                astra_services::RequestAuthMechanism::RequestBoundHmac => {
-                    Ok(Some(astra_services::runs::ProviderRunOwner {
-                        provider_id: context.provider_id.clone(),
-                        provider_scope_id: context.provider_scope_id.clone(),
-                    }))
+                astra_services::RequestAuthMechanism::RequestBoundHmac => Ok(Some(owner)),
+                astra_services::RequestAuthMechanism::KnownLegacy if allow_legacy => {
+                    Ok((context.provider_id == "moi").then_some(owner))
                 }
-                astra_services::RequestAuthMechanism::KnownLegacy if allow_legacy => Ok(None),
                 _ => Err(session_fork_http_error(
                     astra_services::SessionForkCoordinatorError::Forbidden,
                 )),

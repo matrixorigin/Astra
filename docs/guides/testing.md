@@ -699,6 +699,11 @@ cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
   ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
 ```
 
+Run the sibling `warm_chat_and_readonly_rounds_have_bounded_total_sql` and
+`held_chat_and_readonly_rounds_have_bounded_total_sql` cases in separate test
+processes for warm history and a held provider call. All three verify that the
+HTTP observer receives only the current user input and assistant answer.
+
 The 20-statement limit measures each request on an initialized server pool,
 including transactions, periodic control reads and the real observer's SQL.
 Pool initialization happens before capture; no statements are filtered out
@@ -706,8 +711,7 @@ inside the measured interval. Warm-context setup consumes its complete SSE
 response and waits for observer completion before the next request starts;
 it must not use shutdown drain, which closes admission for that next request.
 Capture ends only after
-both the measured run and its observer finish: the detached observer is not
-owned by `drain_background_runs`. The authorized probe requires the exact expected
+both the measured run and its process-owned observation finish. The authorized probe requires the exact expected
 number of both `scheduled` dispatches and `success` outcomes. An extra scheduled
 observer fails even if it is still pending when the expected successes finish.
 Errors, dropped work, missing completions, and skipped

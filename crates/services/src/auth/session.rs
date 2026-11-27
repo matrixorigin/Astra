@@ -17,6 +17,19 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const PROVIDER_SCOPE_PROOF_KEY: &str = "__astra_provider_scope_proof_v1";
+pub const PROVIDER_SCOPE_OWNER_KEY: &str = "__astra_provider_scope_owner_v1";
+pub const PROVIDER_MEMORY_SCOPE_PROOF_KEY: &str = "__astra_provider_memory_scope_proof_v1";
+pub const PROVIDER_SCOPE_METADATA_KEYS: [&str; 3] = [
+    PROVIDER_SCOPE_PROOF_KEY,
+    PROVIDER_SCOPE_OWNER_KEY,
+    PROVIDER_MEMORY_SCOPE_PROOF_KEY,
+];
+
+fn has_provider_scope_metadata(metadata: &serde_json::Map<String, serde_json::Value>) -> bool {
+    PROVIDER_SCOPE_METADATA_KEYS
+        .iter()
+        .any(|key| metadata.contains_key(*key))
+}
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
 const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (activity_at < ";
 const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (activity_at = ";
@@ -246,12 +259,40 @@ pub trait SessionService: Send + Sync {
         self.get_session(session_id, user_id).await
     }
 
+    async fn get_session_for_provider_request_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.get_session_for_provider_request(session_id, user_id)
+            .await
+            .map(|session| (session, None))
+    }
+
     async fn update_session(
         &self,
         session_id: String,
         user_id: String,
         request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Update a Session using the workspace from the verified request.
+    async fn update_session_with_provider_scope(
+        &self,
+        session_id: String,
+        user_id: String,
+        request: SessionUpdateRequestData,
+        provider_owner: Option<&crate::runs::ProviderRunOwner>,
+    ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        if provider_owner.is_some() {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider session authority is unavailable",
+            ));
+        }
+        self.update_session(session_id, user_id, request).await
+    }
 
     /// Ensure a continuation can use an active session. Implementations may
     /// avoid rewriting an already active session while preserving its fence.
@@ -674,7 +715,7 @@ impl DatabaseSessionService {
             .title
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
         let mut metadata = request.metadata.unwrap_or_default();
-        if metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY) {
+        if has_provider_scope_metadata(&metadata) {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "reserved session metadata key",
@@ -692,6 +733,19 @@ impl DatabaseSessionService {
             metadata.insert(
                 PROVIDER_SCOPE_PROOF_KEY.to_string(),
                 serde_json::Value::String(encryptor.sign_provider_session_scope(
+                    &user_id,
+                    &session_id,
+                    &scope.provider_id,
+                    &scope.provider_scope_id,
+                )),
+            );
+            metadata.insert(
+                PROVIDER_SCOPE_OWNER_KEY.to_string(),
+                serde_json::to_value(scope).map_err(internal_error)?,
+            );
+            metadata.insert(
+                PROVIDER_MEMORY_SCOPE_PROOF_KEY.to_string(),
+                serde_json::Value::String(encryptor.sign_provider_memory_scope(
                     &user_id,
                     &session_id,
                     &scope.provider_id,
@@ -729,7 +783,12 @@ impl DatabaseSessionService {
                     ));
                 }
                 let (record, admission_facts) = self
-                    .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
+                    .fetch_session_for_user_with_admission_facts(
+                        &mut *tx,
+                        &session_id,
+                        &user_id,
+                        false,
+                    )
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
                 // Replaying the same deterministic creation intent may read
@@ -800,7 +859,7 @@ impl DatabaseSessionService {
         // session. Keep database-generated fields, but only return after commit
         // succeeds so a commit failure cannot be reported as successful creation.
         let (record, admission_facts) = self
-            .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
+            .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id, false)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
         debug_assert_eq!(admission_facts.active_plan_id, None);
@@ -833,7 +892,7 @@ impl DatabaseSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
-        self.fetch_session_for_user_with_admission_facts(executor, session_id, user_id)
+        self.fetch_session_for_user_with_admission_facts(executor, session_id, user_id, false)
             .await
             .map(|record| record.map(|(session, _)| session))
     }
@@ -843,6 +902,7 @@ impl DatabaseSessionService {
         executor: impl sqlx::Executor<'_, Database = MySql>,
         session_id: &str,
         user_id: &str,
+        include_scope: bool,
     ) -> Result<Option<(SessionRecord, SessionAdmissionFacts)>, (StatusCode, Json<ErrorResponse>)>
     {
         let mut select = QueryBuilder::<MySql>::new(
@@ -851,9 +911,17 @@ impl DatabaseSessionService {
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
              DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
-             IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM ",
+             IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json",
         );
+        if include_scope {
+            select.push(", ");
+            crate::session_fork_coordinator::push_provider_session_scope(
+                &mut select,
+                user_id,
+                session_id,
+            );
+        }
+        select.push(" FROM ");
         push_session_activity_source(&mut select, user_id);
         select
             .push(" WHERE session_id = ")
@@ -868,8 +936,22 @@ impl DatabaseSessionService {
             return Ok(None);
         };
         let active_plan_id = row.try_get("active_plan_id").map_err(internal_error)?;
+        let provider_scope = include_scope
+            .then(|| {
+                crate::session_fork_coordinator::ProviderSessionScopeFacts::from_row(
+                    &row, user_id, session_id,
+                )
+            })
+            .transpose()
+            .map_err(internal_error)?;
         let session = session_record_from_row(row)?;
-        Ok(Some((session, SessionAdmissionFacts { active_plan_id })))
+        Ok(Some((
+            session,
+            SessionAdmissionFacts {
+                active_plan_id,
+                provider_scope,
+            },
+        )))
     }
 
     async fn delete_session_lifecycle(
@@ -1174,7 +1256,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
     {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        self.fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id)
+        self.fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id, false)
             .await?
             .map(|(session, facts)| (session, Some(facts)))
             .ok_or_else(|| {
@@ -1190,13 +1272,29 @@ impl SessionService for DatabaseSessionService {
         session_id: String,
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        match self.get_session(session_id.clone(), user_id).await {
-            Ok(session) => Ok(session),
-            Err(error) if error.0 == StatusCode::NOT_FOUND => {
-                // Only the failed lookup needs classification. Do not turn a
-                // hidden foreign session or a database failure into permission
-                // to rebuild a conversation on the provider's side.
-                let pool = self.get_pool().await.map_err(internal_error)?;
+        self.get_session_for_provider_request_with_admission_facts(session_id, user_id)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    async fn get_session_for_provider_request_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let record = self
+            .fetch_session_for_user_with_admission_facts(
+                &pool,
+                &session_id,
+                &user_id,
+                crate::session_fork_coordinator::legacy_moi_session_namespace(&user_id),
+            )
+            .await?;
+        match record {
+            Some((session, facts)) => Ok((session, Some(facts))),
+            None => {
                 let exists = query("SELECT 1 FROM agent_sessions WHERE session_id = ? LIMIT 1")
                     .bind(&session_id)
                     .fetch_optional(&pool)
@@ -1204,7 +1302,10 @@ impl SessionService for DatabaseSessionService {
                     .map_err(internal_error)?
                     .is_some();
                 if exists {
-                    Err(error)
+                    Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Session {session_id} 不存在"),
+                    ))
                 } else {
                     Err(error_response_coded(
                         StatusCode::NOT_FOUND,
@@ -1213,7 +1314,6 @@ impl SessionService for DatabaseSessionService {
                     ))
                 }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1223,16 +1323,65 @@ impl SessionService for DatabaseSessionService {
         user_id: String,
         request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.update_session_with_provider_scope(session_id, user_id, request, None)
+            .await
+    }
+
+    async fn update_session_with_provider_scope(
+        &self,
+        session_id: String,
+        user_id: String,
+        request: SessionUpdateRequestData,
+        provider_owner: Option<&crate::runs::ProviderRunOwner>,
+    ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let existing = self
-            .fetch_session_for_user(&pool, &session_id, &user_id)
-            .await?
-            .ok_or_else(|| {
-                error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Session {session_id} 不存在"),
-                )
+        let has_changes = request.title.is_some()
+            || request.metadata.is_some()
+            || request.metadata_patch.is_some()
+            || request.status.is_some();
+        let not_found = || {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        };
+        if let Some(owner) = provider_owner {
+            // The scope lookup establishes row existence and ownership in the
+            // same read. The existing write fence still guards the mutation.
+            crate::session_fork_coordinator::authorize_existing_provider_session(
+                &pool,
+                &user_id,
+                &session_id,
+                owner,
+                self.scope_encryptor.as_deref(),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::SessionForkCoordinatorError::NotFound => not_found(),
+                crate::SessionForkCoordinatorError::Forbidden => error_response_coded(
+                    StatusCode::FORBIDDEN,
+                    "Session is outside the authorized scope",
+                    "session_fork_forbidden",
+                ),
+                _ => {
+                    tracing::warn!(%error, "Session scope lookup failed");
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Session scope is temporarily unavailable",
+                        "session_fork_dependency_unavailable",
+                    )
+                }
             })?;
+        }
+        if provider_owner.is_none() || !has_changes {
+            let existing = self
+                .fetch_session_for_user(&pool, &session_id, &user_id)
+                .await?
+                .ok_or_else(not_found)?;
+            if !has_changes {
+                return Ok(existing);
+            }
+        }
 
         let SessionUpdateRequestData {
             title,
@@ -1248,22 +1397,16 @@ impl SessionService for DatabaseSessionService {
             ));
         }
 
-        if metadata
-            .as_ref()
-            .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+        if metadata.as_ref().is_some_and(has_provider_scope_metadata)
             || metadata_patch
                 .as_ref()
-                .is_some_and(|value| value.contains_key(PROVIDER_SCOPE_PROOF_KEY))
+                .is_some_and(has_provider_scope_metadata)
         {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "reserved session metadata key",
                 "session_metadata_invalid",
             ));
-        }
-
-        if title.is_none() && metadata.is_none() && metadata_patch.is_none() && status.is_none() {
-            return Ok(existing);
         }
 
         // A disconnected cancel request can drop this future before BEGIN
@@ -1321,8 +1464,10 @@ impl SessionService for DatabaseSessionService {
         let metadata_patch_for_audit = metadata_patch.clone();
         let metadata = match (metadata, metadata_patch) {
             (Some(mut metadata), None) => {
-                if let Some(proof) = locked_metadata.get(PROVIDER_SCOPE_PROOF_KEY) {
-                    metadata.insert(PROVIDER_SCOPE_PROOF_KEY.to_string(), proof.clone());
+                for key in PROVIDER_SCOPE_METADATA_KEYS {
+                    if let Some(value) = locked_metadata.get(key) {
+                        metadata.insert(key.to_string(), value.clone());
+                    }
                 }
                 Some(metadata)
             }

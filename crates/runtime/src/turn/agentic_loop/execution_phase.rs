@@ -3130,13 +3130,14 @@ pub(crate) fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
         });
     }
 
-    if !model_guidance.is_empty() {
+    if let Some(last_guidance) = model_guidance.last() {
         // A queued user instruction starts a new semantic turn. Preserve the
         // accumulated exploration/budget shape, but clear the prior turn's
         // effect and completion authority until the bounded classifier owns a
         // new value. Otherwise ReadOnly/MustMutate can leak across user
         // steering and make tool admission contradict the current request.
-        state.canonical_turn_chain_id = model_guidance.last().map(|input| input.intent_id.clone());
+        state.begin_observer_guidance(&last_guidance.intent_id);
+        state.canonical_turn_chain_id = Some(last_guidance.intent_id.clone());
         state.turn_intent = None;
         state.task_profile.mutates_workspace = false;
         state.task_profile.verification_required = false;
