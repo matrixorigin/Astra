@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -72,6 +73,18 @@ class SchemaInventoryTest(unittest.TestCase):
             len(manifest_paths),
             len(set(manifest_paths)),
             "duplicate manifest source paths must not be hidden by set comparison",
+        )
+
+    def test_core_schema_create_registrations_are_inventoried(self) -> None:
+        storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
+            encoding="utf-8",
+        )
+        registered = set(re.findall(r'core_schema_create!\(\s*pool,\s*"([a-z0-9_]+)"', storage))
+        self.assertTrue(registered)
+        self.assertEqual(
+            sorted(registered - self.tables.keys()),
+            [],
+            "core bootstrap tables must appear in the schema inventory",
         )
 
     def test_runtime_admission_ddl_after_test_helper_is_inventoried(self) -> None:

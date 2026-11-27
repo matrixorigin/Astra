@@ -42,6 +42,16 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         hot_path_hint="mixed",
     ),
     SchemaSource(
+        owner="astra_services::chatgpt",
+        domain="core_storage",
+        path="crates/services/src/chatgpt.rs",
+        startup_owner="ensure_core_schema",
+        state_class_hint="durable model account connections and OAuth authorization receipts",
+        hot_path_hint="connection fencing during inference and authorization during sign-in",
+        # A test-only import precedes the production DDL constants.
+        stop_at_cfg_test=False,
+    ),
+    SchemaSource(
         owner="astra_services::work",
         domain="work",
         path="crates/services/src/work.rs",
@@ -745,6 +755,26 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="personal offerings use the canonical model admission path; never expose them as deployment-wide models",
         migration_owner="astra_services::storage / models",
         product_owner="Cloud BYOK model configuration",
+    ),
+    "user_llm_connections": TableMetadata(
+        semantic_owner="astra_services::chatgpt",
+        state_class="durable owner-scoped OAuth model connection and credential authority",
+        primary_query="resolve or fence an owner connection by user_id and connection_id; deduplicate the client and provider subject registration",
+        retention_policy="retain connection identity through refresh, reauthentication and disconnect; revoke or remove encrypted credentials when the connection ends",
+        rebuildability="not rebuildable without the account binding, credential generation and a fresh provider authorization",
+        merge_guidance="user_llm_models references connections without owning OAuth refresh, revocation or credential fences",
+        migration_owner="astra_services::storage / chatgpt",
+        product_owner="ChatGPT OAuth model access",
+    ),
+    "user_llm_authorizations": TableMetadata(
+        semantic_owner="astra_services::chatgpt",
+        state_class="expiring OAuth authorization and callback outcome",
+        primary_query="resolve the owner-scoped authorization and apply a callback for its current status and expiry",
+        retention_policy="expire authorization attempts and clear encrypted verifiers when completed, failed or cancelled",
+        rebuildability="a new authorization requires fresh provider state and verifier material",
+        merge_guidance="keep the temporary authorization and callback receipt independent of the resulting account connection",
+        migration_owner="astra_services::storage / chatgpt",
+        product_owner="ChatGPT OAuth sign-in and reauthentication",
     ),
     "auth_external_identities": TableMetadata(
         semantic_owner="astra_services::auth::verified",
