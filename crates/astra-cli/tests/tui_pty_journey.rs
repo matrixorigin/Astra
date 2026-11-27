@@ -196,7 +196,7 @@ impl PtyAstra {
             })
             .expect("conversation is selectable in the picker");
         self.write(choice.to_string().as_bytes());
-        let selected_row = format!(" {choice}. {name} ·");
+        let selected_row = format!(" {choice}. {name}");
         self.wait_for_screen(&selected_row, UI_TRANSITION_TIMEOUT, |screen| {
             screen
                 .lines()
@@ -207,10 +207,7 @@ impl PtyAstra {
 
     fn select_conversation_run(&mut self, run_id: &str, ordinal: u8, control: Option<&str>) {
         assert!((1..=9).contains(&ordinal));
-        // The renderer's selected footer exposes 17 run characters plus an
-        // ellipsis. Never match identities in the parent transcript or queue
-        // relative navigation ahead of the rendered selection. Number selection
-        // is idempotent even when the row arrives after the picker opens.
+        // Select by the resolved run identity below the run list.
         let identity = run_id.chars().take(17).collect::<String>();
         let selected = |screen: &str| {
             let lines: Vec<_> = screen.lines().collect();
@@ -223,7 +220,7 @@ impl PtyAstra {
                 if prefix.chars().any(char::is_alphanumeric) {
                     return None;
                 }
-                let (run, _) = detail.split_once(" · parent ")?;
+                let (run, _) = detail.split_once(" · ")?;
                 if run.chars().any(char::is_whitespace) {
                     return None; // The identity-unavailable placeholder is not a selection acknowledgement.
                 }
@@ -3672,15 +3669,15 @@ async fn live_child_pause_guidance_resume_preserves_execution_identity() {
         assert!(Instant::now() < deadline, "member did not pause");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));
-    astra.wait_for("P pause/resume/continue", UI_TRANSITION_TIMEOUT);
+    astra.select_conversation_run(child_id, 2, Some("P resume"));
+    astra.wait_for("P resume", UI_TRANSITION_TIMEOUT);
     let value = format!("release-{}", uuid::Uuid::new_v4().simple());
     let guidance = "正式版刚更新了，请重新读取 final.txt；最终把发布代码转成大写，只输出代码。";
     astra.write(b"g");
     astra.wait_for("What would you like this agent", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit(guidance);
     astra.write(&[0x07]);
-    astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));
+    astra.select_conversation_run(child_id, 2, Some("P resume"));
     astra.write(b"\r");
     astra.wait_for_screen(
         "initial member history loaded",
@@ -3703,7 +3700,7 @@ async fn live_child_pause_guidance_resume_preserves_execution_identity() {
     )
     .unwrap();
     astra.write(&[0x07]);
-    astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));
+    astra.select_conversation_run(child_id, 2, Some("P resume"));
     astra.write(b"p");
     astra.write(b"\x1b");
     // Stay on this member page: no refresh or reopening may substitute for live delivery.
@@ -3851,7 +3848,11 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     );
     astra.write(&[0x07]);
     astra.wait_for_screen("run navigator", UI_TRANSITION_TIMEOUT, |screen| {
-        screen.contains("Agent runs") || screen.contains("Conversations")
+        (screen.contains("Agent runs") || screen.contains("Conversations"))
+            && screen.contains("Last activity")
+            && screen
+                .lines()
+                .any(|line| line.contains("Run") && line.contains("State") && line.contains("Time"))
     });
     astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
     astra.record_frame("Run navigator");
@@ -3860,13 +3861,35 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.wait_for_screen("selected child activity", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("child_evidence_visible")
+            && screen.contains("Transcript · Mock child review")
             && screen.lines().any(|line| {
-                line.contains("Mock child review")
-                    && ["working", "starting", "waiting"]
-                        .iter()
-                        .any(|state| line.contains(state))
+                let line = line.trim_start();
+                ["working", "starting", "waiting"]
+                    .iter()
+                    .any(|state| line.starts_with(state))
             })
     });
+    astra.record_frame("Live run transcript");
+    astra.write(b"\x1b");
+    astra.wait_for_screen("return to selected run", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Last activity")
+            && screen.lines().any(|line| {
+                line.trim_start().starts_with('›') && line.contains("Mock child review")
+            })
+    });
+    astra.write(b"\r");
+    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x0f]); // Open the root transcript as a retained tab.
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[1;2C"); // Shift+Right follows the retained tab order.
+    astra.wait_for_screen(
+        "switch back to the same child run",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Transcript · Mock child review")
+                && screen.contains("child_evidence_visible")
+        },
+    );
     mock.release_held_response();
     astra.wait_for_screen(
         "child completion in the open conversation",
@@ -3875,11 +3898,13 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
             screen.contains("child_evidence_visible")
                 && screen
                     .lines()
-                    .any(|line| line.contains("done") && line.contains("Mock child review"))
+                    .any(|line| line.trim_start().starts_with("done"))
         },
     );
-    astra.write(&[0x0f]);
+    astra.record_frame("Completed run transcript");
+    astra.write(b"\x1b[1;2D"); // Shift+Left returns to the retained root tab.
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");
@@ -3918,7 +3943,7 @@ async fn fanout_partial_refresh_preserves_slot_selection() {
     }
     select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
     let selected = selected_task_slot(&astra.current_screen()).unwrap();
-    astra.wait_for("stop available (X)", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("X stop", UI_TRANSITION_TIMEOUT);
     mock.publish_partial_fanout_results();
     let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
     while !astra.current_screen().contains("2 done") {

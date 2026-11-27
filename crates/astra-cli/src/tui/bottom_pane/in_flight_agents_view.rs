@@ -11,14 +11,16 @@
 //! agent lifecycle event can affect row state. The view itself stays
 //! ownership-only: it never holds a reference back into `ChatWidget`.
 //!
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::tui::history_cell::truncate_by_width as truncate_to_width;
 
 use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ViewActionDisposition,
@@ -134,6 +136,14 @@ impl AgentRow {
             return None;
         }
         self.control_target.as_ref()
+    }
+
+    fn pause_or_resume_action(&self) -> Option<astra_thin_client::SessionRunAction> {
+        use astra_thin_client::SessionRunAction::{ContinueSession, Pause, Resume};
+
+        [Pause, Resume, ContinueSession]
+            .into_iter()
+            .find(|action| self.target_for_action(*action).is_some())
     }
 
     pub(crate) fn guide_target(&self) -> Option<(&AgentControlTarget, &str)> {
@@ -374,28 +384,13 @@ impl InFlightAgentsView {
     }
 
     fn request_pause_or_resume(&mut self) {
-        let Some(row) = self.rows.get(self.selected) else {
-            return;
-        };
-        let action = if row
-            .available_actions
-            .contains(&astra_thin_client::SessionRunAction::Pause)
+        if let Some(action) = self
+            .rows
+            .get(self.selected)
+            .and_then(AgentRow::pause_or_resume_action)
         {
-            astra_thin_client::SessionRunAction::Pause
-        } else if row
-            .available_actions
-            .contains(&astra_thin_client::SessionRunAction::Resume)
-        {
-            astra_thin_client::SessionRunAction::Resume
-        } else if row
-            .available_actions
-            .contains(&astra_thin_client::SessionRunAction::ContinueSession)
-        {
-            astra_thin_client::SessionRunAction::ContinueSession
-        } else {
-            return;
-        };
-        self.request_control(action);
+            self.request_control(action);
+        }
     }
 
     fn request_guide(&mut self) {
@@ -765,32 +760,28 @@ impl BottomPaneView for InFlightAgentsView {
         }
 
         let width = usize::from(area.width);
-        let columns = width >= 68 && area.height >= 8;
-        let show_evidence = width >= 108;
-        let name_width = if show_evidence {
-            width / 3
-        } else {
-            width.saturating_sub(35)
-        };
+        const STATE_WIDTH: usize = 19;
+        const TIME_WIDTH: usize = 9;
+        let columns = width >= 66 && area.height >= 6;
+        let name_width = width.saturating_sub(STATE_WIDTH + TIME_WIDTH + 8);
         let body_y = area.y + 1 + u16::from(columns);
         if columns {
             let line = Line::styled(
                 format!(
-                    "  {:<name_width$}  {:<18}  {:>9}{}",
-                    "Run",
-                    "State",
-                    "Time",
-                    if show_evidence { "   Evidence" } else { "" }
+                    "  {:<name_width$}  {:<STATE_WIDTH$}  {:>TIME_WIDTH$}",
+                    "Run", "State", "Time"
                 ),
                 dim,
             );
             buf.set_line(area.x, area.y + 1, &line, area.width);
         }
-        let detail_h = usize::from(area.height >= 5) * 2;
-        let body_h = area
-            .height
-            .saturating_sub(1 + u16::from(columns))
-            .saturating_sub(detail_h as u16) as usize;
+        let detail_h = match area.height {
+            8.. => 3,
+            6..=7 => 2,
+            4..=5 => 1,
+            _ => 0,
+        };
+        let body_h = usize::from(area.bottom().saturating_sub(body_y + detail_h));
         let entries = agent_list_entries(&self.rows);
         let selected_entry = entries
             .iter()
@@ -815,45 +806,41 @@ impl BottomPaneView for InFlightAgentsView {
                     };
                     let label =
                         format!("{}{label}", lineage_prefix(visible_depth(row, &self.rows)));
-                    let content_width = width.saturating_sub(2);
+                    let status = state_phrase(row.state).unwrap_or("working");
+                    let elapsed = if matches!(
+                        row.state.confidence,
+                        AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+                    ) || (row.elapsed_ms == 0
+                        && row.state.status == AgentRunStatus::Starting)
+                    {
+                        "—".into()
+                    } else {
+                        format_elapsed(row.elapsed_ms)
+                    };
+                    let status_style = Style::default().fg(status_color);
                     let (label, meta) = if columns {
                         let name = truncate_to_width(&label, name_width);
                         let padding = " ".repeat(name_width.saturating_sub(name.width()));
-                        let status = state_phrase(row.state).unwrap_or("working");
-                        let elapsed = format_elapsed(row.elapsed_ms);
-                        let mut meta = vec![
-                            Span::styled(
-                                format!("  {status:<18}"),
-                                Style::default().fg(status_color),
-                            ),
-                            Span::styled(format!("  {elapsed:>9}"), dim),
+                        let meta = vec![
+                            Span::styled(format!("  {status:<STATE_WIDTH$}"), status_style),
+                            Span::styled(format!("  {elapsed:>TIME_WIDTH$}"), dim),
                         ];
-                        if show_evidence {
-                            let mut evidence = vec![provenance_label(row.provenance).to_string()];
-                            evidence.extend(activity_labels(row.activity));
-                            if *grouped {
-                                evidence.push(row.agent_id.clone());
-                            }
-                            meta.push(Span::styled(format!("   {}", evidence.join(" · ")), dim));
-                        }
                         (format!("{name}{padding}"), meta)
                     } else {
-                        let budget = content_width.saturating_sub(11);
-                        let mut meta = row_meta_for_width(row, budget);
-                        if *grouped {
-                            let id = truncate_to_width(&row.agent_id, 18);
-                            let separator = if meta.is_empty() { "" } else { " · " };
-                            if meta.width() + separator.width() + id.width() <= budget {
-                                meta.push_str(separator);
-                                meta.push_str(&id);
-                            }
+                        let mut budget = width.saturating_sub(16);
+                        let mut meta = Vec::with_capacity(2);
+                        if status.width() + 3 <= budget {
+                            meta.push(Span::styled(format!(" · {status}"), status_style));
+                            budget -= status.width() + 3;
                         }
-                        if !meta.is_empty() {
-                            meta.insert_str(0, " · ");
+                        if elapsed.width() + 3 <= budget {
+                            meta.push(Span::styled(format!(" · {elapsed}"), dim));
                         }
-                        let label =
-                            truncate_to_width(&label, content_width.saturating_sub(meta.width()));
-                        (label, vec![Span::styled(meta, dim)])
+                        let meta_width = meta.iter().map(Span::width).sum::<usize>();
+                        (
+                            truncate_to_width(&label, width.saturating_sub(meta_width + 2)),
+                            meta,
+                        )
                     };
                     let mut spans = vec![
                         Span::styled(
@@ -898,30 +885,29 @@ impl BottomPaneView for InFlightAgentsView {
         if detail_h > 0
             && let Some(row) = self.rows.get(self.selected)
         {
-            let detail_y = body_y + body_h as u16;
-            let detail = selected_runtime_detail(row, columns && !show_evidence);
-            for (offset, text) in detail.into_iter().enumerate() {
-                let line = Line::from(Span::styled(
-                    truncate_to_width(&text, usize::from(area.width)),
-                    if offset == 0 {
-                        Style::default().fg(theme.accent)
-                    } else {
-                        dim
-                    },
-                ));
+            let detail_y = body_y + entries.len().saturating_sub(window_start).min(body_h) as u16;
+            for (offset, line) in selected_runtime_detail(row)
+                .into_iter()
+                .take(detail_h as usize)
+                .enumerate()
+            {
                 buf.set_line(area.x, detail_y + offset as u16, &line, area.width);
             }
         }
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        let rows = agent_list_entries(&self.rows).len().max(1);
-        (rows as u16)
-            .saturating_add(3 + u16::from(width >= 108))
-            .clamp(5, 12)
+        let rows = agent_list_entries(&self.rows).len().min(7) as u16;
+        (rows + 5 + u16::from(width >= 66)).clamp(6, 12)
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return;
+        }
         match key.code {
             KeyCode::Char('h') | KeyCode::Char('H') => self.toggle_history(),
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
@@ -985,6 +971,10 @@ impl BottomPaneView for InFlightAgentsView {
         true
     }
 
+    fn owns_primary_canvas(&self) -> bool {
+        true
+    }
+
     fn reserve_status_footer(&self) -> bool {
         true
     }
@@ -1002,19 +992,14 @@ impl BottomPaneView for InFlightAgentsView {
                 format!("H history · {hint}")
             });
         }
-        let mut hints = vec!["↑↓ move", "Enter/→ transcript"];
+        let mut hints = vec!["Enter transcript", "Esc back", "↑↓ select"];
         let selected = self.rows.get(self.selected);
-        if selected.is_some_and(|row| {
-            row.target_for_action(astra_thin_client::SessionRunAction::Pause)
-                .is_some()
-                || row
-                    .target_for_action(astra_thin_client::SessionRunAction::Resume)
-                    .is_some()
-                || row
-                    .target_for_action(astra_thin_client::SessionRunAction::ContinueSession)
-                    .is_some()
-        }) {
-            hints.push("P pause/resume/continue");
+        use astra_thin_client::SessionRunAction::{Cancel, ContinueSession, Pause, Resume};
+        match selected.and_then(AgentRow::pause_or_resume_action) {
+            Some(Pause) => hints.push("P pause"),
+            Some(Resume) => hints.push("P resume"),
+            Some(ContinueSession) => hints.push("P continue"),
+            Some(Cancel) | None => {}
         }
         if selected.is_some_and(|row| {
             row.target_for_action(astra_thin_client::SessionRunAction::Cancel)
@@ -1038,7 +1023,6 @@ impl BottomPaneView for InFlightAgentsView {
                 "H history"
             });
         }
-        hints.push("←/Esc close");
         Some(hints.join(" · "))
     }
 }
@@ -1104,126 +1088,77 @@ fn activity_labels(activity: AgentActivityCounts) -> Vec<String> {
     labels
 }
 
-fn selected_runtime_detail(row: &AgentRow, show_activity: bool) -> [String; 2] {
-    let mut overview = Vec::with_capacity(6);
-    match row.run_id.as_deref().filter(|id| !id.is_empty()) {
-        Some(run_id) => overview.push(format!("run {}", truncate_label(run_id, 18))),
-        None => overview.push("run identity unavailable".into()),
-    }
-    let parent = row
-        .parent_run_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .map(|id| truncate_label(id, 18))
-        .unwrap_or_else(|| "root".into());
-    overview.push(format!("parent {parent}"));
-    if row.depth > 1 {
-        overview.push(format!("depth {}", row.depth));
-    }
-    if row.fanout.is_some() {
-        overview.push(truncate_label(&row.agent_id, 24));
-    }
-    if let Some(runtime) = row
-        .runtime
-        .runtime_profile
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        overview.push(runtime.replace('_', " "));
-    }
-    if let Some(model) = row
-        .runtime
-        .model_name
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        overview.push(model.to_string());
-    }
-    if let Some(background) = row.runtime.background {
-        overview.push(if background {
-            "background".into()
-        } else {
-            "foreground".into()
-        });
-    }
-    let glyphs = crate::tui::glyphs::current();
-    let line_one = format!("  {} {}", glyphs.detail_branch, overview.join(" · "));
-
-    let mut details = Vec::with_capacity(4);
-    if row.run_id.as_deref().is_none_or(str::is_empty) {
-        details.push("live transcript opens now · run identity and controls are syncing".into());
-    }
-    if let Some(summary) = row
+fn selected_runtime_detail(row: &AgentRow) -> [Line<'static>; 3] {
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let status_style = Style::default().fg(state_color(row.state));
+    let mut activity = activity_labels(row.activity);
+    let last = row
         .attention_summary
         .as_deref()
         .filter(|summary| !summary.trim().is_empty())
-    {
-        details.push(format!("attention {summary}"));
+        .map(|summary| crate::tui::render::line_utils::sanitize_terminal_text(summary).into_owned())
+        .unwrap_or_else(|| state_phrase(row.state).unwrap_or("working").to_string());
+    let mut first = vec![
+        Span::styled("  Last activity  ", dim),
+        Span::styled(last, status_style),
+    ];
+    if !activity.is_empty() {
+        first.push(Span::styled(format!(" · {}", activity.join(" · ")), dim));
     }
-    if let Some(facts) = row.runtime.permission.as_ref() {
-        let health = if facts.has_issues {
-            "permission issues"
-        } else {
-            "permissions clear"
-        };
-        details.push(format!(
-            "{health} · {}/{} approved · {} blocked",
-            facts.approved, facts.requests, facts.tools_blocked
-        ));
+
+    activity.clear();
+    if let Some(model) = row.runtime.model_name.as_deref() {
+        activity.push(model.to_string());
     }
     if let Some(binding) = row
         .runtime
         .agent_binding_name
         .as_deref()
         .or(row.runtime.agent_binding_id.as_deref())
-        .filter(|value| !value.is_empty())
     {
-        details.push(format!("binding {binding}"));
+        activity.push(format!("binding {binding}"));
     }
-    if show_activity {
-        details.extend(activity_labels(row.activity));
+    if let Some(profile) = row.runtime.runtime_profile.as_deref() {
+        activity.push(profile.replace('_', " "));
     }
-    let mut controls = Vec::with_capacity(3);
-    if row
-        .target_for_action(astra_thin_client::SessionRunAction::Pause)
-        .is_some()
-    {
-        controls.push("pause available (P)");
-    }
-    if row
-        .target_for_action(astra_thin_client::SessionRunAction::Resume)
-        .is_some()
-    {
-        controls.push("resume available (P)");
-    }
-    if row
-        .target_for_action(astra_thin_client::SessionRunAction::Cancel)
-        .is_some()
-    {
-        controls.push("stop available (X)");
-    }
-    if row.guide_target().is_some() {
-        controls.push("guide available (G)");
-    }
-    if !controls.is_empty() {
-        details.push(controls.join(" · "));
-    }
-    if let Some(target) = row.transcript_target {
-        let location = match target {
-            AgentTranscriptTarget::LocalJournal => "local journal",
-            AgentTranscriptTarget::DurableServer => "durable server",
-        };
-        details.push(format!("transcript {location}"));
-    }
-    if details.is_empty() {
-        details.push(if row.run_id.as_deref().is_some_and(|id| !id.is_empty()) {
-            "live transcript available · canonical location pending".into()
+    if let Some(background) = row.runtime.background {
+        activity.push(if background {
+            "background".into()
         } else {
-            "live transcript opens now · run identity and controls are syncing".into()
+            "foreground".into()
         });
     }
-    let line_two = format!("  {} {}", glyphs.detail_last, details.join(" · "));
-    [line_one, line_two]
+    if let Some(facts) = row.runtime.permission.as_ref() {
+        let caption = if facts.has_issues {
+            "permission issues"
+        } else {
+            "approvals"
+        };
+        activity.push(format!(
+            "{caption} {}/{} · {} blocked",
+            facts.approved, facts.requests, facts.tools_blocked
+        ));
+    }
+
+    let mut identity = vec![
+        transcript_run_id(row).map_or_else(
+            || "Run identity pending".into(),
+            |run_id| format!("run {run_id}"),
+        ),
+        provenance_label(row.provenance).into(),
+    ];
+    if let Some(parent) = row.parent_run_id.as_deref() {
+        identity.push(format!("parent {parent}"));
+    }
+    if row.fanout.is_some() {
+        identity.push(row.agent_id.clone());
+    }
+    [
+        Line::from(first),
+        Line::styled(format!("  {}", identity.join(" · ")), dim),
+        Line::styled(format!("  {}", activity.join(" · ")), dim),
+    ]
 }
 
 fn transcript_run_id(row: &AgentRow) -> Option<&str> {
@@ -1242,70 +1177,6 @@ fn provenance_label(source: AgentProjectionSource) -> &'static str {
         AgentProjectionSource::WorkspaceSnapshot => "restored snapshot",
         AgentProjectionSource::LocalIntent => "pending intent",
     }
-}
-
-fn row_meta_parts(row: &AgentRow, include_activity: bool) -> Vec<String> {
-    let mut parts = Vec::new();
-    if let Some(status) = state_phrase(row.state) {
-        parts.push(status.to_string());
-    }
-    parts.push(provenance_label(row.provenance).to_string());
-    if include_activity {
-        parts.extend(activity_labels(row.activity));
-    }
-    parts.push(format_elapsed(row.elapsed_ms));
-    parts
-}
-
-fn row_meta_for_width(row: &AgentRow, max_width: usize) -> String {
-    let full = row_meta_parts(row, true);
-    let essential = row_meta_parts(row, false);
-    let status_and_elapsed = state_phrase(row.state)
-        .map(|status| vec![status.to_string(), format_elapsed(row.elapsed_ms)]);
-    let provenance_and_elapsed = vec![
-        provenance_label(row.provenance).to_string(),
-        format_elapsed(row.elapsed_ms),
-    ];
-    let elapsed = vec![format_elapsed(row.elapsed_ms)];
-
-    [
-        Some(full),
-        Some(essential),
-        status_and_elapsed,
-        Some(provenance_and_elapsed),
-        Some(elapsed),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|parts| parts.join(" · "))
-    .find(|candidate| UnicodeWidthStr::width(candidate.as_str()) <= max_width)
-    .unwrap_or_default()
-}
-
-fn truncate_to_width(text: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let content_width = max_width - 1;
-    let mut width = 0;
-    let mut truncated = String::new();
-    for ch in text.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + char_width > content_width {
-            break;
-        }
-        width += char_width;
-        truncated.push(ch);
-    }
-    truncated.push('…');
-    truncated
 }
 
 pub(crate) fn state_color(state: AgentRunState) -> Color {
@@ -1661,7 +1532,7 @@ mod tests {
 
         assert!(rendered.contains("waiting"), "{rendered}");
         assert!(
-            rendered.contains("attention Approval required · git status"),
+            rendered.contains("Last activity  Approval required · git status"),
             "{rendered}"
         );
     }
@@ -2009,7 +1880,7 @@ mod tests {
     fn pause_hint_and_action_only_exist_when_backend_declares_them() {
         let mut local = InFlightAgentsView::new(rows(1));
         let local_hints = local.hint_keys().unwrap_or_default();
-        assert!(!local_hints.contains("P pause/resume"));
+        assert!(!local_hints.contains("P pause"));
         assert!(local_hints.contains("G message"));
         local.handle_key(key(KeyCode::Char('p')));
         assert_eq!(local.take_action_request(), None);
@@ -2020,7 +1891,7 @@ mod tests {
         assert!(
             durable
                 .hint_keys()
-                .is_some_and(|hints| hints.contains("P pause/resume"))
+                .is_some_and(|hints| hints.contains("P pause"))
         );
     }
 
@@ -2258,7 +2129,7 @@ mod tests {
         rows[1].state = AgentRunState::observed(AgentRunStatus::Failed);
         rows[2].state = AgentRunState::observed(AgentRunStatus::Completed);
 
-        let out = render(&InFlightAgentsView::new(rows), 100, 7);
+        let out = render(&InFlightAgentsView::new(rows), 100, 10);
 
         assert!(out.contains("review fanout"), "{out}");
         assert!(out.contains("3 target"), "{out}");
@@ -2305,7 +2176,7 @@ mod tests {
             "presentation does not rewrite canonical metadata"
         );
 
-        let out = render(&InFlightAgentsView::new(hierarchy), 100, 6);
+        let out = render(&InFlightAgentsView::new(hierarchy), 100, 10);
 
         assert!(out.contains("3 observed tool starts"), "{out}");
         assert!(out.contains("1 child"), "{out}");
@@ -2322,10 +2193,11 @@ mod tests {
 
     #[test]
     fn selected_row_uses_availability_facts_not_missing_metadata_placeholders() {
-        let out = render(&InFlightAgentsView::new(rows(1)), 100, 5);
+        let view = InFlightAgentsView::new(rows(1));
+        let out = render(&view, 100, 8);
 
         assert!(out.contains("run run-0"), "{out}");
-        assert!(out.contains("stop available (X)"), "{out}");
+        assert!(view.hint_keys().unwrap().contains("X stop"), "{out}");
         assert!(!out.contains("not reported"), "{out}");
         assert!(!out.contains("model not reported"), "{out}");
     }
@@ -2344,14 +2216,14 @@ mod tests {
         ];
 
         let view = InFlightAgentsView::new(vec![row]);
-        let detail = render(&view, 120, view.desired_height(120));
+        let detail = render(&view, 120, 8);
+        let hint = view.hint_keys().unwrap();
 
         assert!(detail.contains("task 0"), "{detail}");
         assert!(detail.contains("run durable-run-1"), "{detail}");
-        assert!(detail.contains("pause available (P)"), "{detail}");
-        assert!(detail.contains("stop available (X)"), "{detail}");
-        assert!(detail.contains("guide available (G)"), "{detail}");
-        assert!(!detail.contains("resume available (P)"), "{detail}");
+        assert!(hint.contains("P pause"), "{hint}");
+        assert!(hint.contains("X stop"), "{hint}");
+        assert!(hint.contains("G message"), "{hint}");
     }
 
     #[test]
@@ -2373,7 +2245,7 @@ mod tests {
             durable_snapshot_truncated: true,
         };
 
-        let out = render(&InFlightAgentsView::new(snapshot), 100, 3);
+        let out = render(&InFlightAgentsView::new(snapshot), 100, 4);
 
         assert!(out.contains("partial server list"), "{out}");
         assert!(out.contains("≥1 child"), "{out}");
@@ -2470,13 +2342,13 @@ mod tests {
             })
         ));
         assert!(!view.is_complete());
-        let pending_render = render(&view, 100, 5);
+        let pending_render = render(&view, 100, 8);
         assert!(
-            pending_render.contains("run identity unavailable"),
+            pending_render.contains("Run identity pending"),
             "{pending_render}"
         );
         assert!(
-            pending_render.contains("live transcript opens now"),
+            view.hint_keys().unwrap().contains("Enter transcript"),
             "{pending_render}"
         );
 
@@ -2541,7 +2413,7 @@ mod tests {
         let out = render(&InFlightAgentsView::new(narrow), 40, 3);
 
         assert!(out.contains("› 1."), "{out}");
-        assert!(out.contains("server record"), "{out}");
+        assert!(out.contains("working"), "{out}");
         assert!(out.contains("1.0s"), "{out}");
         assert!(out.contains('…'), "{out}");
     }
@@ -2552,11 +2424,11 @@ mod tests {
         let out = render(&v, 80, 4);
         assert!(out.contains("Agent runs · 2 working"), "{out}");
         assert!(!out.contains("SUBAGENTS"), "{out}");
-        assert!(out.contains("1 observed tool start"), "{out}");
+        assert!(out.contains("Last activity"), "{out}");
         assert!(!out.contains("steps"), "{out}");
         assert_eq!(
             v.hint_keys().as_deref(),
-            Some("↑↓ move · Enter/→ transcript · X stop · G message · ←/Esc close")
+            Some("Enter transcript · Esc back · ↑↓ select · X stop · G message")
         );
     }
 

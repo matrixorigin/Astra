@@ -442,39 +442,34 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// If viewport would extend past screen bottom, add only the missing rows
-    /// at the bottom so displaced content enters native terminal scrollback.
-    /// Once enough space exists below a shrunken viewport, later growth reuses
-    /// that space instead of printing more blank lines.
-    /// If viewport area changed, clear old area and set new one.
-    fn update_inline_viewport(terminal: &mut CustomTerminal, height: u16) -> io::Result<bool> {
+    /// Reclaim rows below a growing frame before scrolling. When it shrinks,
+    /// keep its old bottom edge so the composer stays near the user's hands.
+    fn update_inline_viewport<B: Backend + Write>(
+        terminal: &mut custom_terminal::Terminal<B>,
+        height: u16,
+    ) -> io::Result<bool> {
         let size = terminal.last_known_screen_size;
-        let mut area = terminal.viewport_area;
-        area.height = height.min(size.height);
-        area.width = size.width;
-        let mut needs_full_repaint = false;
-
-        if area.bottom() > size.height {
-            terminal.clear()?;
-            let scroll_by = area.bottom() - size.height;
-            queue!(
-                terminal.backend_mut(),
-                cursor::MoveTo(0, size.height.saturating_sub(1))
-            )?;
+        let old = terminal.viewport_area;
+        let height = height.min(size.height);
+        let requested_bottom = old
+            .bottom()
+            .min(size.height)
+            .max(old.top().saturating_add(height));
+        let bottom = requested_bottom.min(size.height);
+        let area = ratatui::layout::Rect::new(0, bottom - height, size.width, height);
+        if area == old {
+            return Ok(false);
+        }
+        terminal.clear()?;
+        let scroll_by = requested_bottom.saturating_sub(size.height);
+        if scroll_by > 0 {
+            queue!(terminal.backend_mut(), cursor::MoveTo(0, size.height - 1))?;
             for _ in 0..scroll_by {
                 queue!(terminal.backend_mut(), Print("\n"))?;
             }
-            needs_full_repaint = true;
-            area.y = size.height - area.height;
         }
-
-        if area != terminal.viewport_area {
-            terminal.clear()?;
-            terminal.set_viewport_area(area);
-            needs_full_repaint = true;
-        }
-
-        Ok(needs_full_repaint)
+        terminal.set_viewport_area(area);
+        Ok(true)
     }
 
     fn flush_pending_history<B: Backend + Write>(
@@ -813,6 +808,23 @@ mod tests {
         let mut terminal = crate::tui::custom_terminal::Terminal::with_options(backend).unwrap();
         terminal.set_viewport_area(ratatui::layout::Rect::new(0, top, width, 4));
         terminal
+    }
+
+    #[test]
+    fn shrinking_a_workspace_keeps_the_composer_at_the_bottom() {
+        let mut terminal = recording_terminal(80, 0);
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, 80, 40));
+        assert!(super::TerminalGuard::update_inline_viewport(&mut terminal, 6).unwrap());
+        assert_eq!(
+            terminal.viewport_area,
+            ratatui::layout::Rect::new(0, 34, 80, 6)
+        );
+        assert!(!super::TerminalGuard::update_inline_viewport(&mut terminal, 6).unwrap());
+        assert!(super::TerminalGuard::update_inline_viewport(&mut terminal, 8).unwrap());
+        assert_eq!(
+            terminal.viewport_area,
+            ratatui::layout::Rect::new(0, 32, 80, 8)
+        );
     }
 
     fn settled_guttered_text(source: &str) -> String {

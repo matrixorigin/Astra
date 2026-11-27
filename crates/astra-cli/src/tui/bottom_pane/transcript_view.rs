@@ -2116,7 +2116,7 @@ impl BottomPaneView for TranscriptView {
             return Some("↑↓ extend · Y copy · V clear selection".into());
         }
         if !self.report {
-            return Some("↑↓ select · Enter details · / search · Esc back · Y copy".into());
+            return Some("Enter details · / search · Esc back · ↑↓ select · Y copy".into());
         }
         let evidence = if self.expanded.is_empty() {
             "Enter evidence"

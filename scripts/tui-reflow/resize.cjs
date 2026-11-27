@@ -168,6 +168,24 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       await settle();
     }
     check('initial 100x30');
+    if (draft && !rapid) {
+      const draftText = 'DRAFT_SENTINEL';
+      send({ input: '\x0f' });
+      await waitFor(() => lines().some(line => line.includes('· Transcript')));
+      send({ input: '\x0f' });
+      await waitFor(() => lines().some(line => line.includes(draftText)));
+      await settle();
+      const buffer = terminal.buffer.active;
+      const draftRow = lines().slice(buffer.baseY).findIndex(line => line.includes(draftText));
+      assert(draftRow >= terminal.rows - 10,
+        'returning from the transcript moved the composer away from the bottom: ' + lines().join('\n'));
+      const cursor = buffer.cursorY;
+      send({ input: '\x1b[200~跟进 patch.rs\x1b[201~' });
+      await waitFor(() => lines().some(line => line.includes('跟进 patch.rs')));
+      await settle();
+      assert.equal(buffer.cursorY, cursor, 'typing on the current line moved the input cursor');
+      check('typing after a transcript round trip');
+    }
     if (expiredReply) {
       tracingResize = true;
       holdCursorReply = true;

@@ -232,7 +232,15 @@ fn focused_agent_activity_line(
             Style::default().fg(crate::tui::theme::current().dim),
         );
     };
-    let mut parts = vec![state_phrase(state).unwrap_or("working").to_string()];
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let mut parts = vec![
+        Span::styled("  ", dim),
+        Span::styled(
+            state_phrase(state).unwrap_or("working"),
+            Style::default().fg(state_color(state)).bold(),
+        ),
+    ];
     let reliable = !matches!(
         state.confidence,
         AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
@@ -245,24 +253,21 @@ fn focused_agent_activity_line(
         None
     };
     if let Some(elapsed) = elapsed {
-        parts.push(format_elapsed(elapsed));
+        parts.push(Span::styled(format!(" · {}", format_elapsed(elapsed)), dim));
     }
     if let Some(attention) = attention {
-        parts.push(crate::tui::render::line_utils::sanitize_terminal_text(attention).into_owned());
+        let attention = crate::tui::render::line_utils::sanitize_terminal_text(attention);
+        let available =
+            usize::from(width).saturating_sub(parts.iter().map(Span::width).sum::<usize>() + 3);
+        if available > 0 {
+            let brief = super::history_cell::truncate_by_width(&attention, available);
+            parts.push(Span::styled(
+                format!(" · {brief}"),
+                Style::default().fg(theme.warn),
+            ));
+        }
     }
-    parts.push(
-        crate::tui::render::line_utils::sanitize_terminal_text(&cell.description).into_owned(),
-    );
-    let text = super::history_cell::truncate_by_width(
-        &format!("  {}", parts.join(" · ")),
-        usize::from(width),
-    );
-    Line::styled(
-        text,
-        Style::default()
-            .fg(state_color(state))
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    )
+    Line::from(parts)
 }
 
 /// A compact browser-like tab strip for retained conversations. On narrow
@@ -277,9 +282,10 @@ fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Opti
     let theme = crate::tui::theme::current();
     let dim = Style::default().fg(theme.dim);
     let active_style = Style::default()
-        .fg(theme.accent)
+        .fg(theme.selected_fg)
+        .bg(theme.selected_bg)
         .add_modifier(ratatui::style::Modifier::BOLD);
-    let label_budget = 22;
+    let label_budget = usize::from(width);
     let labels = tabs
         .iter()
         .map(|tab| super::history_cell::truncate_by_width(&tab.label, label_budget))
@@ -290,26 +296,22 @@ fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Opti
             .iter()
             .map(|label| UnicodeWidthStr::width(label.as_str()) + 2)
             .sum::<usize>()
-        + tabs.len().saturating_sub(1) * 3
-        + UnicodeWidthStr::width(shortcut);
+        + tabs.len().saturating_sub(1) * 2;
 
     if full_width <= usize::from(width) {
         let mut spans = vec![Span::styled("  ", dim)];
         for (index, (tab, label)) in tabs.iter().zip(labels).enumerate() {
             if index > 0 {
-                spans.push(Span::styled(" · ", dim));
+                spans.push(Span::raw("  "));
             }
-            let marker = if tab.active {
-                crate::tui::glyphs::current().activity_frames[2]
-            } else {
-                crate::tui::glyphs::current().agent_running
-            };
             spans.push(Span::styled(
-                format!("{marker} {label}"),
+                format!(" {label} "),
                 if tab.active { active_style } else { dim },
             ));
         }
-        spans.push(Span::styled(shortcut, dim));
+        if full_width + shortcut.width() <= usize::from(width) {
+            spans.push(Span::styled(shortcut, dim));
+        }
         return Some(Line::from(spans));
     }
 
@@ -319,20 +321,13 @@ fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Opti
         .find_map(|(tab, label)| tab.active.then_some(label))
         .unwrap_or_else(|| "conversation".to_string());
     let prefix = if width >= 16 { "  " } else { "" };
-    let marker = crate::tui::glyphs::current().activity_frames[2];
-    let lead = format!("{prefix}{marker} ");
-    let lead = if lead.width() < usize::from(width) {
-        lead
-    } else {
-        String::new()
-    };
     let label = super::history_cell::truncate_by_width(
         &active_label,
-        usize::from(width).saturating_sub(lead.width()),
+        usize::from(width).saturating_sub(prefix.width()),
     );
-    let mut spans = vec![Span::styled(format!("{lead}{label}"), active_style)];
+    let mut spans = vec![Span::raw(prefix), Span::styled(label.clone(), active_style)];
     let suffix = format!(" · {} conversations{shortcut}", tabs.len());
-    if lead.width() + label.width() + suffix.width() <= usize::from(width) {
+    if prefix.width() + label.width() + suffix.width() <= usize::from(width) {
         spans.push(Span::styled(suffix, dim));
     }
     Some(Line::from(spans))
@@ -763,6 +758,7 @@ pub(crate) fn do_draw(
         Some(super::bottom_pane::view::ConversationTabId::Run { agent_id, run_id }) => Some(
             focused_agent_activity_line(chat_widget, &agent_id, &run_id, width),
         ),
+        _ if bottom_pane.agent_monitor_is_open() => None,
         _ => viewport
             .multi_agent
             .as_deref()

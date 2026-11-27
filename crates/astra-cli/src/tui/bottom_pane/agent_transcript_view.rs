@@ -2569,7 +2569,7 @@ impl BottomPaneView for AgentTranscriptView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        let mut hints = vec![self.transcript.hint_keys()?];
+        let mut hints = vec![self.transcript.hint_keys()?, "Shift+←/→ switch".into()];
         if self.session_id.is_some() && self.transcript_target.is_some() {
             hints.push("R refresh".into());
         } else if self.transcript_target.is_none() {
@@ -2578,11 +2578,7 @@ impl BottomPaneView for AgentTranscriptView {
         if self.has_more {
             hints.push("O older".into());
         }
-        hints.extend([
-            "S export".into(),
-            "Ctrl+G agents".into(),
-            "Shift+←/→ switch".into(),
-        ]);
+        hints.extend(["S export".into(), "Ctrl+G agents".into()]);
         Some(hints.join(" · "))
     }
 
