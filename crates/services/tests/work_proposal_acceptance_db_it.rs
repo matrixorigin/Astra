@@ -184,17 +184,15 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
     assert_eq!(graph.try_get::<String, _>("actor_id").unwrap(), proposal_id);
     assert_eq!(graph.try_get::<i64, _>("item_count").unwrap(), 4);
     assert_eq!(graph.try_get::<i64, _>("edge_count").unwrap(), 2);
-    for (table, expected) in [("work_items", 4_i64), ("work_item_revisions", 4_i64)] {
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {table} WHERE owner_id = ? AND work_id = ?"
-        )))
-        .bind(&owner_id)
-        .bind(&work_id)
-        .fetch_one(pool.get())
-        .await
-        .unwrap_or_else(|error| panic!("count {table}: {error}"));
-        assert_eq!(count, expected, "unexpected durable {table} rows");
-    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_item_revisions WHERE owner_id = ? AND work_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count Work item revisions");
+    assert_eq!(count, 4);
     let event_kinds: Vec<String> = sqlx::query_scalar(
         "SELECT event_kind FROM work_events
          WHERE owner_id = ? AND work_id = ? ORDER BY event_seq",
@@ -482,6 +480,28 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
         .create_genesis(genesis(&owner_id, &work_id, &delivery_branch))
         .await
         .expect("genesis");
+
+    // Advance the graph without touching the root item's immutable declaration.
+    let expansion = repository
+        .propose_plan(proposal(
+            &owner_id,
+            &work_id,
+            &delivery_branch,
+            &common::id("expansion"),
+            vec![item("independent-task")],
+            Vec::new(),
+        ))
+        .await
+        .expect("propose graph expansion");
+    let expanded = repository
+        .accept_plan_proposal(common::plan_acceptance(&expansion, &common::id("expand")))
+        .await
+        .expect("accept graph expansion")
+        .resolution
+        .expect("expansion resolution");
+    let expanded_graph = expanded.result_graph_revision.expect("expanded graph");
+    assert_eq!(expanded_graph.get(), 2);
+
     sqlx::query(
         "INSERT INTO agent_sessions
          (session_id, user_id, status, event_count, project_retention_policy)
@@ -528,6 +548,11 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
             Vec::new(),
             Vec::new(),
         );
+        plan.expected_graph_revision = expanded_graph;
+        if branch_id == delivery_branch {
+            plan.expected_branch_revision =
+                expanded.result_branch_revision.expect("expanded branch");
+        }
         plan.revisions.push(WorkItemRevisionChange::new(
             WorkItemId::root(),
             WorkItemRevision::INITIAL,
@@ -581,23 +606,28 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
     .await
     .expect("sibling item revisions");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].try_get::<i64, _>("revision").unwrap(), 2);
-    assert_eq!(rows[1].try_get::<i64, _>("revision").unwrap(), 3);
+    assert_eq!(rows[0].try_get::<i64, _>("revision").unwrap(), 3);
+    assert_eq!(rows[1].try_get::<i64, _>("revision").unwrap(), 4);
     assert!(
         rows.iter()
             .all(|row| { row.try_get::<Option<i64>, _>("parent_revision").unwrap() == Some(1) })
     );
-    let objectives = rows
-        .iter()
-        .map(|row| row.try_get::<String, _>("objective").unwrap())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        objectives,
-        std::collections::BTreeSet::from([
-            "Explore the delivery approach".to_string(),
-            "Explore the sibling approach".to_string(),
-        ])
-    );
+    for (objective, resolution) in [
+        ("Explore the delivery approach", delivery),
+        ("Explore the sibling approach", sibling),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.try_get::<String, _>("objective").unwrap() == objective)
+            .expect("branch-specific root declaration");
+        assert_eq!(
+            row.try_get::<i64, _>("revision").unwrap(),
+            resolution
+                .result_graph_revision
+                .expect("committed graph")
+                .get()
+        );
+    }
     common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
@@ -669,11 +699,11 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
         })
     ));
     let state = sqlx::query(
-        "SELECT p.status, gs.last_revision, b.branch_revision, b.current_graph_revision,
-                (SELECT COUNT(*) FROM work_items wi
-                 WHERE wi.owner_id = p.owner_id AND wi.work_id = p.work_id) AS item_count
+        "SELECT p.status, w.last_graph_revision, b.branch_revision, b.current_graph_revision,
+                (SELECT COUNT(*) FROM work_item_revisions wi
+                 WHERE wi.owner_id = p.owner_id AND wi.work_id = p.work_id AND wi.revision = 1) AS item_count
          FROM work_proposals p
-         JOIN work_graph_sequences gs ON gs.owner_id = p.owner_id AND gs.work_id = p.work_id
+         JOIN works w ON w.owner_id = p.owner_id AND w.work_id = p.work_id
          JOIN work_branches b ON b.owner_id = p.owner_id AND b.work_id = p.work_id
           AND b.branch_id = p.branch_id
          WHERE p.owner_id = ? AND p.work_id = ? AND p.proposal_id = ?",
@@ -685,7 +715,7 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
     .await
     .expect("rolled back state");
     assert_eq!(state.try_get::<String, _>("status").unwrap(), "pending");
-    assert_eq!(state.try_get::<i64, _>("last_revision").unwrap(), 1);
+    assert_eq!(state.try_get::<i64, _>("last_graph_revision").unwrap(), 1);
     assert_eq!(state.try_get::<i64, _>("branch_revision").unwrap(), 1);
     assert_eq!(
         state.try_get::<i64, _>("current_graph_revision").unwrap(),
@@ -795,13 +825,13 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
         })
     ));
     let state = sqlx::query(
-        "SELECT p.status, p.resolution_ref, gs.last_revision,
+        "SELECT p.status, p.resolution_ref, w.last_graph_revision,
                 b.branch_revision, b.current_graph_revision,
-                (SELECT COUNT(*) FROM work_items wi
-                 WHERE wi.owner_id = p.owner_id AND wi.work_id = p.work_id) AS item_count,
+                (SELECT COUNT(*) FROM work_item_revisions wi
+                 WHERE wi.owner_id = p.owner_id AND wi.work_id = p.work_id AND wi.revision = 1) AS item_count,
                 es.last_event_seq
          FROM work_proposals p
-         JOIN work_graph_sequences gs ON gs.owner_id = p.owner_id AND gs.work_id = p.work_id
+         JOIN works w ON w.owner_id = p.owner_id AND w.work_id = p.work_id
          JOIN work_branches b ON b.owner_id = p.owner_id AND b.work_id = p.work_id
           AND b.branch_id = p.branch_id
          JOIN work_event_sequences es ON es.owner_id = p.owner_id AND es.work_id = p.work_id
@@ -820,7 +850,7 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
             .unwrap(),
         None
     );
-    assert_eq!(state.try_get::<i64, _>("last_revision").unwrap(), 1);
+    assert_eq!(state.try_get::<i64, _>("last_graph_revision").unwrap(), 1);
     assert_eq!(state.try_get::<i64, _>("branch_revision").unwrap(), 1);
     assert_eq!(
         state.try_get::<i64, _>("current_graph_revision").unwrap(),
@@ -908,14 +938,14 @@ async fn competing_proposal_acceptances_have_one_complete_winner() {
         assert_eq!(stored.resolution.is_some(), won);
     }
     let state = sqlx::query(
-        "SELECT p.status, gs.last_revision, b.branch_revision, b.current_graph_revision,
+        "SELECT p.status, w.last_graph_revision, b.branch_revision, b.current_graph_revision,
                 (SELECT COUNT(*) FROM work_graph_revisions gr
                  WHERE gr.owner_id = p.owner_id AND gr.work_id = p.work_id) AS graph_count,
-                (SELECT COUNT(*) FROM work_items wi
-                 WHERE wi.owner_id = p.owner_id AND wi.work_id = p.work_id) AS item_count,
+                (SELECT COUNT(*) FROM work_item_revisions wi
+                 WHERE wi.owner_id = p.owner_id AND wi.work_id = p.work_id AND wi.revision = 1) AS item_count,
                 es.last_event_seq
          FROM work_proposals p
-         JOIN work_graph_sequences gs ON gs.owner_id = p.owner_id AND gs.work_id = p.work_id
+         JOIN works w ON w.owner_id = p.owner_id AND w.work_id = p.work_id
          JOIN work_branches b ON b.owner_id = p.owner_id AND b.work_id = p.work_id
           AND b.branch_id = p.branch_id
          JOIN work_event_sequences es ON es.owner_id = p.owner_id AND es.work_id = p.work_id
@@ -927,7 +957,7 @@ async fn competing_proposal_acceptances_have_one_complete_winner() {
     .fetch_one(pool.get())
     .await
     .expect("single-winner state");
-    assert_eq!(state.try_get::<i64, _>("last_revision").unwrap(), 2);
+    assert_eq!(state.try_get::<i64, _>("last_graph_revision").unwrap(), 2);
     assert_eq!(state.try_get::<i64, _>("branch_revision").unwrap(), 2);
     assert_eq!(
         state.try_get::<i64, _>("current_graph_revision").unwrap(),
@@ -945,7 +975,8 @@ async fn competing_proposal_acceptances_have_one_complete_winner() {
         }
     );
     let persisted_items: Vec<String> = sqlx::query_scalar(
-        "SELECT item_id FROM work_items WHERE owner_id = ? AND work_id = ? ORDER BY item_id",
+        "SELECT item_id FROM work_item_revisions
+         WHERE owner_id = ? AND work_id = ? AND revision = 1 ORDER BY item_id",
     )
     .bind(&owner_id)
     .bind(&work_id)

@@ -4,7 +4,7 @@ use super::repository::{
     rollback_transaction,
 };
 use super::{
-    NewWorkPlanProposal, RecordedWorkPlanProposal, WorkChangeRef, WorkGraphChange,
+    GraphRevision, NewWorkPlanProposal, RecordedWorkPlanProposal, WorkChangeRef, WorkGraphChange,
     WorkGraphItemChange, WorkPlanProposalAcceptance, WorkPlanProposalResolution,
     WorkProposalStatus,
 };
@@ -58,9 +58,10 @@ fn validate_acceptance_identity(
 async fn lock_acceptance_work_basis(
     transaction: &mut sqlx::Transaction<'_, MySql>,
     proposal: &NewWorkPlanProposal,
-) -> Result<(), WorkRepositoryError> {
+) -> Result<GraphRevision, WorkRepositoryError> {
     let row = query(
         "SELECT w.work_revision, w.current_goal_revision, w.current_criteria_set_revision,
+                w.last_graph_revision,
                 CASE WHEN w.archived_at IS NULL THEN 0 ELSE 1 END AS work_archived,
                 g.revision AS materialized_goal_revision,
                 cs.revision AS materialized_criteria_set_revision
@@ -121,7 +122,9 @@ async fn lock_acceptance_work_basis(
             std::io::Error::other("current Work criterion set revision is missing"),
         ));
     }
-    Ok(())
+    let current = GraphRevision::new(integer("last_graph_revision")?)
+        .map_err(|source| WorkRepositoryError::corrupt("Work graph revision", source))?;
+    current.checked_next().map_err(invalid_mutation)
 }
 
 async fn load_acceptance_graph_change(
@@ -344,11 +347,11 @@ pub(super) async fn accept_plan_proposal(
         });
     }
     let result = async {
-        lock_acceptance_work_basis(&mut transaction, &recorded.proposal).await?;
+        let graph_revision =
+            lock_acceptance_work_basis(&mut transaction, &recorded.proposal).await?;
         let graph_change =
             load_acceptance_graph_change(&mut transaction, &recorded.proposal).await?;
-        let prepared =
-            super::graph_repository::prepare_graph_change(&mut transaction, graph_change).await?;
+        let prepared = super::graph_repository::prepare_graph_change(graph_change, graph_revision)?;
         let branch = super::graph_repository::apply_prepared_graph_change(
             &mut transaction,
             &prepared,

@@ -997,23 +997,6 @@ async fn insert_genesis_rows(
     })?;
 
     query(
-        "INSERT INTO work_items (owner_id, work_id, item_id, last_revision)
-         VALUES (?, ?, ?, 1)",
-    )
-    .bind(owner_id)
-    .bind(work_id)
-    .bind(genesis.root_item.item_id.as_str())
-    .execute(&mut **transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::insert(
-            "insert root WorkItem identity",
-            WorkConflictResource::WorkItemIdentity,
-            source,
-        )
-    })?;
-
-    query(
         "INSERT INTO work_item_revisions
          (owner_id, work_id, item_id, revision, parent_revision, item_kind, objective,
           expected_result, declaration_state, source_ref)
@@ -1031,7 +1014,7 @@ async fn insert_genesis_rows(
     .map_err(|source| {
         WorkRepositoryError::insert(
             "insert root WorkItem revision",
-            WorkConflictResource::WorkItemRevision,
+            WorkConflictResource::WorkItemIdentity,
             source,
         )
     })?;
@@ -1053,22 +1036,6 @@ async fn insert_genesis_rows(
     .map_err(|source| {
         WorkRepositoryError::insert(
             "insert initial graph revision",
-            WorkConflictResource::GraphRevision,
-            source,
-        )
-    })?;
-
-    query(
-        "INSERT INTO work_graph_sequences (owner_id, work_id, last_revision)
-         VALUES (?, ?, 1)",
-    )
-    .bind(owner_id)
-    .bind(work_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::insert(
-            "insert graph revision sequence",
             WorkConflictResource::GraphRevision,
             source,
         )

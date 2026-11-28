@@ -1220,11 +1220,6 @@ impl DatabaseWorkBranchDeletionService {
                  WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
             ),
             (
-                "delete branch subject",
-                "DELETE FROM work_branch_subjects
-                 WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
-            ),
-            (
                 "delete branch control operations",
                 "DELETE FROM work_branch_control_operations
                  WHERE owner_id = ? AND work_id = ? AND branch_id = ?",

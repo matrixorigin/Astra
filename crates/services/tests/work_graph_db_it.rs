@@ -252,7 +252,6 @@ async fn missing_item_reference_rolls_back_branch_and_revision_allocation() {
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
-    let initial_item_count = scalar_count(&pool, "work_items", &owner_id, &work_id).await;
     let initial_item_revision_count =
         scalar_count(&pool, "work_item_revisions", &owner_id, &work_id).await;
     let missing = WorkItemRevisionRef {
@@ -300,25 +299,19 @@ async fn missing_item_reference_rolls_back_branch_and_revision_allocation() {
             .expect("graph"),
         1
     );
-    let sequence: i64 = sqlx::query(
-        "SELECT last_revision FROM work_graph_sequences WHERE owner_id = ? AND work_id = ?",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("sequence")
-    .try_get("last_revision")
-    .expect("last revision");
+    let sequence: i64 =
+        sqlx::query("SELECT last_graph_revision FROM works WHERE owner_id = ? AND work_id = ?")
+            .bind(&owner_id)
+            .bind(&work_id)
+            .fetch_one(pool.get())
+            .await
+            .expect("sequence")
+            .try_get("last_graph_revision")
+            .expect("last revision");
     assert_eq!(sequence, 1);
     assert_eq!(
         scalar_count(&pool, "work_graph_revisions", &owner_id, &work_id).await,
         1
-    );
-    assert_eq!(
-        scalar_count(&pool, "work_items", &owner_id, &work_id).await,
-        initial_item_count,
-        "a rejected graph must not leave item identity residue"
     );
     assert_eq!(
         scalar_count(&pool, "work_item_revisions", &owner_id, &work_id).await,
@@ -414,16 +407,15 @@ async fn concurrent_same_branch_graph_changes_have_one_cas_winner_without_residu
     assert!(persisted_item_ids.iter().any(|id| id == "root"));
     assert!(persisted_item_ids.iter().any(|id| id == winning_item_id));
     assert!(!persisted_item_ids.iter().any(|id| id == losing_item_id));
-    let sequence: i64 = sqlx::query(
-        "SELECT last_revision FROM work_graph_sequences WHERE owner_id = ? AND work_id = ?",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("sequence")
-    .try_get("last_revision")
-    .expect("last revision");
+    let sequence: i64 =
+        sqlx::query("SELECT last_graph_revision FROM works WHERE owner_id = ? AND work_id = ?")
+            .bind(&owner_id)
+            .bind(&work_id)
+            .fetch_one(pool.get())
+            .await
+            .expect("sequence")
+            .try_get("last_graph_revision")
+            .expect("last revision");
     assert_eq!(
         sequence, 2,
         "losing CAS must roll back its allocated revision"

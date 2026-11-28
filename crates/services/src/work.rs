@@ -202,6 +202,7 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     current_goal_revision BIGINT NOT NULL,
     current_criteria_set_revision BIGINT NOT NULL,
     delivery_branch_id VARCHAR(64) NOT NULL,
+    last_graph_revision BIGINT NOT NULL DEFAULT 1,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     archived_at DATETIME(6) NULL,
@@ -210,6 +211,7 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     INDEX idx_works_owner_project_updated (owner_id, project_id, updated_at, work_id),
     INDEX idx_works_owner_created (owner_id, created_at, work_id),
     CONSTRAINT chk_works_revision CHECK (work_revision > 0),
+    CONSTRAINT chk_works_graph_revision CHECK (last_graph_revision > 0),
     CONSTRAINT chk_works_goal_revision CHECK (current_goal_revision > 0),
     CONSTRAINT chk_works_criteria_revision CHECK (current_criteria_set_revision > 0),
     CONSTRAINT chk_works_archive_order CHECK (archived_at IS NULL OR archived_at >= created_at)
@@ -296,25 +298,6 @@ pub(crate) const WORK_GRAPH_REVISIONS_CREATE_SQL: &str =
     CONSTRAINT chk_work_graph_patch CHECK ((patch_ref IS NULL) = (patch_hash IS NULL))
 )";
 
-pub(crate) const WORK_GRAPH_SEQUENCES_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_graph_sequences (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    last_revision BIGINT NOT NULL,
-    PRIMARY KEY (owner_id, work_id),
-    CONSTRAINT chk_work_graph_sequence CHECK (last_revision > 0)
-)";
-
-pub(crate) const WORK_ITEMS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work_items (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    item_id VARCHAR(64) NOT NULL,
-    last_revision BIGINT NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, item_id),
-    CONSTRAINT chk_work_item_last_revision CHECK (last_revision > 0)
-)";
-
 pub(crate) const WORK_ITEM_REVISIONS_CREATE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS work_item_revisions (
     owner_id VARCHAR(128) NOT NULL,
@@ -358,6 +341,14 @@ pub(crate) const WORK_BRANCHES_CREATE_SQL: &str =
     archived_at DATETIME(6) NULL,
     deletion_operation_id VARCHAR(64) NULL,
     deletion_requested_at DATETIME(6) NULL,
+    subject_record_revision BIGINT NULL,
+    subject_branch_revision BIGINT NULL,
+    subject_graph_revision BIGINT NULL,
+    subject_ref VARCHAR(256) NULL,
+    subject_revision CHAR(71) NULL,
+    subject_source_ref VARCHAR(256) NULL,
+    subject_created_at DATETIME(6) NULL,
+    subject_updated_at DATETIME(6) NULL,
     PRIMARY KEY (owner_id, work_id, branch_id),
     UNIQUE KEY uq_work_branches_session (owner_id, session_id),
     INDEX idx_work_branches_owner_work_updated (owner_id, work_id, updated_at, branch_id),
@@ -372,6 +363,18 @@ pub(crate) const WORK_BRANCHES_CREATE_SQL: &str =
     CONSTRAINT chk_work_branch_archive_order CHECK (archived_at IS NULL OR archived_at >= created_at),
     CONSTRAINT chk_work_branch_deletion_marker CHECK (
         (deletion_operation_id IS NULL) = (deletion_requested_at IS NULL)
+    ),
+    CONSTRAINT chk_work_branch_subject CHECK (
+        (subject_ref IS NULL) = (subject_record_revision IS NULL)
+        AND (subject_ref IS NULL) = (subject_branch_revision IS NULL)
+        AND (subject_ref IS NULL) = (subject_graph_revision IS NULL)
+        AND (subject_ref IS NULL) = (subject_revision IS NULL)
+        AND (subject_ref IS NULL) = (subject_source_ref IS NULL)
+        AND (subject_ref IS NULL) = (subject_created_at IS NULL)
+        AND (subject_ref IS NULL) = (subject_updated_at IS NULL)
+        AND (subject_ref IS NULL OR (
+            subject_record_revision > 0 AND subject_branch_revision > 0 AND subject_graph_revision > 0
+        ))
     )
 )";
 
@@ -573,31 +576,6 @@ pub(crate) const WORK_BRANCH_CREATION_OPERATIONS_CREATE_SQL: &str =
         (operation_state = 'pending' AND executor_token IS NOT NULL
          AND executor_lease_expires_at IS NOT NULL)
     )
-)";
-
-/// The single materialized target currently represented by a Work branch.
-///
-/// Workspace/materialization services continue to own the referenced content;
-/// this row only owns Work's selection of that immutable subject. Keeping one
-/// row per branch makes freshness checks constant-time and prevents long runs
-/// from accumulating mutable "current head" history.
-pub(crate) const WORK_BRANCH_SUBJECTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_branch_subjects (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    branch_id VARCHAR(64) NOT NULL,
-    subject_record_revision BIGINT NOT NULL,
-    branch_revision BIGINT NOT NULL,
-    graph_revision BIGINT NOT NULL,
-    subject_ref VARCHAR(256) NOT NULL,
-    subject_revision CHAR(71) NOT NULL,
-    source_ref VARCHAR(256) NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, branch_id),
-    CONSTRAINT chk_work_branch_subject_record_revision CHECK (subject_record_revision > 0),
-    CONSTRAINT chk_work_branch_subject_branch_revision CHECK (branch_revision > 0),
-    CONSTRAINT chk_work_branch_subject_graph_revision CHECK (graph_revision > 0)
 )";
 
 pub(crate) const WORK_PROPOSAL_SEQUENCES_CREATE_SQL: &str =
@@ -1105,8 +1083,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
     ),
     ("work_criterion_sets", WORK_CRITERION_SETS_CREATE_SQL),
     ("work_graph_revisions", WORK_GRAPH_REVISIONS_CREATE_SQL),
-    ("work_graph_sequences", WORK_GRAPH_SEQUENCES_CREATE_SQL),
-    ("work_items", WORK_ITEMS_CREATE_SQL),
     ("work_item_revisions", WORK_ITEM_REVISIONS_CREATE_SQL),
     ("work_branches", WORK_BRANCHES_CREATE_SQL),
     (
@@ -1121,7 +1097,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         "work_branch_deletion_operations",
         WORK_BRANCH_DELETION_OPERATIONS_CREATE_SQL,
     ),
-    ("work_branch_subjects", WORK_BRANCH_SUBJECTS_CREATE_SQL),
     (
         "work_proposal_sequences",
         WORK_PROPOSAL_SEQUENCES_CREATE_SQL,

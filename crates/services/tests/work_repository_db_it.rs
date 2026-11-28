@@ -193,11 +193,8 @@ async fn genesis_is_atomic_owner_scoped_and_materializes_real_roots() {
     );
     let root = sqlx::query(
         "SELECT r.item_kind, r.objective, r.expected_result, r.declaration_state, r.source_ref
-         FROM work_items i
-         JOIN work_item_revisions r
-           ON r.owner_id = i.owner_id AND r.work_id = i.work_id
-          AND r.item_id = i.item_id AND r.revision = 1
-         WHERE i.owner_id = ? AND i.work_id = ? AND i.item_id = 'root'",
+         FROM work_item_revisions r
+         WHERE r.owner_id = ? AND r.work_id = ? AND r.item_id = 'root' AND r.revision = 1",
     )
     .bind(&owner_id)
     .bind(&work_id)
@@ -306,10 +303,8 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
         "works",
         "work_goal_revisions",
         "work_criterion_sets",
-        "work_items",
         "work_item_revisions",
         "work_graph_revisions",
-        "work_graph_sequences",
         "work_branches",
         "work_proposal_sequences",
         "work_event_sequences",

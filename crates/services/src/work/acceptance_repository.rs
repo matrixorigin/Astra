@@ -98,9 +98,9 @@ async fn validate_basis(
             b.current_graph_revision,
             b.criteria_set_revision_ref AS branch_criteria_set_revision,
             CASE WHEN b.archived_at IS NULL THEN 0 ELSE 1 END AS branch_archived,
-            s.graph_revision AS subject_graph_revision,
-            s.subject_ref AS current_subject_ref,
-            s.subject_revision AS current_subject_revision,
+            b.subject_graph_revision,
+            b.subject_ref AS current_subject_ref,
+            b.subject_revision AS current_subject_revision,
             cs.member_manifest_json,
             cs.member_count
          FROM works w
@@ -112,10 +112,6 @@ async fn validate_basis(
            ON cs.owner_id = w.owner_id
           AND cs.work_id = w.work_id
           AND cs.revision = ?
-         LEFT JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id
-          AND s.work_id = b.work_id
-          AND s.branch_id = b.branch_id
          WHERE w.owner_id = ? AND w.work_id = ?
          LIMIT 1",
     )
@@ -570,16 +566,13 @@ pub(super) async fn accept_gaps(
            ON b.owner_id = w.owner_id
           AND b.work_id = w.work_id
           AND b.branch_id = ?
-         JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id
-          AND s.work_id = b.work_id
-          AND s.branch_id = b.branch_id
          WHERE w.owner_id = ? AND w.work_id = ?
            AND w.archived_at IS NULL AND b.archived_at IS NULL
            AND w.work_revision = ? AND w.current_goal_revision = ?
            AND w.current_criteria_set_revision = ?
            AND b.branch_revision = ? AND b.current_graph_revision = ?
-           AND s.graph_revision = ? AND s.subject_ref = ? AND s.subject_revision = ?",
+           AND b.subject_record_revision IS NOT NULL
+           AND b.subject_graph_revision = ? AND b.subject_ref = ? AND b.subject_revision = ?",
     )
     .bind(decision.owner_id.as_str())
     .bind(decision.work_id.as_str())

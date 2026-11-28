@@ -232,6 +232,14 @@ An attachment with a divergent manifest returns
 compatible attachment can then proceed through its normal authority checks.
 Fresh bootstrap declares 104 tables.
 
+Fresh schema contract v131 allocates graph revisions on the Work root during
+the existing plan-acceptance lock. New items establish identity with their
+first immutable declaration. Revised items use the accepted graph revision
+and retain the exact parent item revision. Each branch stores its selected
+result on the branch row and updates its branch revision in the same write.
+The existing Work event records the change. Fresh bootstrap declares
+101 tables, including 24 Work tables.
+
 ## Session-memory recovery journal
 
 Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed
