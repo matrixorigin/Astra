@@ -175,7 +175,7 @@ pub struct NewWorkItem {
 
 /// One immutable replacement revision for an existing Work item. The current
 /// graph must contain `expected_revision`; applying the graph change creates
-/// exactly its successor and never edits the previous declaration in place.
+/// a new immutable revision at the committed graph revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkItemRevisionChange {
     pub item_id: WorkItemId,
@@ -184,9 +184,8 @@ pub struct WorkItemRevisionChange {
     pub objective: WorkItemText,
     pub expected_result: WorkItemText,
     pub declaration_state: WorkItemDeclarationState,
-    /// Assigned under the WorkItem identity row lock. It is deliberately not
-    /// part of the proposal payload because sibling branches may allocate
-    /// different successors from the same parent revision.
+    /// The committed graph revision supplies the new declaration identity.
+    /// Sibling branches can revise the same prior declaration independently.
     #[serde(skip)]
     pub(crate) result_revision: Option<WorkItemRevision>,
 }

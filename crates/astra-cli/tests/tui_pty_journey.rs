@@ -4349,7 +4349,11 @@ async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
             assert!(context.contains("first objective"), "{context}");
         }
         mock.release_held_response();
-        astra.wait_for(&format!("turn {}", index + 1), UI_TRANSITION_TIMEOUT);
+        let completed_turn = format!("turn {}", index + 1);
+        // A streamed reply can appear while the composer still routes input as guidance.
+        astra.wait_for_screen("plan turn settled", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains(&completed_turn) && screen.contains("Ctrl+T tasks · / commands")
+        });
     }
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());

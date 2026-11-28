@@ -211,7 +211,7 @@ fn mark_provider_attempt_context_expired_query(
     query
 }
 
-/// Keep a request-diagnostic scope bounded after appending an event.
+/// Prune a request-diagnostic scope after a guarded terminal append found it full.
 ///
 /// The event rows are diagnostic observability, not user-visible conversation
 /// history. Complete attempts are pruned as accepted/terminal pairs. If the
@@ -222,27 +222,6 @@ pub(crate) async fn compact_model_request_context_scope(
     user_id: &str,
     session_id: &str,
 ) -> ServiceResult<u64> {
-    let over_limit = sqlx::query_scalar::<_, String>(
-        "SELECT event_id FROM model_request_context_events
-         WHERE user_id = ? AND session_id = ? LIMIT 1 OFFSET ?",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "probe model request context scope retention",
-            error,
-        )
-    })?;
-
-    if over_limit.is_none() {
-        return Ok(0);
-    }
-
     let mut query = QueryBuilder::<MySql>::new(
         "SELECT context.attempt_id FROM model_request_context_events context",
     );
@@ -486,9 +465,6 @@ pub struct ModelRequestContextSeed {
     /// auxiliary subject cannot be retried by moving to another provider round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_round: Option<u32>,
-    /// Catalog-provided family used for low-cardinality aggregation. It is
-    /// never inferred by substring matching the provider model name.
-    pub model_family: Option<String>,
     pub actor_id: Option<String>,
     pub execution_principal: Option<String>,
     pub billing_scope: Option<String>,
@@ -513,7 +489,6 @@ impl ModelRequestContextSeed {
             topology: ModelRequestTopology::ServerOnly,
             rollout_stage: ModelRequestRolloutStage::Shadow,
             execution_round: None,
-            model_family: None,
             actor_id: None,
             execution_principal: None,
             billing_scope: None,
@@ -832,21 +807,6 @@ pub struct ModelRequestContextRecord {
     pub created_at: chrono::NaiveDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelRequestMetricsRow {
-    pub topology: String,
-    pub provider: String,
-    pub model_family: String,
-    pub purpose: String,
-    pub terminal_status: String,
-    pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRequestTraceCoverage {
@@ -865,17 +825,6 @@ fn non_negative_u64(value: i64, column: &'static str) -> ServiceResult<u64> {
             "model request context column {column} is negative: {value}"
         ))
     })
-}
-
-fn row_non_negative_u64(row: &sqlx::mysql::MySqlRow, column: &'static str) -> ServiceResult<u64> {
-    let value = row.try_get::<i64, _>(column).map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            format!("decode model request context column {column}"),
-            error,
-        )
-    })?;
-    non_negative_u64(value, column)
 }
 
 fn row_string(row: &sqlx::mysql::MySqlRow, column: &'static str) -> ServiceResult<String> {
@@ -1083,50 +1032,6 @@ pub async fn list_model_request_context_events(
         })
     }
     Ok(records)
-}
-
-/// Low-cardinality database projection suitable for metrics/dashboard
-/// scrapers. Model family is an explicit catalog fact, never parsed from a
-/// model name.
-pub async fn aggregate_model_request_metrics(
-    pool: &SharedPool,
-) -> ServiceResult<Vec<ModelRequestMetricsRow>> {
-    let rows = sqlx::query(
-        "SELECT topology, provider, model_family, purpose, terminal_status,
-                CAST(COALESCE(SUM(requests), 0) AS SIGNED) AS requests,
-                CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS input_tokens,
-                CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS output_tokens,
-                CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS cache_read_tokens,
-                CAST(COALESCE(SUM(cache_creation_tokens), 0) AS SIGNED) AS cache_creation_tokens
-         FROM model_request_metric_shards
-         GROUP BY topology, provider, model_family, purpose, terminal_status
-         ORDER BY topology, provider, model_family, purpose, terminal_status",
-    )
-    .fetch_all(pool.get())
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "aggregate model request context metrics",
-            error,
-        )
-    })?;
-    rows.into_iter()
-        .map(|row| -> ServiceResult<ModelRequestMetricsRow> {
-            Ok(ModelRequestMetricsRow {
-                topology: row_string(&row, "topology")?,
-                provider: row_string(&row, "provider")?,
-                model_family: row_string(&row, "model_family")?,
-                purpose: row_string(&row, "purpose")?,
-                terminal_status: row_string(&row, "terminal_status")?,
-                requests: row_non_negative_u64(&row, "requests")?,
-                input_tokens: row_non_negative_u64(&row, "input_tokens")?,
-                output_tokens: row_non_negative_u64(&row, "output_tokens")?,
-                cache_read_tokens: row_non_negative_u64(&row, "cache_read_tokens")?,
-                cache_creation_tokens: row_non_negative_u64(&row, "cache_creation_tokens")?,
-            })
-        })
-        .collect()
 }
 
 pub async fn model_request_trace_coverage(

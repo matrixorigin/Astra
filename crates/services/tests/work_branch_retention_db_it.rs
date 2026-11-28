@@ -186,15 +186,16 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     )
     .await;
     sqlx::query(
-        "INSERT INTO work_branch_subjects
-         (owner_id, work_id, branch_id, subject_record_revision, branch_revision,
-          graph_revision, subject_ref, subject_revision, source_ref, created_at, updated_at)
-         VALUES (?, ?, ?, 1, 1, 1, 'workspace:test', ?, 'test-subject', NOW(6), NOW(6))",
+        "UPDATE work_branches
+         SET subject_record_revision = 1, subject_branch_revision = 1, subject_graph_revision = 1,
+             subject_ref = 'workspace:test', subject_revision = ?, subject_source_ref = 'test-subject',
+             subject_created_at = NOW(6), subject_updated_at = NOW(6)
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
     )
+    .bind(format!("sha256:{}", "a".repeat(64)))
     .bind(&owner_id)
     .bind(&work_id)
     .bind(&branch_id)
-    .bind(format!("sha256:{}", "a".repeat(64)))
     .execute(pool.get())
     .await
     .expect("seed branch-owned subject");
@@ -621,9 +622,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                 (SELECT COUNT(*) FROM work_branches b
                  WHERE b.owner_id = w.owner_id AND b.work_id = w.work_id
                    AND b.branch_id = ?) AS branch_rows,
-                (SELECT COUNT(*) FROM work_branch_subjects s
-                 WHERE s.owner_id = w.owner_id AND s.work_id = w.work_id
-                   AND s.branch_id = ?) AS subject_rows,
                 (SELECT COUNT(*) FROM work_proposal_sequences p
                  WHERE p.owner_id = w.owner_id AND p.work_id = w.work_id
                    AND p.branch_id = ?) AS proposal_sequence_rows,
@@ -639,7 +637,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     .bind(&branch_id)
     .bind(&branch_id)
     .bind(&branch_id)
-    .bind(&branch_id)
     .bind(&owner_id)
     .bind(&work_id)
     .fetch_one(pool.get())
@@ -650,7 +647,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         delivery_branch_id
     );
     assert_eq!(terminal.try_get::<i64, _>("branch_rows").unwrap(), 0);
-    assert_eq!(terminal.try_get::<i64, _>("subject_rows").unwrap(), 0);
     assert_eq!(
         terminal
             .try_get::<i64, _>("proposal_sequence_rows")

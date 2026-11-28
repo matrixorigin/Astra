@@ -31,20 +31,9 @@ pub struct WorkCatalogEntryV1 {
     pub graph_item_count: u16,
     pub pending_decision_count: u16,
     pub event_head: u64,
-    pub seen_through_event_seq: Option<u64>,
-    pub unseen_event_count: u64,
-    pub attention: WorkCatalogAttentionV1,
     pub delivery_branch_activity: astra_server_types::WorkBranchActivityV1,
     pub created_at: String,
     pub last_activity_at: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkCatalogAttentionV1 {
-    NeedsReview,
-    Updated,
-    None,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -97,26 +86,6 @@ impl WorkCatalogPageV1 {
                 || entry.event_head == 0
             {
                 return Err("Work catalog contains a non-positive revision".into());
-            }
-            if entry
-                .seen_through_event_seq
-                .is_some_and(|seen| seen > entry.event_head)
-                || entry.unseen_event_count
-                    != entry
-                        .event_head
-                        .saturating_sub(entry.seen_through_event_seq.unwrap_or(0))
-            {
-                return Err("Work catalog event cursors disagree".into());
-            }
-            let expected_attention = if entry.pending_decision_count > 0 {
-                WorkCatalogAttentionV1::NeedsReview
-            } else if entry.unseen_event_count > 0 {
-                WorkCatalogAttentionV1::Updated
-            } else {
-                WorkCatalogAttentionV1::None
-            };
-            if entry.attention != expected_attention {
-                return Err("Work catalog attention disagrees with event facts".into());
             }
             let created = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
                 .map_err(|_| "Work catalog has an invalid creation timestamp".to_string())?;

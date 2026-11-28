@@ -753,26 +753,6 @@ and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
 
-The collision-receipt test separates the normal database contract from scale
-diagnostics. Its normal workload processes 1,024 distinct conflicting payloads
-through the bounded batch writer, plus concurrent single-receipt checks. To run
-1,024 independent transactions contending on one identity, opt in explicitly:
-
-```bash
-# Use a dedicated test database and credentials from your environment/.env.
-ASTRA_TEST_DB_IT=1 ASTRA_TEST_STORAGE_SCALE=1 \
-cargo nextest run -p astra-services --test observation_capture_db_it \
-  --run-ignored all --profile strict-online-ci --test-threads 1 \
-  --success-output immediate \
-  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners)'
-```
-
-The scale mode retains the same 60-second online hard deadline and fails on timeout;
-it is not enabled by ordinary integration CI. Keep source, database, machine,
-test profile and workload identical for before/after comparisons. A same-row
-contention result is not a multi-session capacity result; batching does not
-remove contention between independent transactions on the same identity.
-
 For a short batching tradeoff comparison, run the ignored
 `ingestion_batch_tradeoff_db_it` test against a dedicated disposable database.
 Enable `--features capacity-probes` explicitly; it is not part of the ordinary

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,18 @@ class SchemaInventoryTest(unittest.TestCase):
             "duplicate manifest source paths must not be hidden by set comparison",
         )
 
+    def test_core_schema_create_registrations_are_inventoried(self) -> None:
+        storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
+            encoding="utf-8",
+        )
+        registered = set(re.findall(r'core_schema_create!\(\s*pool,\s*"([a-z0-9_]+)"', storage))
+        self.assertTrue(registered)
+        self.assertEqual(
+            sorted(registered - self.tables.keys()),
+            [],
+            "core bootstrap tables must appear in the schema inventory",
+        )
+
     def test_runtime_admission_ddl_after_test_helper_is_inventoried(self) -> None:
         source = next(
             source
@@ -131,14 +144,11 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_graph_revisions",
-            "work_graph_sequences",
-            "work_items",
             "work_item_revisions",
             "work_branches",
             "work_branch_creation_operations",
             "work_branch_control_operations",
             "work_branch_deletion_operations",
-            "work_branch_subjects",
             "work_proposal_sequences",
             "work_proposals",
             "work_proposal_trigger_attempts",
@@ -146,7 +156,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_acceptance_decisions",
             "work_current_gap_acceptances",
             "work_event_sequences",
-            "work_attention_receipts",
             "work_item_attempts",
             "work_terminal_cuts",
             "work_events",
@@ -158,7 +167,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(28, len(actual))
+        self.assertEqual(24, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
@@ -173,7 +182,7 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_work_metadata_locks_authority_boundaries(self) -> None:
         self.assertIn("current pointers", self.tables["works"]["merge_guidance"])
         self.assertIn("immutable", self.tables["work_goal_revisions"]["state_class"])
-        self.assertIn("ordering authority", self.tables["work_graph_sequences"]["rebuildability"])
+        self.assertIn("ordering authority", self.tables["works"]["rebuildability"])
         self.assertIn("idempotency/recovery", self.tables["work_branch_control_operations"]["merge_guidance"])
         self.assertIn("evidence", self.tables["work_check_runs"]["merge_guidance"])
         self.assertIn("canonical history", self.tables["work_events"]["state_class"])
@@ -233,8 +242,8 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("reservation", heads["merge_guidance"])
         self.assertIn("fencing", heads["merge_guidance"])
 
-        subjects = self.tables["work_branch_subjects"]
-        self.assertIn("branch-selected immutable subject authority", subjects["state_class"])
+        subjects = self.tables["work_branches"]
+        self.assertIn("branch-selected immutable subject authority", subjects["merge_guidance"])
         self.assertIn("workspace/materialization", subjects["rebuildability"])
         self.assertNotIn("rebuildable from the current branch/work declarations", subjects["rebuildability"])
 
@@ -395,7 +404,6 @@ fn char_literal() { let slash = '/'; }
             "run_checkpoints",
             "session_transcript_items",
             "tool_invocation_ledger",
-            "semantic_read_observations",
         }
         for table in first_batch:
             with self.subTest(table=table):
@@ -845,6 +853,7 @@ fn char_literal() { let slash = '/'; }
         for table in (
             "conversation_log", "skill_selection_events", "infra_sandbox_metadata",
             "skill_metrics", "session_checkpoints", "mcp_tools", "skill_user_credentials",
+            "inference_routes", "observation_identity_collisions",
         ):
             self.assertNotIn(table, self.tables)
 

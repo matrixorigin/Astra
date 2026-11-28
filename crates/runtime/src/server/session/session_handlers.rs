@@ -1298,6 +1298,7 @@ pub(crate) async fn update_session_handler(
     Json(request): Json<SessionUpdateRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let finalizing = request.status.as_deref() == Some("closed");
     let session = state
         .session_service
         .update_session(
@@ -1311,6 +1312,9 @@ pub(crate) async fn update_session_handler(
             },
         )
         .await?;
+    if finalizing {
+        state.session_memory_wakeup.notify_one();
+    }
     Ok(Json(SessionResponse::from(session)))
 }
 
@@ -1849,8 +1853,7 @@ pub(crate) async fn close_session_handler(
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
-    // The close transaction durably enqueued memory work; the managed recovery
-    // task owns dispatch and shutdown rather than an untracked detached task.
+    state.session_memory_wakeup.notify_one();
     Ok(Json(SessionResponse::from(session)))
 }
 
@@ -1922,7 +1925,7 @@ pub(crate) async fn finalize_session_memory_handler(
         .request_finalization(&user.user_id, &session_id)
         .await
         .map_err(|error| error_response(StatusCode::CONFLICT, error))?;
-    // Recovery polls this durable handoff independently of the CLI process.
+    state.session_memory_wakeup.notify_one();
     Ok(Json(
         serde_json::json!({"accepted":true, "session_id":session_id, "status":"queued"}),
     ))

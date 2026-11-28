@@ -3,13 +3,13 @@ use super::{
     CriterionSetRevision, GoalRevision, GraphRevision, InternalSessionId,
     NewWorkAcceptanceDecision, NewWorkCheckRun, NewWorkPlanProposal, OriginalIntentRef, ProjectId,
     RecordedWorkAcceptanceDecision, RecordedWorkCheckRun, RecordedWorkPlanProposal,
-    WorkAttentionCursorAdvance, WorkAttentionReceipt, WorkBranchBasisChange, WorkBranchId,
-    WorkBranchRecord, WorkBranchRecordParts, WorkBranchRevision, WorkBranchSubject,
-    WorkBranchSubjectChange, WorkChangeReason, WorkChangeRef, WorkCriteriaChange, WorkDomainError,
-    WorkEventPage, WorkEventQuery, WorkGoal, WorkId, WorkItemRevisionRef, WorkObservationQuery,
-    WorkObservationReport, WorkOwnerId, WorkPlanContext, WorkPlanProposalAcceptance,
-    WorkProposalStatus, WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding,
-    WorkTaskExecutionSnapshot, WorkTaskGraphPage, WorkTaskGraphQuery,
+    WorkBranchBasisChange, WorkBranchId, WorkBranchRecord, WorkBranchRecordParts,
+    WorkBranchRevision, WorkBranchSubject, WorkBranchSubjectChange, WorkChangeReason,
+    WorkChangeRef, WorkCriteriaChange, WorkDomainError, WorkEventPage, WorkEventQuery, WorkGoal,
+    WorkId, WorkItemRevisionRef, WorkObservationQuery, WorkObservationReport, WorkOwnerId,
+    WorkPlanContext, WorkPlanProposalAcceptance, WorkProposalStatus, WorkRecord, WorkRecordParts,
+    WorkRevision, WorkSessionPlanBinding, WorkTaskExecutionSnapshot, WorkTaskGraphPage,
+    WorkTaskGraphQuery,
 };
 use astra_core::SharedPool;
 use async_trait::async_trait;
@@ -38,7 +38,6 @@ pub enum WorkConflictResource {
     AcceptanceDecisionIdentity,
     WorkEventSequence,
     WorkEventIdentity,
-    WorkAttentionReceipt,
     WorkProposalIdentity,
     RecoveryPointIdentity,
     RecoveryPointRequest,
@@ -251,7 +250,7 @@ pub enum WorkRepositoryError {
     #[error("acceptance decision references missing verifier runs: {missing:?}")]
     MissingAcceptanceCheckRuns { missing: Vec<CheckRunId> },
     #[error(
-        "Work attention cursor {through_event_seq} is ahead of the committed event head {event_head}"
+        "Work event cursor {through_event_seq} is ahead of the committed event head {event_head}"
     )]
     EventCursorAhead {
         through_event_seq: i64,
@@ -590,11 +589,6 @@ pub trait WorkRepository: Send + Sync {
         &self,
         decision: NewWorkAcceptanceDecision,
     ) -> Result<RecordedWorkAcceptanceDecision, WorkRepositoryError>;
-
-    async fn advance_attention_cursor(
-        &self,
-        advance: WorkAttentionCursorAdvance,
-    ) -> Result<WorkAttentionReceipt, WorkRepositoryError>;
 
     async fn list_events(
         &self,
@@ -1003,23 +997,6 @@ async fn insert_genesis_rows(
     })?;
 
     query(
-        "INSERT INTO work_items (owner_id, work_id, item_id, last_revision)
-         VALUES (?, ?, ?, 1)",
-    )
-    .bind(owner_id)
-    .bind(work_id)
-    .bind(genesis.root_item.item_id.as_str())
-    .execute(&mut **transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::insert(
-            "insert root WorkItem identity",
-            WorkConflictResource::WorkItemIdentity,
-            source,
-        )
-    })?;
-
-    query(
         "INSERT INTO work_item_revisions
          (owner_id, work_id, item_id, revision, parent_revision, item_kind, objective,
           expected_result, declaration_state, source_ref)
@@ -1037,7 +1014,7 @@ async fn insert_genesis_rows(
     .map_err(|source| {
         WorkRepositoryError::insert(
             "insert root WorkItem revision",
-            WorkConflictResource::WorkItemRevision,
+            WorkConflictResource::WorkItemIdentity,
             source,
         )
     })?;
@@ -1059,22 +1036,6 @@ async fn insert_genesis_rows(
     .map_err(|source| {
         WorkRepositoryError::insert(
             "insert initial graph revision",
-            WorkConflictResource::GraphRevision,
-            source,
-        )
-    })?;
-
-    query(
-        "INSERT INTO work_graph_sequences (owner_id, work_id, last_revision)
-         VALUES (?, ?, 1)",
-    )
-    .bind(owner_id)
-    .bind(work_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::insert(
-            "insert graph revision sequence",
             WorkConflictResource::GraphRevision,
             source,
         )
@@ -1133,12 +1094,6 @@ async fn insert_genesis_rows(
             graph_revision: Some(GraphRevision::INITIAL),
             source_ref: genesis_source,
         },
-    )
-    .await?;
-    super::attention_repository::insert_genesis_receipt(
-        transaction,
-        &genesis.owner_id,
-        &genesis.work_id,
     )
     .await?;
     super::runtime_event_outbox::insert_genesis_slot(
@@ -1980,13 +1935,6 @@ impl WorkRepository for DatabaseWorkRepository {
         decision: NewWorkAcceptanceDecision,
     ) -> Result<RecordedWorkAcceptanceDecision, WorkRepositoryError> {
         super::acceptance_repository::accept_gaps(self, decision).await
-    }
-
-    async fn advance_attention_cursor(
-        &self,
-        advance: WorkAttentionCursorAdvance,
-    ) -> Result<WorkAttentionReceipt, WorkRepositoryError> {
-        super::attention_repository::advance_cursor(self, advance).await
     }
 
     async fn list_events(

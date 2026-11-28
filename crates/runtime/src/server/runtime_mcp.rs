@@ -110,7 +110,11 @@ impl RuntimeMcpBundle {
     ) -> Result<crate::server::runtime_tool_executor::SemanticReadCacheActivation, String> {
         executor.configure_semantic_read_cache(
             self.semantic_read_capabilities.clone(),
-            astra_turn_types::SemanticReadCacheLimits::default(),
+            astra_turn_types::SemanticReadCacheLimits {
+                max_ready_entries: 64,
+                max_ready_bytes: 2 * 1024 * 1024,
+                max_in_flight_fills: 8,
+            },
         )
     }
 }

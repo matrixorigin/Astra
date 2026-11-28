@@ -160,7 +160,6 @@ pub struct WorkEventPage {
     pub next_after_event_seq: Option<WorkEventSeq>,
     pub event_head: WorkEventSeq,
     pub retained_from_event_seq: WorkEventSeq,
-    pub seen_through_event_seq: Option<WorkEventSeq>,
     pub coverage: WorkEventCoverage,
     pub has_more: bool,
     pub events: Vec<WorkEventRecord>,

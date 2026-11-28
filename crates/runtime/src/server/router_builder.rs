@@ -8,6 +8,7 @@ mod realtime;
 mod sessions;
 
 pub(super) fn build_router(state: AppState) -> Router {
+    super::completions::register_metrics(&state.metrics_registry);
     let router: Router<AppState> = Router::new();
     let router = realtime::add_routes(router);
     let router = sessions::add_routes(router);

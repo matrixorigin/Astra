@@ -5,54 +5,93 @@ use astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore;
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+const ACTIVE_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const IDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
 pub(crate) fn spawn_session_memory_recovery(
     state: AppState,
     cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(pool) = state.shared_pool.clone() else {
-            return;
-        };
-        let store = SessionMemoryLifecycleStore::new(pool);
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! { _ = cancel.cancelled() => break, _ = interval.tick() => {} }
-            let due = match store.list_due(16).await {
-                Ok(due) => due,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let pool = state.shared_pool.clone()?;
+    state.auth_service.memoria_credentials()?;
+    let store = SessionMemoryLifecycleStore::new(pool);
+    Some(tokio::spawn(async move {
+        while !cancel.is_cancelled() {
+            let scan_started = tokio::time::Instant::now();
+            let earliest_scan = scan_started + ACTIVE_RECOVERY_INTERVAL;
+            let idle_deadline = scan_started + IDLE_RECOVERY_INTERVAL;
+            let (due, next_scan) = match store
+                .scan_recovery(16, IDLE_RECOVERY_INTERVAL.as_secs())
+                .await
+            {
+                Ok(scan) if scan.due.is_empty() => {
+                    let next_scan = scan.retry_after.map_or(idle_deadline, |delay| {
+                        (tokio::time::Instant::now() + delay).min(idle_deadline)
+                    });
+                    (scan.due, next_scan)
+                }
+                Ok(scan) => (scan.due, earliest_scan),
                 Err(error) => {
                     tracing::warn!(%error, "session memory recovery scan failed");
-                    continue;
+                    (Vec::new(), earliest_scan)
                 }
             };
             use futures_util::{StreamExt, stream};
-            stream::iter(due).for_each_concurrent(2, |(user, session)| {
-                let state = state.clone();
-                let cancel = cancel.clone();
-                async move {
+            let state = &state;
+            let store = &store;
+            let cancel = &cancel;
+            stream::iter(due)
+                .for_each_concurrent(2, |(user, session)| async move {
                     tokio::select! {
                         _ = cancel.cancelled() => {},
-                        result = drive_session_memory_work(&state, &user, &session) => {
-                            if let Err(error) = result { tracing::warn!(session_id = session, %error, "session memory recovery remains pending"); }
+                        result = drive_session_memory_work(state, store, &user, &session) => {
+                            if let Err(error) = result {
+                                tracing::warn!(session_id = session, %error, "session memory recovery remains pending");
+                            }
                         }
                     }
-                }
-            }).await;
+                })
+                .await;
+            if !wait_for_recovery_scan(
+                &state.session_memory_wakeup,
+                cancel,
+                earliest_scan,
+                next_scan,
+            )
+            .await
+            {
+                break;
+            }
         }
-    })
+    }))
+}
+
+async fn wait_for_recovery_scan(
+    wakeup: &tokio::sync::Notify,
+    cancel: &CancellationToken,
+    earliest_scan: tokio::time::Instant,
+    next_scan: tokio::time::Instant,
+) -> bool {
+    // A local commit may advance the deadline to the existing scan floor.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        _ = async {
+            tokio::select! {
+                _ = wakeup.notified() => {},
+                _ = tokio::time::sleep_until(next_scan) => {},
+            }
+            tokio::time::sleep_until(earliest_scan).await;
+        } => true,
+    }
 }
 
 pub(crate) async fn drive_session_memory_work(
     state: &AppState,
+    store: &SessionMemoryLifecycleStore,
     user: &str,
     session: &str,
 ) -> Result<(), String> {
-    let store = SessionMemoryLifecycleStore::new(
-        state
-            .shared_pool
-            .clone()
-            .ok_or("durable memory storage is unavailable")?,
-    );
     let Some(claim) = store.claim(user, session).await? else {
         return Ok(());
     };
@@ -164,5 +203,64 @@ pub(crate) async fn drive_session_memory_work(
             store.release(&claim, false).await?;
             Err("durable session memory attempt deadline exceeded".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_recovery_bounds_local_hints_and_keeps_retry_deadlines() {
+        use tokio::time::Instant;
+
+        let wakeup = tokio::sync::Notify::new();
+        let cancel = CancellationToken::new();
+
+        let start = Instant::now();
+        for _ in 0..3 {
+            let scan = Instant::now();
+            wakeup.notify_one();
+            assert!(
+                wait_for_recovery_scan(
+                    &wakeup,
+                    &cancel,
+                    scan + ACTIVE_RECOVERY_INTERVAL,
+                    scan + IDLE_RECOVERY_INTERVAL,
+                )
+                .await
+            );
+        }
+        assert_eq!(start.elapsed(), ACTIVE_RECOVERY_INTERVAL * 3);
+
+        for delay in [
+            ACTIVE_RECOVERY_INTERVAL,
+            Duration::from_secs(5),
+            IDLE_RECOVERY_INTERVAL,
+        ] {
+            let scan = Instant::now();
+            assert!(
+                wait_for_recovery_scan(
+                    &wakeup,
+                    &cancel,
+                    scan + ACTIVE_RECOVERY_INTERVAL,
+                    scan + delay
+                )
+                .await
+            );
+            assert_eq!(scan.elapsed(), delay);
+        }
+
+        cancel.cancel();
+        let scan = Instant::now();
+        assert!(
+            !wait_for_recovery_scan(
+                &wakeup,
+                &cancel,
+                scan + ACTIVE_RECOVERY_INTERVAL,
+                scan + IDLE_RECOVERY_INTERVAL,
+            )
+            .await
+        );
     }
 }

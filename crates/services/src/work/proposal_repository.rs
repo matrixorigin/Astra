@@ -333,12 +333,12 @@ async fn validate_basis(
     let mut collisions = BTreeSet::new();
     if !addition_ids.is_empty() {
         let mut builder =
-            QueryBuilder::<MySql>::new("SELECT item_id FROM work_items WHERE owner_id = ");
+            QueryBuilder::<MySql>::new("SELECT item_id FROM work_item_revisions WHERE owner_id = ");
         builder
             .push_bind(proposal.owner_id.as_str())
             .push(" AND work_id = ")
             .push_bind(proposal.work_id.as_str())
-            .push(" AND item_id IN (");
+            .push(" AND revision = 1 AND item_id IN (");
         let mut separated = builder.separated(", ");
         for item_id in addition_ids {
             separated.push_bind(item_id);

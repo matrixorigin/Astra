@@ -136,7 +136,24 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
         .expect("same immutable target is a semantic no-op");
     assert_eq!(no_op, winner);
 
-    let invalidation = WorkBranchSubjectInvalidation {
+    // A later branch update can leave the selected result pinned to its older basis.
+    let newer_branch_revision = winner
+        .branch_revision
+        .checked_next()
+        .expect("new branch basis");
+    sqlx::query(
+        "UPDATE work_branches SET branch_revision = ?
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+    )
+    .bind(newer_branch_revision.get())
+    .bind(&owner_id)
+    .bind(&work_id)
+    .bind(&branch_id)
+    .execute(pool.get())
+    .await
+    .expect("advance branch basis while retaining its earlier subject");
+
+    let old_basis = WorkBranchSubjectInvalidation {
         owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
         work_id: WorkId::parse(&work_id).expect("work"),
         branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
@@ -144,13 +161,23 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
         graph_revision: GraphRevision::INITIAL,
         source_ref: WorkChangeRef::parse(common::id("execution-boundary")).expect("source"),
     };
+    assert!(matches!(
+        repository
+            .invalidate_branch_subject(old_basis.clone())
+            .await,
+        Err(WorkRepositoryError::StaleSubjectBasis { .. })
+    ));
+    let invalidation = WorkBranchSubjectInvalidation {
+        expected_branch_revision: newer_branch_revision,
+        ..old_basis
+    };
     let invalidated_revision = repository
         .invalidate_branch_subject(invalidation.clone())
         .await
-        .expect("invalidate exact subject before execution");
+        .expect("clear the earlier subject from the current branch before execution");
     assert_eq!(
         invalidated_revision,
-        WorkBranchRevision::new(3).expect("branch r3")
+        WorkBranchRevision::new(4).expect("branch r4")
     );
     assert_eq!(
         repository
@@ -183,7 +210,7 @@ async fn concurrent_subject_cas_has_one_winner_and_exact_replays_are_noops() {
     .expect("branch")
     .try_get("branch_revision")
     .expect("revision");
-    assert_eq!(branch_revision, 3, "replays must not churn branch revision");
+    assert_eq!(branch_revision, 4, "replays must not churn branch revision");
     let events: Vec<String> = sqlx::query_scalar(
         "SELECT event_kind FROM work_events
          WHERE owner_id = ? AND work_id = ? ORDER BY event_seq",

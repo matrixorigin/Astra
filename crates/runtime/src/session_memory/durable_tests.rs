@@ -525,6 +525,12 @@ async fn public_exit_close_and_status_routes_preserve_ownership_and_durable_hand
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["accepted"], true);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.session_memory_wakeup.notified(),
+    )
+    .await
+    .expect("finalize must wake idle recovery after committing");
     assert_eq!(
         sessions
             .get_session(f.session.clone(), f.user.clone())
@@ -551,9 +557,17 @@ async fn public_exit_close_and_status_routes_preserve_ownership_and_durable_hand
             .status,
         "closed"
     );
-    crate::server::session_memory_runtime::drive_session_memory_work(&state, &f.user, &f.session)
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.session_memory_wakeup.notified(),
+    )
+    .await
+    .expect("close must wake idle recovery after committing");
+    crate::server::session_memory_runtime::drive_session_memory_work(
+        &state, &f.store, &f.user, &f.session,
+    )
+    .await
+    .unwrap();
     let request = Request::builder()
         .uri(format!("/sessions/{}/memory/status", f.session))
         .header("authorization", format!("Bearer {}", tokens.access_token))

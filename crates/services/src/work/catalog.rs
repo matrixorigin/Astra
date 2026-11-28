@@ -42,14 +42,6 @@ pub struct WorkCatalogQuery {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkCatalogAttention {
-    NeedsReview,
-    Updated,
-    None,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum WorkBranchActivity {
     Working,
     Waiting,
@@ -82,9 +74,6 @@ pub struct WorkCatalogEntry {
     pub graph_item_count: u16,
     pub pending_decision_count: u16,
     pub event_head: WorkEventSeq,
-    pub seen_through_event_seq: Option<WorkEventSeq>,
-    pub unseen_event_count: u64,
-    pub attention: WorkCatalogAttention,
     pub delivery_branch_activity: WorkBranchActivity,
     pub created_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,

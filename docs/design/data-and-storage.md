@@ -199,6 +199,47 @@ The standalone Agent configuration catalog and its CRUD service are retired.
 Edge registration, heartbeat, AgentBindings and Run execution retain their
 canonical owners; no replacement Agent metadata projection is stored.
 
+## Optional database projections
+
+Fresh schema contract `2026-11-27-v128` removes the model request metric
+shards, eight metric-only request-context columns, two unused request-context
+indexes, and the semantic read observation and budget tables. Inference
+settlement and recovery write canonical evidence without an aggregate upsert.
+The dashboard reads existing process-local counters. Exact historical usage
+queries retain their Run and inference ledger sources.
+
+The existing executor-local cache owns optional MCP pure-read reuse. A hit
+completes the exact invocation through the tool ledger. A fill uses the
+confirmed terminal record returned by settlement and the provider's
+acknowledgement of the exact read condition. Both cache operations use local
+memory. Ending the executor releases its cache. Session deletion has no
+cache-table cleanup. A v127 database requires replacement under the existing
+fresh-schema contract.
+
+Fresh schema contract v129 stores the immutable admitted route and price
+on the invocation row. Admission writes both together and session audit reads
+the historical price from that row. Physical attempts retain their own
+delivery and usage records. Event identity collisions use the original
+event's hash and emit structured diagnostics. Fresh bootstrap declares
+106 tables.
+
+Fresh schema contract v130 retires Work read receipts and attachment
+quarantines. Event pages read the current head, retention boundary, and
+bounded event slice together. Browsing Work uses read-only activity and
+event queries. The Work event sequence owns event allocation.
+An attachment with a divergent manifest returns
+`fork_required` directly from the manifest read. An explicit fork or a
+compatible attachment can then proceed through its normal authority checks.
+Fresh bootstrap declares 104 tables.
+
+Fresh schema contract v131 allocates graph revisions on the Work root during
+the existing plan-acceptance lock. New items establish identity with their
+first immutable declaration. Revised items use the accepted graph revision
+and retain the exact parent item revision. Each branch stores its selected
+result on the branch row and updates its branch revision in the same write.
+The existing Work event records the change. Fresh bootstrap declares
+101 tables, including 24 Work tables.
+
 ## Session-memory recovery journal
 
 Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed
@@ -211,6 +252,12 @@ its queued inputs through the existing deletion catalog.
 Ordinary turns create no memory-journal row or input snapshot. Explicit Session
 close/finalize enqueues maintenance; its worker materializes the latest canonical
 Context through the existing coordinator before freezing extraction input.
+A committed HTTP close or finalize can advance that pod's next scan. Scans
+start at least two seconds apart, even with repeated close requests. The same
+bounded query finds due work and the next eligible retry within 30 seconds.
+The worker scans in two seconds after a scan error or when it finds due work.
+An otherwise idle worker scans every 30 seconds to cover other pods and missed
+hints.
 
 Completed extraction drops its input transcript; publication coordinates and
 facts survive independently. Only fully successful governance retires replay

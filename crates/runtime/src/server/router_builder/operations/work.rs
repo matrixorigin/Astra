@@ -93,10 +93,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::server::work_handlers::post_work_branch_comparison_handler),
         )
         .route(
-            "/v1/works/{work_id}/read-cursor",
-            axum::routing::put(crate::server::work_handlers::put_work_read_cursor_handler),
-        )
-        .route(
             "/v1/works/{work_id}/events",
             get(crate::server::work_handlers::get_work_events_handler),
         )

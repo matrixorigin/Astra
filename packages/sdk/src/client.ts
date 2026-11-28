@@ -94,7 +94,6 @@ import type {
   WorkCriteriaProposalSummaryV1,
   WorkObservationReportV1,
   WorkEventPageV1,
-  WorkReadCursorReceiptV1,
   WorkTaskGraphCursorV1,
   WorkTaskGraphPageV2,
   WorkSessionBindingV1,
@@ -220,7 +219,6 @@ import {
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
   workBranchCriteriaProposalDecisionPath,
-  workReadCursorPath,
 } from "./paths";
 import { SSEClient, readSseReplay } from "./sse-client";
 import {
@@ -247,7 +245,6 @@ import {
   decodeWorkCriteriaProposalListV1,
   decodeWorkCriteriaProposalSummaryV1,
   decodeWorkEventPageV1,
-  decodeWorkReadCursorReceiptV1,
   decodeWorkTaskGraphPageV2,
   decodeWorkSessionBindingV1,
   decodeWorkBranchActivityResponseV1,
@@ -964,7 +961,7 @@ export class AstraClient {
 
   /** List one bounded owner-scoped Work page in stable creation order. */
   async listWorks(
-    options: { cursor?: WorkCatalogCursorV1; limit?: number } = {},
+    options: { cursor?: WorkCatalogCursorV1; limit?: number; signal?: AbortSignal } = {},
   ): Promise<WorkCatalogPageV1> {
     if (
       options.limit !== undefined &&
@@ -992,6 +989,7 @@ export class AstraClient {
       {
         cache: "no-store",
         headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+        signal: options.signal,
       },
     );
     return decodeWorkCatalogPageV1(raw);
@@ -1106,10 +1104,12 @@ export class AstraClient {
   async getWorkBranchActivity(
     workId: string,
     branchId: string,
+    options: { signal?: AbortSignal } = {},
   ): Promise<WorkBranchActivityResponseV1> {
     const raw = await this.fetch<unknown>(workBranchActivityPath(workId, branchId), {
       cache: "no-store",
       headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      signal: options.signal,
     });
     const activity = decodeWorkBranchActivityResponseV1(raw);
     if (activity.work_id !== workId || activity.branch_id !== branchId) {
@@ -2254,30 +2254,7 @@ export class AstraClient {
     return detail;
   }
 
-  /** Monotonically mark one exact committed Work event sequence as seen. */
-  async advanceWorkReadCursor(
-    workId: string,
-    throughEventSeq: number,
-  ): Promise<WorkReadCursorReceiptV1> {
-    if (!Number.isSafeInteger(throughEventSeq) || throughEventSeq < 1) {
-      throw new TypeError("throughEventSeq must be a positive safe integer");
-    }
-    const raw = await this.put<unknown>(
-      workReadCursorPath(workId),
-      { through_event_seq: throughEventSeq },
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const receipt = decodeWorkReadCursorReceiptV1(raw);
-    if (receipt.work_id !== workId) {
-      throw new TypeError("Work read-cursor receipt belongs to a different Work");
-    }
-    if (receipt.through_event_seq < throughEventSeq) {
-      throw new TypeError("Work read-cursor receipt did not cover the requested event");
-    }
-    return receipt;
-  }
-
-  /** Read a bounded semantic event page without mutating the seen cursor. */
+  /** Read a bounded semantic event page. */
   async listWorkEvents(
     workId: string,
     options: { afterEventSeq?: number; limit?: number } = {},
@@ -2316,6 +2293,7 @@ export class AstraClient {
       cursor?: WorkTaskGraphCursorV1;
       itemLimit?: number;
       dependencyLimit?: number;
+      signal?: AbortSignal;
     } = {},
   ): Promise<WorkTaskGraphPageV2> {
     const cursor = options.cursor;
@@ -2358,7 +2336,7 @@ export class AstraClient {
         dependency_offset: cursor?.dependency_offset,
         dependency_limit: options.dependencyLimit,
       })}`,
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR }, signal: options.signal },
     );
     const page = decodeWorkTaskGraphPageV2(raw);
     if (page.basis.work_id !== workId || page.basis.branch_id !== branchId) {
@@ -2389,10 +2367,12 @@ export class AstraClient {
   async getWorkBranchInteractions(
     workId: string,
     branchId: string,
+    options: { signal?: AbortSignal } = {},
   ): Promise<WorkBranchInteractionPageV1> {
     const raw = await this.fetch<unknown>(workBranchInteractionsPath(workId, branchId), {
       cache: "no-store",
       headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      signal: options.signal,
     });
     const page = decodeWorkBranchInteractionPageV1(raw);
     if (page.work_id !== workId || page.branch_id !== branchId) {

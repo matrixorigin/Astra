@@ -61,10 +61,10 @@ pub use protocol::{
 /// SSE / buffered HTTP response from a Server-owned developer loop.
 pub use reqwest::Response as HttpResponse;
 pub use work::{
-    WorkCatalogAttentionV1, WorkCatalogCursorV1, WorkCatalogEntryV1, WorkCatalogPageV1,
-    WorkItemDeliveryBlockerKindV2, WorkItemDeliveryStatusV2, WorkItemExecutionStatusV2,
-    WorkItemVerificationStatusV2, WorkTaskGraphBasisV2, WorkTaskGraphCursorV2,
-    WorkTaskGraphDependencyV2, WorkTaskGraphItemV2, WorkTaskGraphPageV2,
+    WorkCatalogCursorV1, WorkCatalogEntryV1, WorkCatalogPageV1, WorkItemDeliveryBlockerKindV2,
+    WorkItemDeliveryStatusV2, WorkItemExecutionStatusV2, WorkItemVerificationStatusV2,
+    WorkTaskGraphBasisV2, WorkTaskGraphCursorV2, WorkTaskGraphDependencyV2, WorkTaskGraphItemV2,
+    WorkTaskGraphPageV2,
 };
 
 pub use protocol::{
