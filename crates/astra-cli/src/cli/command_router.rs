@@ -4691,6 +4691,31 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     match crate::cli::cloud_sync::read_sync_outbox_diagnostics().await {
         Ok(diagnostics) => {
             let status = diagnostics.status;
+            let pending = status.pending.saturating_add(status.in_flight);
+            stdout_println!("  {} {pending}", "Records awaiting delivery:".dim());
+            let format_time = |ms: u64| {
+                i64::try_from(ms)
+                    .ok()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            };
+            if let Some(ack_at) = status.last_ack_at_unix_ms.and_then(format_time) {
+                stdout_println!("  {} {ack_at}", "Last confirmed delivery:".dim());
+            } else if status.acked > 0 || status.ack_tombstones > 0 {
+                stdout_println!("  Cloud delivery confirmed. Last confirmation time unavailable.");
+            } else {
+                stdout_println!("  Cloud delivery unverified. No delivery confirmation recorded.");
+            }
+            if let Some(failure) = status.last_pending_failure.as_ref() {
+                stdout_println!(
+                    "  {} {}",
+                    "Last pending delivery error:".dim(),
+                    failure.reason
+                );
+            }
+            if status.poisoned > 0 || status.skipped > 0 {
+                stdout_println!("  {}", "Historical failures retained locally".bold());
+            }
             if status.poisoned > 0 {
                 let summary = format!(
                     "{} item(s) could not be synchronized and remain on this device",
@@ -4726,13 +4751,15 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                 }
                 issues.push(summary);
             }
-            if status.pending > 0 || status.in_flight > 0 {
-                stdout_println!("  {}", "Local changes are waiting to sync".yellow());
-            } else if status.poisoned == 0 && status.skipped == 0 {
-                stdout_println!("  {}", "No pending local changes".green());
-            }
-            if let Some(reason) = status.last_error.as_deref() {
-                stdout_println!("  {} {}", "Last sync error:".dim(), reason);
+            if let Some(failure) = status.last_historical_failure {
+                if let Some(time) = format_time(failure.at_unix_ms) {
+                    stdout_println!("  {} {time}", "Last historical failure at:".dim());
+                }
+                stdout_println!(
+                    "  {} {}",
+                    "Last historical delivery error:".dim(),
+                    failure.reason
+                );
             }
         }
         Err(error) => {

@@ -131,10 +131,28 @@ reinterpreted as verified sync receipts. A lost response remains retryable until
 an owner-scoped reconciliation proves the result. Only authoritative permanent
 record-level rejections are quarantined; request-level failures leave records
 pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
-oversized singleton pending for the deployment to be corrected. Newly terminal
-sync failures are reported to an active TUI after they are persisted. Local
-outbox I/O failures also produce a warning and remain eligible for bounded
-background retry.
+oversized singleton pending for the deployment to be corrected. The active TUI
+reports newly persisted permanent rejections and skipped journal records to
+their owner. Its bounded in-process notice snapshot coalesces unread warnings
+and retains permanent loss counts while the TUI is busy. Retryable delivery
+and local I/O warnings are shown only if the same incident is still active
+when displayed. A confirmed recovery re-arms the next incident. If another process
+settles the last outstanding record, the next successful outbox status read
+retires the stale settlement warning, including one already queued for display.
+A new observer starts at the current count. Subsequent startup checks and
+drains leave those historical records in `astra doctor`. Retryable delivery
+failures warn once while pending, including after login. A successful delivery
+of unrelated records does not clear that warning while failed items remain.
+A post-login journal projection that fails after the login prompt returns still
+notifies the current owner. Reconciliation of that same source journal allows
+a subsequent projection failure to notify again. Browser and password login
+share a background sync operation. If projection and delivery take longer than
+the login notice window, or the drain finds unconfirmed work, that operation
+reports the outcome once while synchronization continues. At display time the
+TUI discards a queued pending notice if the login has settled, and a queued
+projection warning if its failed journals have reconciled. Only a status read that starts
+after the login projected its records can confirm their delivery.
+Local outbox I/O failures remain eligible for bounded background retry.
 
 A projected event must fit the 4 MiB encoded singleton request, including the
 envelope, JSON escaping and reserved space for the final sequence number.
@@ -204,7 +222,13 @@ The UI and CLI should expose:
 - `degraded` when retries or dropped/poisoned records exist;
 - `action_needed` when user repair or reconnect is required.
 
-The user should not have to infer safety from logs.
+The TUI startup check reports an unreadable outbox. Retained failures are
+available on demand in `astra doctor`, which shows the local delivery queue
+and the last confirmed delivery separately from historical failures. The last
+confirmation describes an observed delivery, while a device with no recorded
+confirmation reports cloud delivery as unverified. Queue compaction preserves the
+latest observed confirmation time. Claiming a record for another attempt
+preserves its last failure time until the attempt has a new outcome.
 
 ## Required operations
 

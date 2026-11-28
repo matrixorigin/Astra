@@ -60,7 +60,6 @@ const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const GUIDANCE_OBSERVER_OWNER_CHECK_INTERVAL: Duration = Duration::from_millis(250);
-const CLOUD_SYNC_WARNING_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
 const LOCAL_AGENT_SESSION_SHUTDOWN_REASON: &str = "interactive session is shutting down";
@@ -4044,12 +4043,8 @@ fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Opt
                 None
             }
         }
-        TuiAppEvent::CloudSyncIssue(owner) => {
-            (owner == astra_services::local_owner_scope()).then(|| {
-                TuiAppEvent::SystemWarning(
-                    "Cloud sync needs attention. Run `astra doctor` for details.".to_string(),
-                )
-            })
+        TuiAppEvent::CloudSyncIssue(warning) => {
+            warning.current_message().map(TuiAppEvent::SystemWarning)
         }
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
             (current_turn == Some(turn_id.as_str())).then_some(*event)
@@ -4062,10 +4057,9 @@ async fn forward_sync_warnings(
     mut source: tokio::sync::watch::Receiver<
         Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     >,
-    mut terminal: tokio::sync::broadcast::Receiver<astra_services::OwnerScope>,
+    mut outbox: crate::cli::cloud_sync::SyncOutboxNotices,
     output: tokio::sync::mpsc::Sender<TuiAppEvent>,
 ) {
-    let mut last_terminal = None;
     loop {
         let blocked = source.borrow_and_update().clone();
         if let Some(snapshot) = blocked
@@ -4077,31 +4071,55 @@ async fn forward_sync_warnings(
             return;
         }
         loop {
-            tokio::select! {
+            let (_, notices) = tokio::select! {
                 changed = source.changed() => {
                     if changed.is_err() {
                         return;
                     }
                     break;
                 }
-                event = terminal.recv() => match event {
-                    Ok(owner) => {
-                        let now = tokio::time::Instant::now();
-                        if last_terminal.as_ref().is_none_or(|(previous, at)| {
-                            previous != &owner || now.duration_since(*at) >= CLOUD_SYNC_WARNING_REPEAT_INTERVAL
-                        }) {
-                            last_terminal = Some((owner.clone(), now));
-                            if output.send(TuiAppEvent::CloudSyncIssue(owner)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                event = outbox.recv() => match event {
+                    Some(event) => event,
+                    None => return,
                 },
                 _ = output.closed() => return,
+            };
+            for item in notices {
+                if let Some(warning) = outbox.queued_warning(item)
+                    && output
+                        .send(TuiAppEvent::CloudSyncIssue(warning))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct SyncWarningProbe(tokio::sync::mpsc::Receiver<TuiAppEvent>);
+
+#[cfg(test)]
+impl SyncWarningProbe {
+    pub(crate) fn subscribe() -> Self {
+        let (output, events) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(forward_sync_warnings(
+            crate::cli::cloud_sync::subscribe_sync_cloud_access(),
+            crate::cli::cloud_sync::subscribe_sync_outbox_notices(),
+            output,
+        ));
+        Self(events)
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<String> {
+        while let Some(event) = self.0.recv().await {
+            if let Some(TuiAppEvent::SystemWarning(text)) = accept_owned_tui_event(event, None) {
+                return Some(text);
+            }
+        }
+        None
     }
 }
 
@@ -9934,7 +9952,7 @@ pub(crate) async fn run_tui_session(
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
     let sync_access_observer = tokio::spawn(forward_sync_warnings(
         crate::cli::cloud_sync::subscribe_sync_cloud_access(),
-        crate::cli::cloud_sync::subscribe_sync_issues(),
+        crate::cli::cloud_sync::subscribe_sync_outbox_notices(),
         tui_tx.clone(),
     ));
     if let Ok(executable) = std::env::current_exe() {
@@ -10001,10 +10019,7 @@ pub(crate) async fn run_tui_session(
     {
         let owner = astra_services::local_owner_scope();
         startup_observation_tasks.push(tokio::spawn(async move {
-            match crate::cli::cloud_sync::read_sync_outbox_status_for_owner(&owner).await {
-                Ok(status) if crate::cli::cloud_sync::terminal_sync_items(&status) == 0 => {}
-                _ => crate::cli::cloud_sync::notify_sync_issue(&owner),
-            }
+            crate::cli::cloud_sync::check_startup_outbox_health(&owner).await;
         }));
     }
     {
@@ -15730,7 +15745,7 @@ fn handle_app_event(
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
         | TuiAppEvent::CloudSyncAccessBlocked(_)
-        | TuiAppEvent::CloudSyncIssue(_)
+        | TuiAppEvent::CloudSyncIssue(..)
         | TuiAppEvent::SystemInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
@@ -30504,9 +30519,12 @@ mod tests {
         let _owner = install_cli_profile_identity_for_test("a", Some("account-a")).unwrap();
         crate::cli::cloud_sync::clear_sync_cloud_access();
         let source = crate::cli::cloud_sync::subscribe_sync_cloud_access();
-        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(2);
         let (output, mut events) = tokio::sync::mpsc::channel(2);
-        let observer = tokio::spawn(forward_sync_warnings(source, terminal_rx, output));
+        let observer = tokio::spawn(forward_sync_warnings(
+            source,
+            crate::cli::cloud_sync::subscribe_sync_outbox_notices(),
+            output,
+        ));
         let snapshot = cli_owner_auth_snapshot();
         crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -30517,37 +30535,24 @@ mod tests {
             accept_owned_tui_event(event, None),
             Some(TuiAppEvent::SystemWarning(text)) if text.contains("/login")
         ));
-        terminal_tx.send(snapshot.owner_scope.clone()).unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            accept_owned_tui_event(event, None),
-            Some(TuiAppEvent::SystemWarning(text)) if text.contains("astra doctor")
-        ));
-        terminal_tx.send(snapshot.owner_scope.clone()).unwrap();
-        let other_owner = astra_services::OwnerScope::user("different-owner").unwrap();
-        terminal_tx.send(other_owner.clone()).unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(next, TuiAppEvent::CloudSyncIssue(owner) if owner == other_owner));
         crate::cli::cloud_sync::clear_sync_cloud_access();
         assert!(
             accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot.clone()), None)
                 .is_none()
         );
         crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        crate::cli::cloud_sync::report_new_sync_terminal(&snapshot.owner_scope, 1);
+        let previous_owner_warning = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, TuiAppEvent::CloudSyncIssue(_)) {
+                break event;
+            }
+        };
         let _other = install_cli_profile_identity_for_test("b", Some("account-b")).unwrap();
-        assert!(
-            accept_owned_tui_event(
-                TuiAppEvent::CloudSyncIssue(snapshot.owner_scope.clone()),
-                None
-            )
-            .is_none()
-        );
+        assert!(accept_owned_tui_event(previous_owner_warning, None).is_none());
         assert!(
             accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot), None).is_none()
         );
@@ -30559,7 +30564,7 @@ mod tests {
         let (output, events) = tokio::sync::mpsc::channel(1);
         let observer = tokio::spawn(forward_sync_warnings(
             access_rx,
-            crate::cli::cloud_sync::subscribe_sync_issues(),
+            crate::cli::cloud_sync::subscribe_sync_outbox_notices(),
             output,
         ));
         drop(events);
@@ -30569,32 +30574,38 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn sync_issue_warnings_do_not_stay_suppressed() {
-        let (_access_tx, access_rx) = tokio::sync::watch::channel(None);
-        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(2);
-        let (output, mut events) = tokio::sync::mpsc::channel(2);
-        let observer = tokio::spawn(forward_sync_warnings(access_rx, terminal_rx, output));
-        let owner = astra_services::OwnerScope::user("account").unwrap();
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn coalesced_permanent_sync_warning_reaches_backpressured_tui() {
+        use crate::cli::cloud_sync::{report_new_sync_terminal, subscribe_sync_outbox_notices};
 
-        terminal_tx.send(owner.clone()).unwrap();
+        let owner = astra_services::local_owner_scope();
+        report_new_sync_terminal(&owner, 99);
+        let notices = subscribe_sync_outbox_notices();
+        let (_access, access_rx) = tokio::sync::watch::channel(None);
+        let (output, mut events) = tokio::sync::mpsc::channel(1);
+        output
+            .try_send(TuiAppEvent::SystemWarning("output already full".into()))
+            .unwrap();
+        report_new_sync_terminal(&owner, 1);
+        report_new_sync_terminal(&owner, 2);
+        let observer = tokio::spawn(forward_sync_warnings(access_rx, notices, output));
+
         assert!(matches!(
             events.recv().await,
-            Some(TuiAppEvent::CloudSyncIssue(_))
+            Some(TuiAppEvent::SystemWarning(_))
         ));
-        terminal_tx.send(owner.clone()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap(),
+            Some(TuiAppEvent::CloudSyncIssue(warning))
+                if warning.current_message().is_some_and(|text| text.contains("3 item") && !text.contains("99"))
+        ));
+        let mut later = subscribe_sync_outbox_notices();
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), events.recv())
+            tokio::time::timeout(Duration::from_millis(50), later.recv())
                 .await
                 .is_err()
         );
-        tokio::time::advance(CLOUD_SYNC_WARNING_REPEAT_INTERVAL).await;
-        terminal_tx.send(owner).unwrap();
-        assert!(matches!(
-            events.recv().await,
-            Some(TuiAppEvent::CloudSyncIssue(_))
-        ));
-
         drop(events);
         observer.await.unwrap();
     }
@@ -33283,6 +33294,7 @@ mod tests {
             )
             .await
             .unwrap();
+            let mut warnings = SyncWarningProbe::subscribe();
             let mut tasks = tokio::task::JoinSet::new();
             let (tx, mut rx) = tokio::sync::mpsc::channel(2);
             let mut widget = chat_widget::ChatWidget::new("");
@@ -33322,6 +33334,13 @@ mod tests {
                 Some(_) = rx.recv() => panic!("a stalled preference read must not publish"),
             }
             assert_eq!(pane.composer.text(), "next message");
+            if stalled == "outbox" {
+                let warning = tokio::time::timeout(Duration::from_secs(5), warnings.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(warning.contains("unconfirmed"), "{warning}");
+            }
             assert!(
                 matches!(widget.history()[0].to_persist(), Some(crate::tui::turn_event::TurnEvent::System { text, .. }) if text == "Logged in.")
             );

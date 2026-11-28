@@ -20,7 +20,6 @@ pub(crate) fn schedule_journal_ingestion(journal: &session_journal::JournalWrite
         if let Err(error) = outcome {
             tracing::warn!(target: "astra_cli::cloud_sync", %session_id, ?error,
                 "failed to project durable journal into sync outbox");
-            crate::cli::cloud_sync::notify_sync_issue(owner);
         }
     }
 }
