@@ -316,10 +316,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             state.multi_agent_metrics.clone(),
             bg_cancel.clone(),
         ));
-        bg_handles.push(astra_services::work::spawn_work_runtime_event_projector(
-            pool.clone(),
-            bg_cancel.clone(),
-        ));
         bg_handles.push(
             work_branch_deletion_runtime::spawn_work_branch_deletion_recovery(
                 pool.clone(),

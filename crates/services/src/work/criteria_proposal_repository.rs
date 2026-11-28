@@ -195,16 +195,12 @@ async fn validate_basis(
     let row = query(
         "SELECT w.work_revision, w.current_goal_revision, w.current_criteria_set_revision,
                 CASE WHEN w.archived_at IS NULL THEN 0 ELSE 1 END AS work_archived,
-                g.revision AS materialized_goal_revision,
                 cs.revision AS materialized_criteria_set_revision,
                 b.branch_revision, b.goal_revision_ref, b.criteria_set_revision_ref,
                 b.current_graph_revision,
                 CASE WHEN b.archived_at IS NULL THEN 0 ELSE 1 END AS branch_archived,
                 gr.revision AS materialized_graph_revision
          FROM works w
-         LEFT JOIN work_goal_revisions g
-           ON g.owner_id = w.owner_id AND g.work_id = w.work_id
-          AND g.revision = w.current_goal_revision
          LEFT JOIN work_criterion_sets cs
            ON cs.owner_id = w.owner_id AND cs.work_id = w.work_id
           AND cs.revision = w.current_criteria_set_revision
@@ -240,7 +236,6 @@ async fn validate_basis(
         return Err(WorkRepositoryError::Archived);
     }
     for field in [
-        "materialized_goal_revision",
         "materialized_criteria_set_revision",
         "materialized_graph_revision",
     ] {

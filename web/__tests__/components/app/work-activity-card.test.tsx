@@ -18,13 +18,13 @@ const events: WorkEventRecordV1[] = [
   {
     event_seq: 4,
     branch_id: "branch-1",
-    kind: "run_failed",
+    kind: "graph_replaced",
     work_revision: null,
     goal_revision: null,
     criterion_set_revision: null,
     branch_revision: null,
     graph_revision: 1,
-    source_ref: "run:run-2",
+    source_ref: "proposal-2",
     created_at: "2026-08-01T00:02:00Z",
   },
 ];
@@ -35,7 +35,7 @@ test("renders the bounded retained history newest first", () => {
   expect(screen.getByRole("heading", { name: "Recent activity" })).toBeVisible();
   expect(screen.getByText("Showing the latest 2 updates.")).toBeVisible();
   expect(within(screen.getByRole("list")).getAllByRole("listitem").map((item) => item.textContent))
-    .toEqual(["The latest run stopped with an error", "Plan expanded"]);
+    .toEqual(["Plan updated", "Plan expanded"]);
 });
 
 test("omits an empty history", () => {

@@ -14,7 +14,7 @@ pub(super) async fn list_catalog(
     query_value: WorkCatalogQuery,
 ) -> Result<WorkCatalogPage, WorkRepositoryError> {
     let mut builder = QueryBuilder::new(
-        "SELECT w.work_id, w.work_revision, w.delivery_branch_id, g.goal_text,
+        "SELECT w.work_id, w.work_revision, w.delivery_branch_id, w.goal_text,
                 b.branch_revision, b.current_graph_revision,
                 b.session_id AS branch_session_id,
                 gr.item_count AS graph_item_count,
@@ -37,9 +37,6 @@ pub(super) async fn list_catalog(
                        THEN active.updated_at ELSE es.updated_at END,
                   '%Y-%m-%dT%H:%i:%s.%fZ') AS last_activity_at
          FROM works w
-         LEFT JOIN work_goal_revisions g
-           ON g.owner_id = w.owner_id AND g.work_id = w.work_id
-          AND g.revision = w.current_goal_revision
          LEFT JOIN work_branches b
            ON b.owner_id = w.owner_id AND b.work_id = w.work_id
           AND b.branch_id = w.delivery_branch_id AND b.archived_at IS NULL

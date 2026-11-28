@@ -29,6 +29,7 @@ pub(crate) const WORK_ESTABLISHMENT_OPERATIONS_CREATE_SQL: &str =
     operation_id VARCHAR(256) NOT NULL,
     request_hash CHAR(71) NOT NULL,
     payload_json LONGTEXT NOT NULL,
+    mutation_triggers_json LONGTEXT NULL,
     work_id VARCHAR(64) NOT NULL,
     branch_id VARCHAR(64) NOT NULL,
     session_id VARCHAR(64) NOT NULL,

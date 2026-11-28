@@ -2114,11 +2114,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
         cleanup_lifecycle_execution_binding(&pool, &execution_key).await;
         crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
-        for table in [
-            "work_runtime_event_outbox_slots",
-            "work_runtime_event_outbox",
-            "work_item_attempts",
-        ] {
+        for table in ["work_item_attempts"] {
             let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE owner_id = ?"
             )))

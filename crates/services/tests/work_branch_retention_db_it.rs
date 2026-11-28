@@ -562,9 +562,10 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         "INSERT INTO work_item_attempts
          (owner_id, work_id, branch_id, work_item_id, work_item_revision,
           attempt_id, executor_run_id, execution_mode, status, graph_revision,
-          outcome, summary_text, blocker_kind, unavailable_capabilities_json, settled_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?, 'delegated', 'completed', 1,
-                 'delivered', 'branch result', NULL, '[]', NOW(6))",
+          outcome, summary_text, blocker_kind, unavailable_capabilities_json, settled_at,
+          terminal_graph_revision, terminal_control_epoch)
+         VALUES (?, ?, ?, ?, 1, ?, ?, 'primary', 'completed', 1,
+                 'delivered', 'branch result', NULL, '[]', NOW(6), 1, -1)",
     )
     .bind(&owner_id)
     .bind(&work_id)
@@ -575,18 +576,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     .execute(pool.get())
     .await
     .expect("insert branch-owned attempt settlement");
-    sqlx::query(
-        "INSERT INTO work_terminal_cuts
-         (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch)
-         VALUES (?, ?, ?, 1, ?, -1)",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .bind(&branch_id)
-    .bind(&settled_attempt_id)
-    .execute(pool.get())
-    .await
-    .expect("insert branch-owned terminal cut");
     let completed = deletion
         .complete_branch_cleanup(
             &WorkOwnerId::parse(&owner_id).unwrap(),
@@ -628,9 +617,9 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                 (SELECT COUNT(*) FROM work_item_attempts s
                  WHERE s.owner_id = w.owner_id AND s.work_id = w.work_id
                    AND s.branch_id = ?) AS settlement_rows,
-                (SELECT COUNT(*) FROM work_terminal_cuts c
+                (SELECT COUNT(*) FROM work_item_attempts c
                  WHERE c.owner_id = w.owner_id AND c.work_id = w.work_id
-                   AND c.branch_id = ?) AS terminal_cut_rows
+                   AND c.branch_id = ? AND c.terminal_graph_revision IS NOT NULL) AS terminal_cut_rows
          FROM works w WHERE w.owner_id = ? AND w.work_id = ?",
     )
     .bind(&branch_id)

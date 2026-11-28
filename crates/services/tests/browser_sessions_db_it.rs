@@ -645,11 +645,6 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .execute(pool.get())
             .await
             .unwrap();
-        sqlx::query("DELETE FROM auth_user_roles WHERE user_id = ?")
-            .bind(user)
-            .execute(pool.get())
-            .await
-            .unwrap();
         sqlx::query("DELETE FROM auth_users WHERE user_id = ?")
             .bind(user)
             .execute(pool.get())
@@ -884,7 +879,6 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
         "auth_tokens",
         "auth_external_identities",
         "auth_refresh_tokens",
-        "auth_user_roles",
         "auth_users",
     ] {
         let column = match table {
@@ -976,7 +970,7 @@ async fn fresh_login_and_logout_do_not_depend_on_expired_credentials_or_an_old_e
             StatusCode::UNAUTHORIZED
         );
         for user in [&tokens.user_id, &next.user_id] {
-            for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
+            for table in ["auth_refresh_tokens", "auth_users"] {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id = ?"
                 )))

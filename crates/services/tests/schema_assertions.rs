@@ -37,7 +37,18 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .expect("repeated core schema bootstrap");
 
     let schema = current_schema(&pool).await;
+    let manifest = load_core_schema_table_contracts(pool.get()).await.unwrap();
     for retired in [
+        "astra_schema_bootstrap_leases",
+        "astra_schema_table_contracts",
+        "auth_roles",
+        "auth_user_roles",
+        "maintenance_sweep_cursors",
+        "work_goal_revisions",
+        "work_proposal_trigger_attempts",
+        "work_runtime_event_outbox",
+        "work_runtime_event_outbox_slots",
+        "work_terminal_cuts",
         "agent_agents",
         "user_skill_sources",
         "user_skill_versions",
@@ -51,14 +62,10 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             column_names(&pool, &schema, retired).await.is_empty(),
             "retired table {retired}"
         );
-        let claims: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM astra_schema_table_contracts WHERE table_name = ?",
-        )
-        .bind(retired)
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(claims, 0, "retired table authority {retired}");
+        assert!(
+            manifest.iter().all(|table| table.name != retired),
+            "retired table authority {retired}"
+        );
     }
     assert!(
         !column_names(&pool, &schema, "session_artifacts")
@@ -159,14 +166,8 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     let contracts = load_core_schema_table_contracts(pool.get())
         .await
         .expect("load generated core schema table authority");
-    let model_claim_hash = contracts
-        .iter()
-        .find(|table| table.name == "user_llm_models")
-        .unwrap()
-        .ddl_sha256
-        .clone();
     assert!(
-        contracts.len() >= 90,
+        contracts.len() >= 84,
         "bootstrap must publish the complete generated authority, got {} claims",
         contracts.len()
     );
@@ -296,17 +297,6 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         "session-to-Work lookup must be owner-scoped and index-bounded"
     );
     assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "work_runtime_event_outbox_slots",
-            "idx_work_runtime_event_pending",
-        )
-        .await,
-        ["has_pending", "updated_at", "owner_id", "work_id"],
-        "runtime projection polling must scale with dirty Work, not retained Work"
-    );
-    assert_eq!(
         unique_key_columns(
             &pool,
             &schema,
@@ -317,40 +307,27 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         ["owner_id", "attempt_id"],
         "attempt identity must be owner-scoped and independent of its execution carrier"
     );
-    let attempt_columns = column_names(&pool, &schema, "work_item_attempts").await;
-    for retired in ["terminal_graph_revision", "terminal_control_epoch"] {
-        assert!(
-            !attempt_columns.iter().any(|column| column == retired),
-            "terminal authority must not be split across nullable attempt column {retired}"
+    for column in ["terminal_graph_revision", "terminal_control_epoch"] {
+        assert_eq!(
+            column_nullable(&pool, &schema, "work_item_attempts", column).await,
+            Some(true)
         );
     }
-    assert_eq!(
-        column_names(&pool, &schema, "work_terminal_cuts").await,
-        [
-            "owner_id",
-            "work_id",
-            "branch_id",
-            "graph_revision",
-            "attempt_id",
-            "control_epoch",
-        ],
-        "terminal cut must remain one minimal, non-null authority relation"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "work_terminal_cuts").await,
-        ["owner_id", "work_id", "branch_id", "graph_revision"],
-        "one Work branch graph revision can have exactly one terminal settlement"
-    );
     assert_eq!(
         unique_key_columns(
             &pool,
             &schema,
-            "work_terminal_cuts",
-            "uq_work_terminal_cut_attempt",
+            "work_item_attempts",
+            "uq_work_attempt_terminal_graph"
         )
         .await,
-        ["owner_id", "attempt_id"],
-        "one immutable attempt can publish at most one terminal graph cut"
+        [
+            "owner_id",
+            "work_id",
+            "branch_id",
+            "terminal_graph_revision"
+        ],
+        "one attempt can publish the terminal result for a branch graph"
     );
     assert_eq!(
         index_columns(
@@ -382,13 +359,15 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .unwrap();
     assert_eq!(contracts, 1, "repeated bootstrap must remain idempotent");
 
-    // An interrupted fresh bootstrap can leave canonical tables and claims,
-    // no readiness marker, and an expired lease. It must be safe to retry.
+    // A crashed bootstrap may leave incomplete tables and an expired lease.
+    // The same component row owns the lease and publishes readiness atomically.
     for sql in [
-        "DELETE FROM astra_schema_contracts WHERE component = 'astra-core'",
-        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'conversation_manifest_nodes'",
+        "UPDATE astra_schema_contracts
+         SET contract_version = NULL, table_manifest_json = NULL, completed_at = NULL,
+             bootstrap_holder_id = 'crashed-owner',
+             bootstrap_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
+         WHERE component = 'astra-core'",
         "DROP TABLE conversation_manifest_nodes",
-        "INSERT INTO astra_schema_bootstrap_leases (component, holder_id, lease_expires_at) VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
     ] {
         sqlx::query(sql).execute(pool.get()).await.unwrap();
     }
@@ -530,7 +509,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             );
             if !completed {
                 let ready: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM astra_schema_contracts WHERE component='astra-core'",
+                    "SELECT COUNT(*) FROM astra_schema_contracts WHERE component='astra-core' AND contract_version IS NOT NULL",
                 )
                 .fetch_one(pool.get())
                 .await
@@ -543,28 +522,39 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             .await
             .unwrap();
     }
-    for completed in [true, false] {
-        if !completed {
-            sqlx::query("DELETE FROM astra_schema_contracts WHERE component='astra-core'")
-                .execute(pool.get())
-                .await
-                .unwrap();
-        }
-        sqlx::query("UPDATE astra_schema_table_contracts SET ddl_sha256=? WHERE table_name='user_llm_models'").bind("a".repeat(64)).execute(pool.get()).await.unwrap();
-        assert!(
-            ensure_core_schema(&settings, &bootstrap_catalog)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("user_llm_models")
-        );
-        let unchanged: String = sqlx::query_scalar("SELECT ddl_sha256 FROM astra_schema_table_contracts WHERE table_name='user_llm_models'").fetch_one(pool.get()).await.unwrap();
-        assert_eq!(unchanged, "a".repeat(64));
-        sqlx::query("UPDATE astra_schema_table_contracts SET ddl_sha256=? WHERE table_name='user_llm_models'").bind(&model_claim_hash).execute(pool.get()).await.unwrap();
+    let manifest = load_core_schema_table_contracts(pool.get()).await.unwrap();
+    let mut invalid_manifest = manifest.clone();
+    invalid_manifest
+        .iter_mut()
+        .find(|table| table.name == "user_llm_models")
+        .unwrap()
+        .ddl_sha256 = "a".repeat(64);
+    let update_manifest =
+        "UPDATE astra_schema_contracts SET table_manifest_json = ? WHERE component = 'astra-core'";
+    sqlx::query(update_manifest)
+        .bind(serde_json::to_string(&invalid_manifest).unwrap())
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert!(
         ensure_core_schema(&settings, &bootstrap_catalog)
             .await
-            .unwrap();
-    }
+            .unwrap_err()
+            .to_string()
+            .contains("user_llm_models")
+    );
+    assert_eq!(
+        load_core_schema_table_contracts(pool.get()).await.unwrap(),
+        invalid_manifest
+    );
+    sqlx::query(update_manifest)
+        .bind(serde_json::to_string(&manifest).unwrap())
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .unwrap();
     for (index, create, drop_index) in [
         (
             "uq_auth_refresh_browser_handle",
@@ -676,7 +666,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .execute(pool.get())
     .await
     .unwrap();
-    sqlx::query("ALTER TABLE auth_user_roles DROP INDEX idx_auth_user_roles_role_id")
+    sqlx::query("ALTER TABLE auth_users DROP INDEX idx_auth_users_admin")
         .execute(pool.get())
         .await
         .unwrap();
@@ -691,20 +681,15 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             .await
             .expect_err("missing key must fail validation without repair")
             .to_string();
-        assert!(error.contains("idx_auth_user_roles_role_id"), "{error}");
+        assert!(error.contains("idx_auth_users_admin"), "{error}");
         assert!(
-            index_columns(
-                &pool,
-                &schema,
-                "auth_user_roles",
-                "idx_auth_user_roles_role_id"
-            )
-            .await
-            .is_empty()
+            index_columns(&pool, &schema, "auth_users", "idx_auth_users_admin")
+                .await
+                .is_empty()
         );
     }
     // Restore only this disposable fixture's index to isolate column drift.
-    sqlx::query("CREATE INDEX idx_auth_user_roles_role_id ON auth_user_roles (role_id)")
+    sqlx::query("CREATE INDEX idx_auth_users_admin ON auth_users (is_admin)")
         .execute(pool.get())
         .await
         .unwrap();
@@ -738,7 +723,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     let markers: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM astra_schema_contracts WHERE component = 'astra-core'",
+        "SELECT COUNT(*) FROM astra_schema_contracts WHERE component = 'astra-core' AND contract_version IS NOT NULL",
     )
     .fetch_one(pool.get())
     .await
@@ -922,10 +907,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
     for (table, primary_key) in [
         ("works", &["owner_id", "work_id"][..]),
         (
-            "work_goal_revisions",
-            &["owner_id", "work_id", "revision"][..],
-        ),
-        (
             "work_criterion_revisions",
             &["owner_id", "work_id", "criterion_id", "revision"][..],
         ),
@@ -951,14 +932,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
                 "work_item_revision",
                 "attempt_id",
             ][..],
-        ),
-        (
-            "work_terminal_cuts",
-            &["owner_id", "work_id", "branch_id", "graph_revision"][..],
-        ),
-        (
-            "work_proposal_trigger_attempts",
-            &["owner_id", "work_id", "branch_id", "proposal_id"][..],
         ),
         ("work_branches", &["owner_id", "work_id", "branch_id"][..]),
         (
@@ -1052,7 +1025,16 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
     ] {
         assert!(branch_columns.iter().any(|column| column == expected));
     }
-    for retired in ["work_items", "work_graph_sequences", "work_branch_subjects"] {
+    for retired in [
+        "work_items",
+        "work_graph_sequences",
+        "work_branch_subjects",
+        "work_goal_revisions",
+        "work_proposal_trigger_attempts",
+        "work_runtime_event_outbox",
+        "work_runtime_event_outbox_slots",
+        "work_terminal_cuts",
+    ] {
         assert!(
             column_names(&pool, &schema, retired).await.is_empty(),
             "fresh schema still contains {retired}"
@@ -1070,21 +1052,20 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         "accepted graph lookup must remain bounded after proposal pruning"
     );
     assert_eq!(
-        index_columns(
+        column_nullable(
             &pool,
             &schema,
-            "work_proposal_trigger_attempts",
-            "idx_work_proposal_trigger_attempt"
+            "work_establishment_operations",
+            "mutation_triggers_json"
         )
         .await,
-        [
-            "owner_id",
-            "work_id",
-            "branch_id",
-            "trigger_attempt_id",
-            "proposal_id"
-        ],
-        "trigger provenance lookup must remain owner and branch scoped"
+        Some(true),
+        "trigger provenance lives on the bounded establishment operation"
+    );
+    assert_eq!(
+        column_nullable(&pool, &schema, "works", "goal_text").await,
+        Some(false),
+        "the Work root owns its goal"
     );
     assert!(
         column_names(&pool, &schema, "work_item_revisions")
@@ -1099,14 +1080,13 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         .expect("load generated core schema table authority");
     for table in [
         "works",
-        "work_goal_revisions",
+        "work_establishment_operations",
         "work_criterion_revisions",
         "work_criterion_sets",
         "work_graph_revisions",
         "work_item_revisions",
         "work_branches",
         "work_branch_deletion_operations",
-        "work_proposal_trigger_attempts",
     ] {
         let contract = contracts
             .iter()

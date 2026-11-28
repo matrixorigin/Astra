@@ -4,7 +4,7 @@ use astra_core::SharedPool;
 use chrono::NaiveDateTime;
 
 const COMPACTION_INTERVAL_SECS: u64 = 300;
-const COMPACTION_CURSOR_NAME: &str = "tool_invocation_compaction_v1";
+const COMPACTION_CURSOR_NAME: &str = "runtime_sweepers";
 const COMPACTION_CURSOR_EPOCH: &str = "1970-01-01 00:00:00.000000";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -119,9 +119,8 @@ async fn claim_compaction_candidates(
 ) -> Result<(Vec<(String, String, String)>, bool), sqlx::Error> {
     let mut tx = pool.get().begin().await?;
     sqlx::query(
-        "INSERT IGNORE INTO maintenance_sweep_cursors
-         (sweep_name, cursor_updated_at, cursor_user_id, cursor_run_id)
-         VALUES (?, ?, '', '')",
+        "INSERT IGNORE INTO sweeper_leases (sweeper_name, owner_pod_id, expires_at)
+         VALUES (?, '', ?)",
     )
     .bind(cursor_name)
     .bind(COMPACTION_CURSOR_EPOCH)
@@ -133,7 +132,7 @@ async fn claim_compaction_candidates(
         String,
     ) = sqlx::query_as(
         "SELECT cursor_updated_at, cursor_user_id, cursor_run_id
-         FROM maintenance_sweep_cursors WHERE sweep_name = ? FOR UPDATE",
+         FROM sweeper_leases WHERE sweeper_name = ? FOR UPDATE",
     )
     .bind(cursor_name)
     .fetch_one(&mut *tx)
@@ -174,19 +173,21 @@ async fn claim_compaction_candidates(
         cursor_user_id.clone_from(user_id);
         cursor_run_id.clone_from(run_id);
     }
-    sqlx::query(
-        "UPDATE maintenance_sweep_cursors
-         SET cursor_updated_at = ?, cursor_user_id = ?, cursor_run_id = ?,
-             scan_generation = scan_generation + ?, updated_at = CURRENT_TIMESTAMP(6)
-         WHERE sweep_name = ?",
-    )
-    .bind(cursor_updated_at)
-    .bind(&cursor_user_id)
-    .bind(&cursor_run_id)
-    .bind(u8::from(cursor_wrapped))
-    .bind(cursor_name)
-    .execute(&mut *tx)
-    .await?;
+    if !candidates.is_empty() || cursor_wrapped {
+        sqlx::query(
+            "UPDATE sweeper_leases
+             SET cursor_updated_at = ?, cursor_user_id = ?, cursor_run_id = ?,
+                 scan_generation = scan_generation + ?, compaction_updated_at = CURRENT_TIMESTAMP(6)
+             WHERE sweeper_name = ?",
+        )
+        .bind(cursor_updated_at)
+        .bind(&cursor_user_id)
+        .bind(&cursor_run_id)
+        .bind(u8::from(cursor_wrapped))
+        .bind(cursor_name)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok((
         candidates
@@ -699,15 +700,15 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+        sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(&cursor_name)
             .execute(pool.get())
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO maintenance_sweep_cursors
-             (sweep_name, cursor_updated_at, cursor_user_id, cursor_run_id)
-             VALUES (?, '2089-12-31 23:59:59.000000', '', '')",
+            "INSERT INTO sweeper_leases
+             (sweeper_name, owner_pod_id, expires_at, cursor_updated_at)
+             VALUES (?, '', '1970-01-01 00:00:00', '2089-12-31 23:59:59.000000')",
         )
         .bind(&cursor_name)
         .execute(pool.get())
@@ -745,7 +746,7 @@ mod tests {
             "the durable cursor must wrap after reaching the end of the keyset"
         );
 
-        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+        sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(&cursor_name)
             .execute(pool.get())
             .await

@@ -172,12 +172,8 @@ async fn lock_current_basis(
     let work = query(
         "SELECT w.work_revision, w.current_goal_revision, w.current_criteria_set_revision,
                 CASE WHEN w.archived_at IS NULL THEN 0 ELSE 1 END AS work_archived,
-                g.revision AS materialized_goal_revision,
                 cs.revision AS materialized_criteria_set_revision
          FROM works w
-         LEFT JOIN work_goal_revisions g
-           ON g.owner_id = w.owner_id AND g.work_id = w.work_id
-          AND g.revision = w.current_goal_revision
          LEFT JOIN work_criterion_sets cs
            ON cs.owner_id = w.owner_id AND cs.work_id = w.work_id
           AND cs.revision = w.current_criteria_set_revision
@@ -221,12 +217,10 @@ async fn lock_current_basis(
             return Err(WorkRepositoryError::InvalidWorkProposalBasis { resource });
         }
     }
-    if work_optional("materialized_goal_revision")?.is_none()
-        || work_optional("materialized_criteria_set_revision")?.is_none()
-    {
+    if work_optional("materialized_criteria_set_revision")?.is_none() {
         return Err(WorkRepositoryError::corrupt(
             "criteria proposal Work basis",
-            std::io::Error::other("current Goal or criterion-set revision is missing"),
+            std::io::Error::other("current criterion-set revision is missing"),
         ));
     }
 

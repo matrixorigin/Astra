@@ -51,7 +51,6 @@ mod proposal_queue;
 mod proposal_repository;
 mod recovery_point;
 mod repository;
-mod runtime_event_outbox;
 mod subject;
 mod subject_repository;
 
@@ -184,10 +183,6 @@ pub use repository::{
     WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkProposalBasisResource,
     WorkRecoveryPointBlocker, WorkRepository, WorkRepositoryError,
 };
-pub use runtime_event_outbox::{
-    WorkRuntimeEventProjectionResult, project_pending_runtime_events,
-    spawn_work_runtime_event_projector,
-};
 pub use subject::{
     WorkBranchSubject, WorkBranchSubjectChange, WorkBranchSubjectInvalidation,
     WorkBranchSubjectRevision, WorkSubjectRef,
@@ -199,6 +194,7 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     work_revision BIGINT NOT NULL,
     project_id VARCHAR(128) NULL,
     original_intent_ref VARCHAR(256) NOT NULL,
+    goal_text LONGTEXT NOT NULL,
     current_goal_revision BIGINT NOT NULL,
     current_criteria_set_revision BIGINT NOT NULL,
     delivery_branch_id VARCHAR(64) NOT NULL,
@@ -215,22 +211,6 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     CONSTRAINT chk_works_goal_revision CHECK (current_goal_revision > 0),
     CONSTRAINT chk_works_criteria_revision CHECK (current_criteria_set_revision > 0),
     CONSTRAINT chk_works_archive_order CHECK (archived_at IS NULL OR archived_at >= created_at)
-)";
-
-pub(crate) const WORK_GOAL_REVISIONS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_goal_revisions (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    revision BIGINT NOT NULL,
-    goal_text LONGTEXT NOT NULL,
-    source_kind VARCHAR(32) NOT NULL,
-    source_ref VARCHAR(256) NOT NULL,
-    accepted_by_kind VARCHAR(32) NOT NULL,
-    accepted_by_id VARCHAR(128) NOT NULL,
-    reason VARCHAR(512) NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, revision),
-    CONSTRAINT chk_work_goal_revision CHECK (revision > 0)
 )";
 
 pub(crate) const WORK_CRITERION_REVISIONS_CREATE_SQL: &str =
@@ -678,25 +658,6 @@ pub(crate) const WORK_PROPOSALS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS w
 /// the exact primary settlement that made its trigger set complete.  The
 /// proposal itself remains the graph mutation authority; this narrow relation
 /// only makes its user-visible receipt replay-stable.
-pub(crate) const WORK_PROPOSAL_TRIGGER_ATTEMPTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_proposal_trigger_attempts (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    branch_id VARCHAR(64) NOT NULL,
-    proposal_id VARCHAR(64) NOT NULL,
-    trigger_attempt_id VARCHAR(64) NOT NULL,
-    trigger_item_id VARCHAR(64) NOT NULL,
-    trigger_item_revision BIGINT NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, branch_id, proposal_id),
-    INDEX idx_work_proposal_trigger_attempt (
-        owner_id, work_id, branch_id, trigger_attempt_id, proposal_id
-    ),
-    CONSTRAINT chk_work_proposal_trigger_attempt_revision CHECK (
-        trigger_item_revision > 0
-    )
-)";
-
 pub(crate) const WORK_CHECK_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work_check_runs (
     owner_id VARCHAR(128) NOT NULL,
     work_id VARCHAR(64) NOT NULL,
@@ -884,10 +845,13 @@ pub(crate) const WORK_ITEM_ATTEMPTS_CREATE_SQL: &str =
     started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     settled_at DATETIME(6) NULL,
+    terminal_graph_revision BIGINT NULL,
+    terminal_control_epoch BIGINT NULL,
     PRIMARY KEY (
         owner_id, work_id, branch_id, work_item_id, work_item_revision, attempt_id
     ),
     UNIQUE KEY uq_work_item_attempt_identity (owner_id, attempt_id),
+    UNIQUE KEY uq_work_attempt_terminal_graph (owner_id, work_id, branch_id, terminal_graph_revision),
     INDEX idx_work_item_attempt_latest (
         owner_id, work_id, branch_id, work_item_id, work_item_revision,
         started_at, attempt_id
@@ -926,18 +890,6 @@ pub(crate) const WORK_ITEM_ATTEMPTS_CREATE_SQL: &str =
     )
 )";
 
-pub(crate) const WORK_TERMINAL_CUTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_terminal_cuts (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    branch_id VARCHAR(64) NOT NULL,
-    graph_revision BIGINT NOT NULL,
-    attempt_id VARCHAR(64) NOT NULL,
-    control_epoch BIGINT NOT NULL,
-    PRIMARY KEY (owner_id, work_id, branch_id, graph_revision),
-    UNIQUE KEY uq_work_terminal_cut_attempt (owner_id, attempt_id)
-)";
-
 pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work_events (
     owner_id VARCHAR(128) NOT NULL,
     work_id VARCHAR(64) NOT NULL,
@@ -961,10 +913,7 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
         'graph_replaced', 'delivery_branch_selected', 'branch_archived', 'branch_restored',
         'subject_changed',
         'plan_proposed', 'criteria_proposed', 'proposal_rejected',
-        'check_recorded', 'gaps_accepted',
-        'run_completed', 'run_delegated', 'run_failed', 'run_cancelled',
-        'recovery_point_captured',
-        'runtime_events_expired'
+        'check_recorded', 'gaps_accepted', 'recovery_point_captured'
     )),
     CONSTRAINT chk_work_event_work_revision CHECK (
         work_revision IS NULL OR work_revision > 0
@@ -980,49 +929,6 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
     ),
     CONSTRAINT chk_work_event_graph_revision CHECK (
         graph_revision IS NULL OR graph_revision > 0
-    )
-)";
-
-pub(crate) const WORK_RUNTIME_EVENT_OUTBOX_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_runtime_event_outbox (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    branch_id VARCHAR(64) NOT NULL,
-    runtime_event_seq BIGINT NOT NULL,
-    event_kind VARCHAR(32) NOT NULL,
-    graph_revision BIGINT NOT NULL,
-    source_ref VARCHAR(256) NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, runtime_event_seq),
-    UNIQUE KEY uq_work_runtime_event_source
-        (owner_id, work_id, event_kind, source_ref),
-    CONSTRAINT chk_work_runtime_event_outbox_kind CHECK (event_kind IN (
-        'run_completed', 'run_delegated', 'run_failed', 'run_cancelled'
-    )),
-    CONSTRAINT chk_work_runtime_event_outbox_sequence CHECK (runtime_event_seq > 0),
-    CONSTRAINT chk_work_runtime_event_outbox_graph_revision CHECK (graph_revision > 0)
-)";
-
-pub(crate) const WORK_RUNTIME_EVENT_OUTBOX_SLOTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_runtime_event_outbox_slots (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    last_enqueued_event_seq BIGINT NOT NULL,
-    last_projected_event_seq BIGINT NOT NULL,
-    has_pending TINYINT NOT NULL,
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id),
-    INDEX idx_work_runtime_event_pending
-        (has_pending, updated_at, owner_id, work_id),
-    CONSTRAINT chk_work_runtime_event_outbox_sequence CHECK (
-        last_enqueued_event_seq >= 0
-        AND last_projected_event_seq >= 0
-        AND last_projected_event_seq <= last_enqueued_event_seq
-    ),
-    CONSTRAINT chk_work_runtime_event_outbox_pending CHECK (
-        (has_pending = 0 AND last_projected_event_seq = last_enqueued_event_seq)
-        OR
-        (has_pending = 1 AND last_projected_event_seq < last_enqueued_event_seq)
     )
 )";
 
@@ -1076,7 +982,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         establishment_operation::WORK_ESTABLISHMENT_OPERATIONS_CREATE_SQL,
     ),
     ("works", WORKS_CREATE_SQL),
-    ("work_goal_revisions", WORK_GOAL_REVISIONS_CREATE_SQL),
     (
         "work_criterion_revisions",
         WORK_CRITERION_REVISIONS_CREATE_SQL,
@@ -1102,10 +1007,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         WORK_PROPOSAL_SEQUENCES_CREATE_SQL,
     ),
     ("work_proposals", WORK_PROPOSALS_CREATE_SQL),
-    (
-        "work_proposal_trigger_attempts",
-        WORK_PROPOSAL_TRIGGER_ATTEMPTS_CREATE_SQL,
-    ),
     ("work_check_runs", WORK_CHECK_RUNS_CREATE_SQL),
     (
         "work_acceptance_decisions",
@@ -1117,20 +1018,9 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
     ),
     ("work_event_sequences", WORK_EVENT_SEQUENCES_CREATE_SQL),
     ("work_item_attempts", WORK_ITEM_ATTEMPTS_CREATE_SQL),
-    ("work_terminal_cuts", WORK_TERMINAL_CUTS_CREATE_SQL),
     ("work_events", WORK_EVENTS_CREATE_SQL),
-    (
-        "work_runtime_event_outbox_slots",
-        WORK_RUNTIME_EVENT_OUTBOX_SLOTS_CREATE_SQL,
-    ),
-    (
-        "work_runtime_event_outbox",
-        WORK_RUNTIME_EVENT_OUTBOX_CREATE_SQL,
-    ),
     ("work_recovery_points", WORK_RECOVERY_POINTS_CREATE_SQL),
 ];
-
-pub(crate) use runtime_event_outbox::enqueue_root_run_terminal_event;
 
 const WORK_ID_MAX_CHARS: usize = 64;
 const WORK_BRANCH_ID_MAX_CHARS: usize = 64;
@@ -1792,16 +1682,13 @@ mod tests {
         );
         for required in [
             "works",
-            "work_goal_revisions",
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_branches",
             "work_item_revisions",
             "work_graph_revisions",
-            "work_proposal_trigger_attempts",
             "work_check_runs",
             "work_item_attempts",
-            "work_terminal_cuts",
             "work_acceptance_decisions",
             "work_events",
         ] {

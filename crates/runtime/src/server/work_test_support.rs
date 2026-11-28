@@ -11,8 +11,6 @@ pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         .await
         .expect("begin Work fixture cleanup");
     for (table, owner_column) in [
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_runtime_event_outbox", "owner_id"),
         ("work_recovery_points", "owner_id"),
         ("session_artifact_references", "user_id"),
         ("session_artifacts", "user_id"),
@@ -31,7 +29,6 @@ pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("work_graph_revisions", "owner_id"),
         ("work_criterion_sets", "owner_id"),
         ("work_criterion_revisions", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
         ("works", "owner_id"),
         ("agent_sessions", "user_id"),
     ] {

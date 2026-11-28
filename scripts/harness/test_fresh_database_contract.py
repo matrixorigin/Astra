@@ -643,13 +643,9 @@ class FreshDatabaseContractTests(unittest.TestCase):
         self.assertIn("plans", canonical)
         self.assertIn("workspace_records", canonical)
         self.assertNotIn("session_checkpoints", canonical)
-        self.assertIn("work_runtime_event_outbox", canonical)
+        self.assertNotIn("work_runtime_event_outbox", canonical)
         boot = contract.BOOT_METADATA_TABLES
         counts = {table: (1 if table in boot else 0) for table in canonical}
-        # The sealed seed has exactly one production-admin identity: its
-        # default user role plus the one bootstrap admin role.
-        counts["auth_roles"] = 2
-        counts["auth_user_roles"] = 2
         contract._validate_closed_schema_counts(canonical, canonical, counts)
         changed_bootstrap_auth = {**counts, "auth_users": 2}
         with self.assertRaisesRegex(contract.ContractError, "auth_users"):
@@ -659,7 +655,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
         for dirty in (
             "plans",
             "workspace_records",
-            "work_runtime_event_outbox",
+            "work_item_attempts",
         ):
             with self.subTest(table=dirty):
                 changed = {**counts, dirty: 1}
@@ -691,9 +687,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
         counts.update(
             {
                 "astra_schema_contracts": 1,
-                "astra_schema_table_contracts": 1,
                 "infra_llm_models": 1,
-                "maintenance_sweep_cursors": 1,
                 "sweeper_leases": 1,
             }
         )
@@ -744,7 +738,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
         expected = contract._canonical_runtime_system_baseline(repo)
         self.assertEqual(expected["sweeper_name"], "runtime_sweepers")
         self.assertEqual(
-            expected["maintenance_cursor_name"], "tool_invocation_compaction_v1"
+            expected["maintenance_cursor_name"], "runtime_sweepers"
         )
         self.assertEqual(
             expected["maintenance_cursor_epoch"], "1970-01-01 00:00:00.000000"
@@ -756,106 +750,43 @@ class FreshDatabaseContractTests(unittest.TestCase):
             "0",
             "2026-08-24 13:00:00.000000",
             "2026-08-24 13:00:00.000000",
-        ]
-        cursor = [
-            "tool_invocation_compaction_v1",
             "1970-01-01 00:00:00.000000",
             "",
             "",
             "0",
-            "2026-08-24 13:00:00.000000",
             "2026-08-24 13:00:00.000001",
         ]
 
-        def rows(sql, _database=None):
-            if "FROM sweeper_leases" in sql:
-                return [sweeper]
-            if "FROM maintenance_sweep_cursors" in sql:
-                return [cursor]
-            raise AssertionError(sql)
+        def validate(rows):
+            with (
+                mock.patch.dict(contract.os.environ, {}, clear=True),
+                mock.patch.object(contract, "_mysql_rows", return_value=rows),
+            ):
+                return contract._validate_runtime_system_baseline("fresh", repo)
 
-        with (
-            mock.patch.dict(contract.os.environ, {}, clear=True),
-            mock.patch.object(contract, "_mysql_rows", side_effect=rows),
-        ):
-            sealed = contract._validate_runtime_system_baseline("fresh", repo)
+        sealed = validate([sweeper])
         self.assertEqual(sealed["sweeper_leases_count"], 1)
-        self.assertEqual(sealed["maintenance_sweep_cursors_count"], 1)
         self.assertRegex(sealed["runtime_system_baseline_sha256"], r"^[0-9a-f]{64}$")
 
-        # A running seed server legitimately refreshes its TTL (and a later
-        # replica may take the lease).  Those lifecycle facts are validated,
-        # but must not invalidate a sealed clean-database proof.
+        # The proof binds the logical cursor and lease, not the live pod or TTL.
         refreshed_sweeper = [
             sweeper[0],
             "astra-runtime-0a0c3ce1-c544-4cae-9bf7-0eeef9a3b340",
             "2026-08-24 13:02:00.000000",
-            sweeper[3],
-            sweeper[4],
-            sweeper[5],
-        ]
-        refreshed_cursor = [
-            *cursor[:5],
-            cursor[5],
+            *sweeper[3:10],
             "2026-08-24 13:01:00.000001",
         ]
-        with (
-            mock.patch.dict(contract.os.environ, {}, clear=True),
-            mock.patch.object(
-                contract,
-                "_mysql_rows",
-                side_effect=lambda sql, _database=None: (
-                    [refreshed_sweeper]
-                    if "FROM sweeper_leases" in sql
-                    else [refreshed_cursor]
-                ),
-            ),
-        ):
-            refreshed = contract._validate_runtime_system_baseline("fresh", repo)
+        refreshed = validate([refreshed_sweeper])
         self.assertEqual(
             refreshed["runtime_system_baseline_sha256"],
             sealed["runtime_system_baseline_sha256"],
         )
-
-        for changed in (
-            [
-                sweeper,
-                [
-                    "unexpected_sweeper",
-                    sweeper[1],
-                    *sweeper[2:],
-                ],
-            ],
-            [[*sweeper[:1], "wrong-owner", *sweeper[2:]]],
-        ):
-            with self.subTest(rows=changed):
-                with (
-                    mock.patch.dict(contract.os.environ, {}, clear=True),
-                    mock.patch.object(
-                        contract,
-                        "_mysql_rows",
-                        side_effect=lambda sql, _database=None: (
-                            changed if "FROM sweeper_leases" in sql else [cursor]
-                        ),
-                    ),
-                    self.assertRaises(contract.ContractError),
-                ):
-                    contract._validate_runtime_system_baseline("fresh", repo)
-
-        with (
-            mock.patch.dict(contract.os.environ, {}, clear=True),
-            mock.patch.object(
-                contract,
-                "_mysql_rows",
-                side_effect=lambda sql, _database=None: (
-                    [sweeper]
-                    if "FROM sweeper_leases" in sql
-                    else [[*cursor[:4], "1", *cursor[5:]]]
-                ),
-            ),
-            self.assertRaisesRegex(contract.ContractError, "maintenance"),
-        ):
-            contract._validate_runtime_system_baseline("fresh", repo)
+        with self.assertRaises(contract.ContractError):
+            validate([sweeper, ["unexpected_sweeper", *sweeper[1:]]])
+        with self.assertRaises(contract.ContractError):
+            validate([[sweeper[0], "wrong-owner", *sweeper[2:]]])
+        with self.assertRaisesRegex(contract.ContractError, "maintenance"):
+            validate([[*sweeper[:9], "1", sweeper[10]]])
 
 
 if __name__ == "__main__":

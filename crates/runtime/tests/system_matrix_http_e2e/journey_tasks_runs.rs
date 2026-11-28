@@ -124,16 +124,6 @@ async fn seed_orphan_cancel_race_run(
     .await
     .expect("seed pending Work carrier");
     sqlx::query(
-        "INSERT INTO work_runtime_event_outbox_slots
-         (owner_id, work_id, last_enqueued_event_seq, last_projected_event_seq, has_pending)
-         VALUES (?, ?, 0, 0, 0)",
-    )
-    .bind(&ctx.user_id)
-    .bind(&work_id)
-    .execute(&ctx.pool)
-    .await
-    .expect("seed Work runtime outbox slot");
-    sqlx::query(
         "UPDATE agent_runs
          SET status = 'waiting', waiting_for = 'tool_approval',
              owner_pod_id = NULL, owner_lease_expires_at = NULL,
@@ -153,11 +143,7 @@ async fn cleanup_orphan_cancel_work_fixture(
     run_id: &str,
     work_id: &str,
 ) {
-    for statement in [
-        "DELETE FROM work_runtime_event_outbox WHERE owner_id = ? AND work_id = ?",
-        "DELETE FROM work_runtime_event_outbox_slots WHERE owner_id = ? AND work_id = ?",
-        "DELETE FROM work_item_attempts WHERE owner_id = ? AND executor_run_id = ?",
-    ] {
+    for statement in ["DELETE FROM work_item_attempts WHERE owner_id = ? AND executor_run_id = ?"] {
         let mut query = sqlx::query(statement).bind(&ctx.user_id);
         query = if statement.contains("executor_run_id") {
             query.bind(run_id)
@@ -251,15 +237,6 @@ pub async fn run_orphan_cancel_claim_race_http() {
     .await
     .expect("load cancelled Work carrier");
     assert_eq!(carrier, "cancelled");
-    let outbox_kind: String = sqlx::query_scalar(
-        "SELECT event_kind FROM work_runtime_event_outbox WHERE owner_id = ? AND work_id = ?",
-    )
-    .bind(&ctx.user_id)
-    .bind(&cancel_work_id)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("load cancellation outbox");
-    assert_eq!(outbox_kind, "run_cancelled");
 
     let (claim_run_id, claim_work_id, claim_request_id) =
         seed_orphan_cancel_race_run(ctx, "claim-win").await;

@@ -294,22 +294,12 @@ async fn jwt_authentication_uses_one_cold_query_and_zero_warm_queries_with_local
         .execute(pool.get())
         .await
         .unwrap();
-    sqlx::query("DELETE FROM auth_user_roles WHERE user_id = ?")
-        .bind(&other.user_id)
-        .execute(pool.get())
-        .await
-        .unwrap();
     sqlx::query("DELETE FROM auth_users WHERE user_id = ?")
         .bind(&other.user_id)
         .execute(pool.get())
         .await
         .unwrap();
     sqlx::query("DELETE FROM auth_refresh_tokens WHERE user_id = ?")
-        .bind(&user.user_id)
-        .execute(pool.get())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM auth_user_roles WHERE user_id = ?")
         .bind(&user.user_id)
         .execute(pool.get())
         .await

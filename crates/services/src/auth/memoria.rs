@@ -712,9 +712,6 @@ impl DatabaseAuthService {
         let identity = resolver.provider.verify(key).await?;
         let ciphertext = resolver.encryptor.encrypt(key).map_err(internal_error)?;
         let pool = self.get_pool().await.map_err(internal_error)?;
-        self.ensure_default_roles(&pool)
-            .await
-            .map_err(internal_error)?;
         // Retry aborted identity insert / serialization transactions, never only
         // the credential phase. No durable session exists on a failed attempt.
         for attempt in 0..3 {

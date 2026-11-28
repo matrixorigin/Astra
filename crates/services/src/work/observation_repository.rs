@@ -24,8 +24,8 @@ const SELECT_DECLARED_WORK_OBSERVATION_SQL: &str = "SELECT
     es.last_event_seq AS event_head,
     DATE_FORMAT(w.created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS work_created_at,
     DATE_FORMAT(w.archived_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS work_archived_at,
-    g.revision AS goal_revision,
-    g.goal_text,
+    w.current_goal_revision AS goal_revision,
+    w.goal_text,
     cs.revision AS criteria_revision,
     cs.member_count AS criteria_member_count,
     cs.member_manifest_json AS criteria_member_manifest_json,
@@ -52,10 +52,6 @@ FROM works w
 LEFT JOIN work_event_sequences es
   ON es.owner_id = w.owner_id
  AND es.work_id = w.work_id
-LEFT JOIN work_goal_revisions g
-  ON g.owner_id = w.owner_id
- AND g.work_id = w.work_id
- AND g.revision = w.current_goal_revision
 LEFT JOIN work_criterion_sets cs
   ON cs.owner_id = w.owner_id
  AND cs.work_id = w.work_id

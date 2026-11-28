@@ -42,9 +42,27 @@ initial immutable revision. Revision 1 remains retained for the Work lifetime,
 including after removal from an accepted set, so the existing owner/Work-scoped
 primary key prevents identity reuse without a separate identity table.
 
+## Canonical storage for Work and server coordination
+
+The fresh schema contains 91 table declarations, including 19 Work tables.
+The Work root stores the initial goal. A terminal attempt stores the graph
+revision and control epoch it finalized, with one winner per branch graph.
+The establishment operation retains the exact trigger attempts for its
+bounded deferred graph changes.
+
+The Run journal carries terminal status, errors and replay. Work activity
+records changes to its plan, branches, evidence and decisions. Run completion
+commits directly through the Run state store and its existing event delivery.
+
+The schema component row owns its bootstrap lease and publishes the complete
+table manifest with the readiness version in one fenced update. The account
+row owns the two built-in role grants, `astra_admin` and `astra_user`. The
+runtime sweeper row retains its tool-compaction cursor across lease takeovers.
+These changes ship with fresh schema contract v132.
+
 ## Persistence simplification boundary
 
-The production schema inventory contains 112 table declarations. The earlier
+The v120 production schema inventory contained 112 table declarations. The earlier
 retirement of diagnostic projections and separation of immutable Run openings
 are already part of the baseline. This wave removes the five authoring and
 adaptation tables listed below; it adds no replacement table.
@@ -62,7 +80,7 @@ adaptation tables listed below; it adds no replacement table.
 | Plan, session state and semantic reads | Preserve actual authoring gates, owner state and read observations; Work is not an automatic replacement for these callers. |
 | Quotas, bootstrap and maintenance | Preserve admission limits, schema ownership and bounded maintenance progress. |
 | Work roots, revisions, decisions and operations | Preserve branches, evidence, ordering, recovery and cross-Session operations; do not replace sequence high-water marks with retained-row MAX. |
-| Work runtime-event delivery | Preserve the bounded outbox, coverage floor and projection cursor. |
+| Run terminal delivery | Persist outcomes in the Run journal and use the existing Run replay and status APIs. |
 | Work saved-progress capture | Preserve real capture, package/download and artifact/Context retention. |
 
 The earlier wave removed prompt hash-diff diagnostics (two tables),

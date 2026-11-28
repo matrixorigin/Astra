@@ -1056,41 +1056,28 @@ pub const E2E_PASSWORD: &str = "E2e-matrix-pass-9";
 
 /// Ensure `user_id` has the `astra_admin` role (idempotent). Used for admin-only HTTP paths in E2E.
 pub async fn grant_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
-    sqlx::query(
-        "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
-         SELECT ?, r.role_id FROM auth_roles r WHERE r.role_name = 'astra_admin' LIMIT 1",
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .expect("grant_astra_admin_role insert");
+    sqlx::query("UPDATE auth_users SET is_admin = 1 WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("grant_astra_admin_role insert");
 
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM auth_user_roles ur \
-         INNER JOIN auth_roles r ON ur.role_id = r.role_id \
-         WHERE ur.user_id = ? AND r.role_name = 'astra_admin'",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    .expect("grant_astra_admin_role verify");
-    assert!(
-        n >= 1,
-        "user {user_id} should have astra_admin (auth_roles seeded?)"
-    );
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_users WHERE user_id = ? AND is_admin = 1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("grant_astra_admin_role verify");
+    assert!(n >= 1, "user {user_id} should have astra_admin");
 }
 
 /// Remove the `astra_admin` role from `user_id` if present (admin smoke tests start non-admin).
 pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
-    sqlx::query(
-        "DELETE ur FROM auth_user_roles ur \
-         INNER JOIN auth_roles r ON ur.role_id = r.role_id \
-         WHERE ur.user_id = ? AND r.role_name = 'astra_admin'",
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .expect("revoke_astra_admin_role delete");
+    sqlx::query("UPDATE auth_users SET is_admin = 0 WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("revoke_astra_admin_role delete");
 }
 
 pub async fn bootstrap() -> BootstrapResult {

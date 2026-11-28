@@ -371,7 +371,7 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
             .await
             .expect("another session remains active");
     }
-    for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
+    for table in ["auth_refresh_tokens", "auth_users"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ?"
         )))

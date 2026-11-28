@@ -584,7 +584,6 @@ impl DatabaseRunStateStore {
         )
         .await
         .map_err(|error| error.to_string())?;
-        enqueue_work_terminal_event_for_run(tx, run, request.status).await?;
         Ok(CanonicalTerminalClaim::Claimed {
             admission,
             control_events: controls,

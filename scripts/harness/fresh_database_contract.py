@@ -49,9 +49,7 @@ TEST_FIXTURE_TABLES = (
 BOOT_METADATA_TABLES = frozenset(
     {
         "astra_schema_contracts",
-        "astra_schema_table_contracts",
         "infra_llm_models",
-        "maintenance_sweep_cursors",
         "sweeper_leases",
         # A fresh scored database is seeded through the production admin API.
         # Its single bootstrap administrator is control-plane state, not a
@@ -59,8 +57,6 @@ BOOT_METADATA_TABLES = frozenset(
         # below so a reused user population cannot be mistaken for a fresh
         # run.
         "auth_users",
-        "auth_roles",
-        "auth_user_roles",
         "auth_refresh_tokens",
     }
 )
@@ -300,7 +296,6 @@ def _validate_closed_schema_counts(
     expected_boot_counts = {
         "astra_schema_contracts": 1,
         "infra_llm_models": 1,
-        "maintenance_sweep_cursors": 1,
         "sweeper_leases": 1,
     }
     for table, expected in expected_boot_counts.items():
@@ -315,16 +310,12 @@ def _validate_closed_schema_counts(
     # still the authority that prevents accepting a reused database.
     for table, expected in {
         "auth_users": 1,
-        "auth_roles": 2,
-        "auth_user_roles": 2,
         "auth_refresh_tokens": 1,
     }.items():
         if counts.get(table, 0) not in {0, expected}:
             raise ContractError(
                 f"bootstrap auth table {table} has {counts.get(table)!r} rows; expected 0 or {expected}"
             )
-    if counts.get("astra_schema_table_contracts", 0) <= 0:
-        raise ContractError("bootstrap table astra_schema_table_contracts is empty")
 
 
 def _validate_closed_schema_presence(
@@ -416,17 +407,13 @@ def _validate_runtime_system_baseline(database: str, repo: Path) -> dict[str, ob
     expected = _canonical_runtime_system_baseline(repo)
     sweeper_rows = _mysql_rows(
         "SELECT sweeper_name, owner_pod_id, CAST(expires_at AS CHAR), "
-        "CAST(version AS CHAR), CAST(created_at AS CHAR), CAST(updated_at AS CHAR) "
+        "CAST(version AS CHAR), CAST(created_at AS CHAR), CAST(updated_at AS CHAR), "
+        "CAST(cursor_updated_at AS CHAR), cursor_user_id, cursor_run_id, "
+        "CAST(scan_generation AS CHAR), CAST(compaction_updated_at AS CHAR) "
         "FROM sweeper_leases ORDER BY sweeper_name",
         database,
     )
-    cursor_rows = _mysql_rows(
-        "SELECT sweep_name, CAST(cursor_updated_at AS CHAR), cursor_user_id, "
-        "cursor_run_id, CAST(scan_generation AS CHAR), CAST(created_at AS CHAR), "
-        "CAST(updated_at AS CHAR) FROM maintenance_sweep_cursors ORDER BY sweep_name",
-        database,
-    )
-    if len(sweeper_rows) != 1 or len(sweeper_rows[0]) != 6:
+    if len(sweeper_rows) != 1 or len(sweeper_rows[0]) != 11:
         raise ContractError(
             "bootstrap table sweeper_leases differs from its exact runtime baseline"
         )
@@ -454,27 +441,14 @@ def _validate_runtime_system_baseline(database: str, repo: Path) -> dict[str, ob
         raise ContractError(
             "bootstrap table sweeper_leases differs from its exact runtime baseline"
         )
-    if len(cursor_rows) != 1 or len(cursor_rows[0]) != 7:
-        raise ContractError(
-            "bootstrap table maintenance_sweep_cursors differs from its exact runtime baseline"
-        )
-    cursor = cursor_rows[0]
-    cursor_created_at = _parse_timestamp(cursor[5], "maintenance cursor created_at")
-    cursor_updated_at = _parse_timestamp(cursor[6], "maintenance cursor updated_at")
+    cursor = sweeper[6:10]
+    compaction_updated_at = _parse_timestamp(sweeper[10], "compaction updated_at")
     if (
-        cursor[:5]
-        != [
-            expected["maintenance_cursor_name"],
-            expected["maintenance_cursor_epoch"],
-            "",
-            "",
-            "0",
-        ]
-        or cursor_updated_at < cursor_created_at
+        sweeper[0] != expected["maintenance_cursor_name"]
+        or cursor != [expected["maintenance_cursor_epoch"], "", "", "0"]
+        or compaction_updated_at < created_at
     ):
-        raise ContractError(
-            "bootstrap table maintenance_sweep_cursors differs from its exact runtime baseline"
-        )
+        raise ContractError("maintenance cursor differs from its exact runtime baseline")
     # Lease ownership and timestamps are deliberately *not* proof identity.
     # A healthy seeded server refreshes its TTL while immutable verifier images
     # are being pre-warmed, and an HPA handover may legitimately replace the
@@ -486,14 +460,13 @@ def _validate_runtime_system_baseline(database: str, repo: Path) -> dict[str, ob
     serialized = json.dumps(
         {
             "contract": expected,
-            "maintenance_sweep_cursor": cursor[:5],
+            "maintenance_sweep_cursor": cursor,
             "sweeper_lease": [sweeper[0], sweeper[3]],
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
     return {
-        "maintenance_sweep_cursors_count": 1,
         "sweeper_leases_count": 1,
         "runtime_system_baseline_sha256": hashlib.sha256(serialized).hexdigest(),
     }
@@ -502,40 +475,43 @@ def _validate_runtime_system_baseline(database: str, repo: Path) -> dict[str, ob
 def _validate_boot_metadata(database: str, repo: Path, counts: dict[str, int]) -> dict:
     version = _core_schema_contract_version(repo)
     contracts = _mysql_rows(
-        "SELECT component, contract_version FROM astra_schema_contracts ORDER BY component",
+        "SELECT component, contract_version, table_manifest_json, "
+        "IF(bootstrap_holder_id IS NULL AND bootstrap_expires_at IS NULL, 0, 1) "
+        "FROM astra_schema_contracts ORDER BY component",
         database,
     )
-    if contracts != [["astra-core", version]]:
-        raise ContractError(
-            "astra_schema_contracts does not match the exact source contract"
-        )
-    leases = _mysql_rows(
-        "SELECT component, holder_id FROM astra_schema_bootstrap_leases ORDER BY component",
-        database,
-    )
-    if leases:
+    if len(contracts) != 1 or len(contracts[0]) != 4 or contracts[0][:2] != ["astra-core", version]:
+        raise ContractError("astra_schema_contracts does not match the exact source contract")
+    if contracts[0][3] != "0":
         raise ContractError("schema bootstrap lease remains active after seeding")
-    table_contracts = _mysql_rows(
-        "SELECT table_name, component, owner, contract_version, ddl_sha256 "
-        "FROM astra_schema_table_contracts ORDER BY table_name",
-        database,
-    )
-    if len(table_contracts) != counts["astra_schema_table_contracts"]:
-        raise ContractError("schema table contract row count changed during inspection")
+    try:
+        table_contracts = json.loads(contracts[0][2])
+    except ValueError as error:
+        raise ContractError("schema table manifest is not valid JSON") from error
+    if not isinstance(table_contracts, list) or not table_contracts:
+        raise ContractError("schema table manifest is empty or has an invalid shape")
+    if counts.get("auth_users") == 1:
+        roles = _mysql_rows(
+            "SELECT CAST(is_admin AS CHAR), CAST(has_user_role AS CHAR) FROM auth_users",
+            database,
+        )
+        if roles != [["1", "1"]]:
+            raise ContractError("seeded auth_users row must have both fixed bootstrap roles")
     manifest = _canonical_schema_manifest(repo)
     canonical = set(manifest["tables"])
     conditional_tables = set(manifest["conditional_tables"])
     seen: set[str] = set()
     for row in table_contracts:
-        if len(row) != 5:
+        if not isinstance(row, dict) or set(row) != {"name", "owner", "ddl_sha256"}:
             raise ContractError("schema table contract row has an invalid shape")
-        table, component, owner, row_version, ddl_sha256 = row
+        table, owner, ddl_sha256 = row["name"], row["owner"], row["ddl_sha256"]
         if (
-            table not in canonical
+            not isinstance(table, str)
+            or table not in canonical
             or table in seen
-            or component != "astra-core"
+            or not isinstance(owner, str)
             or not owner
-            or row_version != version
+            or not isinstance(ddl_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", ddl_sha256) is None
         ):
             raise ContractError(f"schema table contract is not canonical: {table!r}")

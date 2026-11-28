@@ -230,7 +230,7 @@ async fn load_basis_and_graph(
         "SELECT w.work_id, w.work_revision,
                 w.current_goal_revision, w.current_criteria_set_revision,
                 CASE WHEN w.archived_at IS NULL THEN 0 ELSE 1 END AS work_archived,
-                g.revision AS goal_revision, g.goal_text,
+                w.goal_text,
                 cs.revision AS criteria_set_revision,
                 cs.member_count AS criteria_member_count,
                 cs.member_manifest_hash AS criteria_manifest_hash,
@@ -244,9 +244,6 @@ async fn load_basis_and_graph(
          FROM work_branches b
          JOIN works w
            ON w.owner_id = b.owner_id AND w.work_id = b.work_id
-         LEFT JOIN work_goal_revisions g
-           ON g.owner_id = w.owner_id AND g.work_id = w.work_id
-          AND g.revision = w.current_goal_revision
          LEFT JOIN work_criterion_sets cs
            ON cs.owner_id = w.owner_id AND cs.work_id = w.work_id
           AND cs.revision = w.current_criteria_set_revision
@@ -292,14 +289,6 @@ async fn load_basis_and_graph(
         .map_err(|source| WorkRepositoryError::corrupt("Work plan basis", source))?;
     let goal_revision = GoalRevision::new(integer("current_goal_revision")?)
         .map_err(|source| WorkRepositoryError::corrupt("Work plan basis", source))?;
-    let materialized_goal_revision = GoalRevision::new(integer("goal_revision")?)
-        .map_err(|source| WorkRepositoryError::corrupt("Work plan basis", source))?;
-    if materialized_goal_revision != goal_revision {
-        return Err(WorkRepositoryError::corrupt(
-            "Work plan basis",
-            std::io::Error::other("current Goal revision is missing or incoherent"),
-        ));
-    }
     let criteria_set_revision =
         CriterionSetRevision::new(integer("current_criteria_set_revision")?)
             .map_err(|source| WorkRepositoryError::corrupt("Work plan basis", source))?;
@@ -698,8 +687,7 @@ pub(super) async fn load_item_executions(
         builder
             .push(
                 "(SELECT a.executor_run_id, a.execution_mode, a.status, a.graph_revision,
-                           c.graph_revision AS terminal_graph_revision,
-                           c.control_epoch AS terminal_control_epoch, a.work_item_id,
+                           a.terminal_graph_revision, a.terminal_control_epoch, a.work_item_id,
                            a.work_item_revision, a.attempt_id, a.run_generation,
                            a.last_event_idx,
                            DATE_FORMAT(a.updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS updated_at,
@@ -708,11 +696,6 @@ pub(super) async fn load_item_executions(
                            a.blocker_kind AS delivery_blocker_kind,
                            a.unavailable_capabilities_json AS delivery_unavailable_capabilities_json
                     FROM work_item_attempts a
-                    LEFT JOIN work_terminal_cuts c
-                      ON c.owner_id = a.owner_id
-                     AND c.work_id = a.work_id
-                     AND c.branch_id = a.branch_id
-                     AND c.attempt_id = a.attempt_id
                     WHERE a.owner_id = ",
             )
             .push_bind(owner_id.as_str())
