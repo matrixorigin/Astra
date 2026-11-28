@@ -7,7 +7,7 @@ use super::{
     WorkId, WorkOwnerId, WorkSubjectRef,
 };
 use chrono::{DateTime, Utc};
-use sqlx::{MySql, Row, Transaction, query};
+use sqlx::{Row, query};
 
 struct SubjectContext {
     branch_revision: WorkBranchRevision,
