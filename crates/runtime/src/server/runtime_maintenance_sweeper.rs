@@ -168,7 +168,7 @@ mod tests {
         // They fill the first raw page; a zero-deletion page must still advance.
         for chunk in (0..500).collect::<Vec<_>>().chunks(100) {
             let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "INSERT INTO model_request_context_events (user_id,session_id,event_id,attempt_id,invocation_id,event_stage,terminal_status,topology,provider,model_family,purpose,event_json,created_at) ",
+                "INSERT INTO model_request_context_events (user_id,session_id,event_id,attempt_id,invocation_id,event_stage,terminal_status,event_json,created_at) ",
             );
             query.push_values(chunk, |mut row, index| {
                 row.push("'orphan-owner'")
@@ -178,10 +178,6 @@ mod tests {
                     .push_bind(format!("invocation-{index}"))
                     .push("'accepted'")
                     .push("NULL")
-                    .push("'server_only'")
-                    .push("'openai'")
-                    .push("'fixture'")
-                    .push("'introspection'")
                     .push("'{}'")
                     .push("DATE_SUB(NOW(6),INTERVAL 32 DAY)");
             });

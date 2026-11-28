@@ -10,9 +10,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, BorderType, Borders, Widget},
 };
 
 use super::textarea::{TextArea, TextAreaAction};
@@ -553,10 +553,13 @@ impl BottomPaneView for TaskInputView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let theme = crate::tui::theme::current();
         if !self.child_owner_can_view() {
             Block::default()
                 .title(" Sign in as the draft owner to view this message ")
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.gutter_frozen))
                 .render(area, buf);
             return;
         }
@@ -566,7 +569,6 @@ impl BottomPaneView for TaskInputView {
         {
             return;
         }
-        let theme = crate::tui::theme::current();
         let (title, name, state, placeholder) = match &self.purpose {
             InputPurpose::Guide(target) => (
                 " Message ",
@@ -624,12 +626,13 @@ impl BottomPaneView for TaskInputView {
                 " Send input ",
                 task_id.as_str(),
                 " · running ",
-                "Input goes only to this process; Enter sends a line.",
+                "Input goes only to this process.",
             ),
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.gutter_frozen))
             .title(Line::from(vec![
                 Span::styled(
                     title,

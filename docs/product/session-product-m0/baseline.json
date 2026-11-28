@@ -273,8 +273,7 @@
       {"name": "Edge", "identity": "work_id + branch_id + graph_revision + from_item_id + to_item_id", "revision": "owned by immutable graph revision", "owner": "WorkGraphRepository", "path": "crates/services/src/work/graph.rs"},
       {"name": "CheckRun", "identity": "check_run_id", "revision": "pinned criterion, item, subject, and graph basis", "owner": "WorkEvidenceRepository", "path": "crates/services/src/work/evidence_repository.rs"},
       {"name": "AcceptanceDecision", "identity": "acceptance_decision_id", "revision": "pinned goal, criteria, graph, check, and subject basis", "owner": "WorkEvidenceRepository", "path": "crates/services/src/work/acceptance.rs"},
-      {"name": "WorkEvent", "identity": "work_id + event_seq", "revision": "monotonic Work-scoped event_seq with source_ref/source_cursor", "owner": "Work event outbox/projector", "path": "crates/services/src/work/events.rs"},
-      {"name": "ReadReceipt", "identity": "user_id + work_id", "revision": "monotonic last_seen_work_event_seq and receipt revision", "owner": "WorkAttentionRepository", "path": "crates/services/src/work/attention_repository.rs"}
+      {"name": "WorkEvent", "identity": "work_id + event_seq", "revision": "monotonic Work-scoped event_seq with source_ref/source_cursor", "owner": "Work event outbox/projector", "path": "crates/services/src/work/events.rs"}
     ]
   },
   "legacy_authority_matrix": [

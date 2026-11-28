@@ -10,15 +10,14 @@ use astra_services::work::{
     DatabaseWorkBranchCatalogService, DatabaseWorkBranchComparisonService,
     DatabaseWorkBranchCreationService, DatabaseWorkBranchDeletionService, DatabaseWorkRepository,
     ForkCursorRef, GoalRevision, GraphRevision, InternalSessionId, NewWorkCriterion,
-    OriginalIntentRef, WorkArchivedBranchCursor, WorkAttentionCursorAdvance,
-    WorkAttentionCursorKind, WorkBranchId, WorkBranchRetentionChange, WorkBranchRetentionKind,
-    WorkBranchRevision, WorkCatalogCursor, WorkCatalogPageLimit, WorkCatalogQuery, WorkChangeRef,
-    WorkConflictResource, WorkContentHash, WorkCriteriaProposalAcceptance,
-    WorkCriteriaProposalRejection, WorkCriteriaQuery, WorkEventPageLimit, WorkEventQuery,
-    WorkEventSeq, WorkGenesis, WorkGenesisParts, WorkGoal, WorkId, WorkItemId, WorkItemRevision,
-    WorkObservationQuery, WorkOwnerId, WorkProposalId, WorkRecoveryPointCaptureRequest,
-    WorkRecoveryPointCursor, WorkRecoveryPointQuery, WorkRepository, WorkRepositoryError,
-    WorkRevision, WorkSubjectRef, WorkTaskGraphQuery,
+    OriginalIntentRef, WorkArchivedBranchCursor, WorkBranchId, WorkBranchRetentionChange,
+    WorkBranchRetentionKind, WorkBranchRevision, WorkCatalogCursor, WorkCatalogPageLimit,
+    WorkCatalogQuery, WorkChangeRef, WorkConflictResource, WorkContentHash,
+    WorkCriteriaProposalAcceptance, WorkCriteriaProposalRejection, WorkCriteriaQuery,
+    WorkEventPageLimit, WorkEventQuery, WorkEventSeq, WorkGenesis, WorkGenesisParts, WorkGoal,
+    WorkId, WorkItemId, WorkItemRevision, WorkObservationQuery, WorkOwnerId, WorkProposalId,
+    WorkRecoveryPointCaptureRequest, WorkRecoveryPointCursor, WorkRecoveryPointQuery,
+    WorkRepository, WorkRepositoryError, WorkRevision, WorkSubjectRef, WorkTaskGraphQuery,
 };
 use astra_services::{
     DatabaseSessionArtifactStore, SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1,
@@ -58,16 +57,16 @@ use astra_server_types::{
     WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
     WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
     WorkInteractionKindV1, WorkInteractionResolutionOutcomeV1, WorkObservationResponseV1,
-    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkRecoveryPointArtifactV1,
-    WorkRecoveryPointCapabilitiesV1, WorkRecoveryPointCaptureRequestV1,
-    WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1, WorkRecoveryPointExecutionV1,
-    WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1, WorkRecoveryPointReasonV1,
-    WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1, WorkRecoveryPointViewV1,
-    WorkRecoveryPointWorkspaceV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
-    WorkTaskGraphResponseV1, WorkTranscriptItemV1, WorkTranscriptPageResponseV1,
-    WorkTranscriptQueryV1, WorkTurnRequestV1, WorkWorkspaceRecoveryArtifactBeginRequestV1,
-    WorkWorkspaceRecoveryArtifactResponseV1, WorkWorkspaceRecoveryArtifactSealRequestV1,
-    WorkWorkspaceRecoveryBlobV1, WorkWorkspaceRecoveryChunkReceiptV1, WorkWorkspaceRecoveryChunkV1,
+    WorkRecoveryPointArtifactV1, WorkRecoveryPointCapabilitiesV1,
+    WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1,
+    WorkRecoveryPointExecutionV1, WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1,
+    WorkRecoveryPointReasonV1, WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1,
+    WorkRecoveryPointViewV1, WorkRecoveryPointWorkspaceV1, WorkSessionBindingResponseV1,
+    WorkTaskGraphQueryV1, WorkTaskGraphResponseV1, WorkTranscriptItemV1,
+    WorkTranscriptPageResponseV1, WorkTranscriptQueryV1, WorkTurnRequestV1,
+    WorkWorkspaceRecoveryArtifactBeginRequestV1, WorkWorkspaceRecoveryArtifactResponseV1,
+    WorkWorkspaceRecoveryArtifactSealRequestV1, WorkWorkspaceRecoveryBlobV1,
+    WorkWorkspaceRecoveryChunkReceiptV1, WorkWorkspaceRecoveryChunkV1,
 };
 
 const WORK_REQUEST_ID_MAX_BYTES: usize = 256;
@@ -498,48 +497,6 @@ fn parse_work_recovery_point_ids(
         )
     })?;
     Ok((work_id, branch_id))
-}
-
-fn map_cursor_repository_error(
-    work_id: &str,
-    error: WorkRepositoryError,
-) -> (StatusCode, Json<WorkApiErrorV1>) {
-    match error {
-        WorkRepositoryError::NotFound => work_error(
-            StatusCode::NOT_FOUND,
-            "work_not_found",
-            WorkApiErrorCategory::NotFound,
-            false,
-            Vec::new(),
-        ),
-        WorkRepositoryError::EventCursorAhead { .. } => work_error(
-            StatusCode::CONFLICT,
-            "work_event_cursor_ahead",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ),
-        error @ WorkRepositoryError::Persistence { .. } => {
-            tracing::warn!(work_id, error = %error, "Work read cursor persistence failed");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work_write_unavailable",
-                WorkApiErrorCategory::Availability,
-                true,
-                vec![WorkApiActionHint::RetryWrite],
-            )
-        }
-        error => {
-            tracing::error!(work_id, error = %error, "canonical Work read cursor is degraded");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "causal_projection_degraded",
-                WorkApiErrorCategory::Degraded,
-                true,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        }
-    }
 }
 
 fn map_event_page_repository_error(
@@ -4179,7 +4136,9 @@ pub(super) async fn get_work_branch_activity_handler(
         work_id: observation.work_id.as_str().to_owned(),
         branch_id: observation.branch_id.as_str().to_owned(),
         branch_revision: observation.branch_revision.get(),
+        event_head: observation.event_head.get(),
         activity,
+        pause_cursor: observation.pause_cursor,
         observed_at: observation
             .observed_at
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
@@ -9148,100 +9107,7 @@ pub(super) async fn get_work_task_graph_handler(
     Ok(Json(WorkTaskGraphResponseV1(page)))
 }
 
-/// Monotonic user read receipt. The exact through-sequence is the idempotency
-/// identity; this command never infers a cursor from page-open time or text.
-pub(super) async fn put_work_read_cursor_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(work_id): Path<String>,
-    payload: Result<Json<WorkReadCursorRequestV1>, JsonRejection>,
-) -> WorkApiResult<WorkReadCursorResponseV1> {
-    require_work_api_major(&headers)?;
-    let Json(payload) = payload.map_err(|_| {
-        work_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_work_read_cursor_request",
-            WorkApiErrorCategory::InvalidRequest,
-            false,
-            Vec::new(),
-        )
-    })?;
-    let through_event_seq = WorkEventSeq::new(payload.through_event_seq).map_err(|_| {
-        work_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_work_event_cursor",
-            WorkApiErrorCategory::InvalidRequest,
-            false,
-            Vec::new(),
-        )
-    })?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
-    let work_id = WorkId::parse(work_id).map_err(|_| {
-        work_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_work_id",
-            WorkApiErrorCategory::InvalidRequest,
-            false,
-            Vec::new(),
-        )
-    })?;
-    let pool = state.shared_pool.ok_or_else(|| {
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "work_write_unavailable",
-            WorkApiErrorCategory::Availability,
-            true,
-            vec![WorkApiActionHint::RetryWrite],
-        )
-    })?;
-    let repository = DatabaseWorkRepository::new(pool);
-    let receipt = repository
-        .advance_attention_cursor(WorkAttentionCursorAdvance {
-            owner_id,
-            work_id: work_id.clone(),
-            kind: WorkAttentionCursorKind::Seen,
-            through_event_seq,
-        })
-        .await
-        .map_err(|error| map_cursor_repository_error(work_id.as_str(), error))?;
-    let through_event_seq = receipt.seen_through_event_seq.ok_or_else(|| {
-        tracing::error!(
-            work_id = work_id.as_str(),
-            "committed receipt has no seen cursor"
-        );
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "causal_projection_degraded",
-            WorkApiErrorCategory::Degraded,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    let receipt_hash = receipt.seen_receipt_hash.ok_or_else(|| {
-        tracing::error!(
-            work_id = work_id.as_str(),
-            "committed receipt has no seen receipt hash"
-        );
-        work_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "causal_projection_degraded",
-            WorkApiErrorCategory::Degraded,
-            true,
-            vec![WorkApiActionHint::RetryRead],
-        )
-    })?;
-    Ok(Json(WorkReadCursorResponseV1 {
-        schema_version: 1,
-        work_id,
-        through_event_seq,
-        receipt_revision: receipt.revision,
-        receipt_hash,
-        updated_at: receipt.updated_at,
-    }))
-}
-
-/// Bounded semantic Work timeline. Reading never advances the durable seen
-/// cursor; clients perform that distinct mutation through the read-cursor PUT.
+/// Bounded semantic Work timeline.
 pub(super) async fn get_work_events_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9999,7 +9865,7 @@ mod tests {
 
     #[test]
     fn future_cursor_mapping_is_a_typed_refresh_conflict() {
-        let (status, Json(error)) = map_cursor_repository_error(
+        let (status, Json(error)) = map_event_page_repository_error(
             "work-1",
             WorkRepositoryError::EventCursorAhead {
                 through_event_seq: 2,

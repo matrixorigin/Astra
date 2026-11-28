@@ -147,8 +147,8 @@ presentation as the primary view. Improve labels, indentation, aligned metrics,
 and selective color without discarding the useful context sections. At narrow
 widths, wrap stage details cleanly instead of squeezing labels or forcing a
 wide timing chart. Details expose explicit dependencies, attempt usage, and
-missing measurements. Live updates redraw in place at a bounded rate rather
-than append a stream of reports. A timeline may be offered as an optional view.
+missing measurements. Chat shows ordinary progress during the turn and
+appends one measured tree at settlement. A timeline may be offered as an optional view.
 Color supplements status symbols and text; respect `NO_COLOR`.
 
 The `on` mode keeps this tree concise while retaining measured timing, overlap,

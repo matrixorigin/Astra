@@ -2,10 +2,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Widget,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
 use crate::cli::command_registry::{self, CommandGroup, CommandMeta};
@@ -13,36 +14,12 @@ use crate::cli::command_registry::{self, CommandGroup, CommandMeta};
 const MAX_CMD_ROWS: usize = 10;
 const TAB_ROWS: u16 = 1;
 const COMMAND_SPACER_ROWS: u16 = 1;
-const HINT_SPACER_ROWS: u16 = 1;
-const HINT_ROWS: u16 = 1;
-const MIN_VIEW_HEIGHT: u16 = TAB_ROWS + COMMAND_SPACER_ROWS + 1 + HINT_ROWS;
-
-fn hint_spacer_rows_for_height(height: u16) -> u16 {
-    if height > MIN_VIEW_HEIGHT {
-        HINT_SPACER_ROWS
-    } else {
-        0
-    }
-}
+const MIN_VIEW_HEIGHT: u16 = TAB_ROWS + COMMAND_SPACER_ROWS + 1;
 
 fn visible_command_rows(height: u16, command_count: usize) -> usize {
-    let hint_rows = if height >= MIN_VIEW_HEIGHT {
-        HINT_ROWS
-    } else {
-        0
-    };
-    let reserved_rows =
-        TAB_ROWS + COMMAND_SPACER_ROWS + hint_spacer_rows_for_height(height) + hint_rows;
-    (height.saturating_sub(reserved_rows) as usize)
+    usize::from(height.saturating_sub(TAB_ROWS + COMMAND_SPACER_ROWS))
         .min(MAX_CMD_ROWS)
         .min(command_count)
-}
-
-fn help_hint() -> String {
-    format!(
-        "←/→ switch section  ↑/↓ browse  Enter select  /<name> searches all actions  {} background  Esc close",
-        crate::tui::background_shortcut::ctrl_b_background_shortcut()
-    )
 }
 
 struct GroupData {
@@ -112,9 +89,14 @@ impl BottomPaneView for HelpView {
             return;
         }
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let sel = Style::default()
-            .fg(crate::tui::theme::current().accent)
+        let theme = crate::tui::theme::current();
+        let dim = Style::default().fg(theme.dim);
+        let tab = Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let selected = Style::default()
+            .fg(theme.selected_fg)
+            .bg(theme.selected_bg)
             .add_modifier(Modifier::BOLD);
         // Plain semantic tabs stay aligned across fonts and terminals.
         {
@@ -122,7 +104,7 @@ impl BottomPaneView for HelpView {
             for (i, gd) in self.groups.iter().enumerate() {
                 let label = gd.title.to_string();
                 if i == self.active_tab {
-                    spans.push(Span::styled(label, sel));
+                    spans.push(Span::styled(label, tab));
                 } else {
                     spans.push(Span::styled(label, dim));
                 }
@@ -139,6 +121,8 @@ impl BottomPaneView for HelpView {
         let cmds = self.active_commands();
         let visible = self.visible_command_range(area.height);
         let command_y = area.y + TAB_ROWS + COMMAND_SPACER_ROWS;
+        let name_width = usize::from(area.width.saturating_sub(4)).min(30);
+        let desc_width = usize::from(area.width).saturating_sub(4 + name_width);
 
         for (i, &meta) in cmds
             .iter()
@@ -155,39 +139,30 @@ impl BottomPaneView for HelpView {
                 meta.name.to_string()
             };
 
-            let name_w = 30;
-            let cmd_display = crate::tui::truncate_ellipsis(&cmd_display, name_w);
-            let padded = format!("{:<width$}", cmd_display, width = name_w);
-            let desc_budget = (area.width as usize).saturating_sub(4 + name_w);
-            let desc: String = meta.description.chars().take(desc_budget).collect();
-
-            let line = if is_sel {
+            let name = crate::tui::history_cell::truncate_by_width(&cmd_display, name_width);
+            let gap = " ".repeat(name_width.saturating_sub(name.width()));
+            let desc = crate::tui::history_cell::truncate_by_width(meta.description, desc_width);
+            let marker = if is_sel { "  › " } else { "    " };
+            let name_style = if is_sel { selected } else { Style::default() };
+            let desc_style = if is_sel { selected } else { dim };
+            let row = Rect::new(area.x, y, area.width, 1);
+            if is_sel {
+                buf.set_style(row, selected);
+            }
+            Widget::render(
                 Line::from(vec![
-                    Span::styled("  ", sel),
-                    Span::styled(padded, sel),
-                    Span::styled(desc, sel),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw("  "),
-                    Span::raw(padded),
-                    Span::styled(desc, dim),
-                ])
-            };
-            Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
-        }
-
-        if area.height >= MIN_VIEW_HEIGHT {
-            let hint_y = area.bottom() - HINT_ROWS;
-            let hint = Line::from(Span::styled(format!("  {}", help_hint()), dim));
-            Widget::render(hint, Rect::new(area.x, hint_y, area.width, HINT_ROWS), buf);
+                    Span::styled(format!("{marker}{name}{gap}"), name_style),
+                    Span::styled(desc, desc_style),
+                ]),
+                row,
+                buf,
+            );
         }
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
         let cmds_h = self.active_commands().len().min(MAX_CMD_ROWS) as u16;
-        TAB_ROWS + COMMAND_SPACER_ROWS + cmds_h + HINT_SPACER_ROWS + HINT_ROWS
+        TAB_ROWS + COMMAND_SPACER_ROWS + cmds_h
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -255,8 +230,15 @@ impl BottomPaneView for HelpView {
         }
     }
 
+    fn slash_reclaims_focus(&self) -> bool {
+        true
+    }
+
     fn hint_keys(&self) -> Option<String> {
-        Some(help_hint())
+        Some(format!(
+            "↑↓ select · ←/→ section · Enter insert · Esc close · / commands · {} background",
+            crate::tui::background_shortcut::ctrl_b_background_shortcut()
+        ))
     }
 }
 
@@ -269,11 +251,11 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         view.render(area, &mut buffer);
 
-        let accent = crate::tui::theme::current().accent;
+        let selected_bg = crate::tui::theme::current().selected_bg;
         let selected_y = (area.y..area.bottom())
             .find(|&y| {
                 let cell = &buffer[(area.x, y)];
-                cell.fg == accent && cell.modifier.contains(Modifier::BOLD)
+                cell.bg == selected_bg && cell.modifier.contains(Modifier::BOLD)
             })
             .expect("the selected command is rendered in the visible area");
 

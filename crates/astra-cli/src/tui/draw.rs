@@ -222,7 +222,8 @@ fn focused_agent_activity_line(
     run_id: &str,
     width: u16,
 ) -> Line<'static> {
-    use super::bottom_pane::in_flight_agents_view::{format_elapsed, state_color, state_phrase};
+    use super::bottom_pane::background_task_view::types::format_elapsed;
+    use super::bottom_pane::in_flight_agents_view::{state_color, state_phrase};
     let Some((cell, state, attention)) = widget.agent_run_for_workspace(agent_id, run_id) else {
         return Line::styled(
             super::history_cell::truncate_by_width(
@@ -232,7 +233,15 @@ fn focused_agent_activity_line(
             Style::default().fg(crate::tui::theme::current().dim),
         );
     };
-    let mut parts = vec![state_phrase(state).unwrap_or("working").to_string()];
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let mut parts = vec![
+        Span::styled("  ", dim),
+        Span::styled(
+            state_phrase(state).unwrap_or("working"),
+            Style::default().fg(state_color(state)).bold(),
+        ),
+    ];
     let reliable = !matches!(
         state.confidence,
         AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
@@ -245,24 +254,21 @@ fn focused_agent_activity_line(
         None
     };
     if let Some(elapsed) = elapsed {
-        parts.push(format_elapsed(elapsed));
+        parts.push(Span::styled(format!(" · {}", format_elapsed(elapsed)), dim));
     }
     if let Some(attention) = attention {
-        parts.push(crate::tui::render::line_utils::sanitize_terminal_text(attention).into_owned());
+        let attention = crate::tui::render::line_utils::sanitize_terminal_text(attention);
+        let available =
+            usize::from(width).saturating_sub(parts.iter().map(Span::width).sum::<usize>() + 3);
+        if available > 0 {
+            let brief = super::history_cell::truncate_by_width(&attention, available);
+            parts.push(Span::styled(
+                format!(" · {brief}"),
+                Style::default().fg(theme.warn),
+            ));
+        }
     }
-    parts.push(
-        crate::tui::render::line_utils::sanitize_terminal_text(&cell.description).into_owned(),
-    );
-    let text = super::history_cell::truncate_by_width(
-        &format!("  {}", parts.join(" · ")),
-        usize::from(width),
-    );
-    Line::styled(
-        text,
-        Style::default()
-            .fg(state_color(state))
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    )
+    Line::from(parts)
 }
 
 /// A compact browser-like tab strip for retained conversations. On narrow
@@ -277,9 +283,10 @@ fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Opti
     let theme = crate::tui::theme::current();
     let dim = Style::default().fg(theme.dim);
     let active_style = Style::default()
-        .fg(theme.accent)
+        .fg(theme.selected_fg)
+        .bg(theme.selected_bg)
         .add_modifier(ratatui::style::Modifier::BOLD);
-    let label_budget = 22;
+    let label_budget = usize::from(width);
     let labels = tabs
         .iter()
         .map(|tab| super::history_cell::truncate_by_width(&tab.label, label_budget))
@@ -290,26 +297,22 @@ fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Opti
             .iter()
             .map(|label| UnicodeWidthStr::width(label.as_str()) + 2)
             .sum::<usize>()
-        + tabs.len().saturating_sub(1) * 3
-        + UnicodeWidthStr::width(shortcut);
+        + tabs.len().saturating_sub(1) * 2;
 
     if full_width <= usize::from(width) {
         let mut spans = vec![Span::styled("  ", dim)];
         for (index, (tab, label)) in tabs.iter().zip(labels).enumerate() {
             if index > 0 {
-                spans.push(Span::styled(" · ", dim));
+                spans.push(Span::raw("  "));
             }
-            let marker = if tab.active {
-                crate::tui::glyphs::current().activity_frames[2]
-            } else {
-                crate::tui::glyphs::current().agent_running
-            };
             spans.push(Span::styled(
-                format!("{marker} {label}"),
+                format!(" {label} "),
                 if tab.active { active_style } else { dim },
             ));
         }
-        spans.push(Span::styled(shortcut, dim));
+        if full_width + shortcut.width() <= usize::from(width) {
+            spans.push(Span::styled(shortcut, dim));
+        }
         return Some(Line::from(spans));
     }
 
@@ -319,20 +322,13 @@ fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Opti
         .find_map(|(tab, label)| tab.active.then_some(label))
         .unwrap_or_else(|| "conversation".to_string());
     let prefix = if width >= 16 { "  " } else { "" };
-    let marker = crate::tui::glyphs::current().activity_frames[2];
-    let lead = format!("{prefix}{marker} ");
-    let lead = if lead.width() < usize::from(width) {
-        lead
-    } else {
-        String::new()
-    };
     let label = super::history_cell::truncate_by_width(
         &active_label,
-        usize::from(width).saturating_sub(lead.width()),
+        usize::from(width).saturating_sub(prefix.width()),
     );
-    let mut spans = vec![Span::styled(format!("{lead}{label}"), active_style)];
+    let mut spans = vec![Span::raw(prefix), Span::styled(label.clone(), active_style)];
     let suffix = format!(" · {} conversations{shortcut}", tabs.len());
-    if lead.width() + label.width() + suffix.width() <= usize::from(width) {
+    if prefix.width() + label.width() + suffix.width() <= usize::from(width) {
         spans.push(Span::styled(suffix, dim));
     }
     Some(Line::from(spans))
@@ -378,9 +374,7 @@ fn render_primary_workspace(
     // terminal. Workspace tabs and activity chrome consume rows above it;
     // sizing against the full terminal leaves the last transcript rows
     // unreachable whenever that chrome is visible.
-    if bottom_pane.conversation_tab_is_open() {
-        bottom_pane.prepare_conversation_workspace(workspace_area.height, workspace_area.width);
-    }
+    bottom_pane.prepare_conversation_workspace(workspace_area.height, workspace_area.width);
     bottom_pane.render(workspace_area, buf);
     bottom_pane.cursor_position(workspace_area)
 }
@@ -390,8 +384,6 @@ fn render_primary_workspace(
 pub(crate) struct ViewportFrame {
     pub active: ActiveView,
     pub status: Option<super::status_indicator::StatusIndicator>,
-    /// Independent bounded Explain observer beside the streamed answer.
-    pub explain_analyze: Option<Vec<Line<'static>>>,
     /// Parallel agents to render ABOVE the active cell. Rendered as
     /// a stack of `LiveFramedCell`s with a "▶ N parallel agents"
     /// header. Co-exists with `active` (which usually holds an
@@ -546,7 +538,9 @@ pub(crate) fn active_viewport(
         let mut lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
             && cell.is_live()
         {
-            sanitize_lines_for_buffer(assistant.live_viewport_lines(inner_w, live_assistant_rows))
+            sanitize_lines_for_buffer(
+                assistant.live_reply_lines(width.saturating_sub(2).max(1), live_assistant_rows),
+            )
         } else {
             history_cell_lines_for_buffer(cell, inner_w)
         };
@@ -677,11 +671,9 @@ pub(crate) fn active_viewport(
         _ => None,
     };
     let active = pick_active_view(active, next_hint.filter(|_| status_line.is_none()));
-    let explain_analyze = chat_widget.explain_analyze_live_lines(inner_w, rows.saturating_sub(8));
     ViewportFrame {
         active,
         status: status_line,
-        explain_analyze,
         multi_agent: multi_agent_active,
         task_board,
         task_board_compact,
@@ -763,6 +755,7 @@ pub(crate) fn do_draw(
         Some(super::bottom_pane::view::ConversationTabId::Run { agent_id, run_id }) => Some(
             focused_agent_activity_line(chat_widget, &agent_id, &run_id, width),
         ),
+        _ if bottom_pane.agent_monitor_is_open() => None,
         _ => viewport
             .multi_agent
             .as_deref()
@@ -774,9 +767,8 @@ pub(crate) fn do_draw(
     // below it. The run navigator remains reachable through Ctrl+G and
     // Left/Esc returns to it, giving this surface browser-tab semantics.
     if bottom_pane.primary_workspace_is_open() {
-        let height = terminal_size.height.max(1);
         return guard
-            .draw(height, |frame| {
+            .draw_workspace(|frame| {
                 let area = frame.area();
                 if let Some((x, y)) = render_primary_workspace(
                     area,
@@ -820,7 +812,6 @@ fn compact_view<'a>(
         active,
         status,
         multi_agent,
-        explain_analyze,
         task_board,
         task_board_compact,
         ..
@@ -836,35 +827,41 @@ fn compact_view<'a>(
                 .or_else(|| task_board_compact.as_ref().map(Vec::len))
                 .unwrap_or(0) as u16,
         )
-        .saturating_add(u16::from(multi_agent.is_some()))
-        .saturating_add(explain_analyze.as_ref().map(Vec::len).unwrap_or(0) as u16);
-    let history_rows = bottom_pane.history_suggestions_height();
+        .saturating_add(u16::from(multi_agent.is_some()));
+    let extra_picker_rows = bottom_pane.extra_picker_rows();
+    let optional_composer_rows =
+        extra_picker_rows + u16::from(bottom_pane.has_composer_hints(width));
     bottom_pane.set_composer_frame_allowed(true);
     let framed_bottom_h = bottom_pane
         .desired_height(width)
-        .saturating_sub(history_rows);
-    // Keep part of the candidate list ahead of optional frame chrome.
-    let minimum_history_rows = history_rows.saturating_sub(1).min(2);
+        .saturating_sub(optional_composer_rows);
+    // Keep a useful slice of the candidate list ahead of the optional frame.
+    let minimum_picker_rows = extra_picker_rows.saturating_sub(1).min(2);
     bottom_pane.set_composer_frame_allowed(
         height
             >= framed_bottom_h
                 .saturating_add(required_rows)
-                .saturating_add(minimum_history_rows),
+                .saturating_add(minimum_picker_rows),
     );
 
     let desired = bottom_pane.desired_height(width);
     let bottom_h = height
         .saturating_sub(required_rows)
-        .clamp(desired.saturating_sub(history_rows), desired);
+        .clamp(desired.saturating_sub(optional_composer_rows), desired);
     let available = height.saturating_sub(bottom_h);
+    let margin = super::style::conversation_margin(width);
     let status = status
         .filter(|_| available > 0 && !bottom_pane.has_active_view())
         .and_then(|indicator| {
-            indicator.render_with_context(
-                width,
+            let mut line = indicator.render_with_context(
+                width - margin * 2,
                 bottom_pane.has_pending_approvals(),
                 bottom_pane.can_interrupt_turn(),
-            )
+            )?;
+            if margin > 0 {
+                line.spans.insert(0, Span::raw("  "));
+            }
+            Some(line)
         });
     let status_rows = u16::from(status.is_some());
     let available = available.saturating_sub(status_rows);
@@ -891,14 +888,6 @@ fn compact_view<'a>(
     if let Some(lines) = &task_board {
         auxiliary -= lines.len() as u16;
     }
-    let explain_analyze = explain_analyze.filter(|lines| {
-        if lines.is_empty() || lines.len() > usize::from(auxiliary) {
-            false
-        } else {
-            auxiliary -= lines.len() as u16;
-            true
-        }
-    });
     let spacer = u16::from((status.is_some() || task_board.is_some()) && auxiliary > 0);
     auxiliary -= spacer;
     let active_rows = usize::from(active_min + auxiliary);
@@ -931,12 +920,6 @@ fn compact_view<'a>(
                 lines: vec![line],
                 live: true,
             })),
-        );
-    }
-    if let Some(lines) = explain_analyze {
-        flex.push(
-            0,
-            RenderableItem::Owned(Box::new(LiveFramedCell { lines, live: true })),
         );
     }
     if let Some(lines) = task_board {
@@ -1178,7 +1161,6 @@ mod compact_surface_tests {
             },
             status: Some(status),
             multi_agent: None,
-            explain_analyze: None,
             task_board: None,
             task_board_compact: None,
             resolved_board_expanded: false,
@@ -1187,7 +1169,7 @@ mod compact_surface_tests {
 
     #[test]
     fn streaming_reply_and_turn_status_remain_visible_together() {
-        for height in [6, 8, 12] {
+        for height in [5, 6, 8, 12] {
             let area = Rect::new(0, 0, 40, height);
             let mut pane = BottomPane::new();
             let flex = compact_view(frame(area.width), &mut pane, area.width, area.height);
@@ -1209,6 +1191,57 @@ mod compact_surface_tests {
             let cursor = flex.cursor_pos(area).expect("composer remains usable");
             assert!(cursor.0 < area.right() && cursor.1 < area.bottom());
         }
+    }
+
+    #[test]
+    fn working_tips_share_the_input_row_and_yield_to_drafts() {
+        use crate::tui::task_status::TaskStatus;
+        let mut pane = BottomPane::new();
+        let started_at = Instant::now();
+        pane.set_task_status(TaskStatus::TurnRunning { started_at });
+        pane.enable_tips(started_at);
+        let draw = |pane: &mut BottomPane, width, height| {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+            let flex = compact_view(frame(area.width), pane, width, height);
+            let viewport_height = flex.desired_height(width);
+            flex.render(area, &mut buf);
+            (buffer_to_string(&buf), viewport_height)
+        };
+
+        let (first, height_with_tip) = draw(&mut pane, 80, 24);
+        assert!(
+            first.lines().any(|row| {
+                row.contains("Message Astra") && row.contains("Tip  Ctrl+Q queues the next turn")
+            }),
+            "{first}"
+        );
+
+        pane.set_tips_enabled(false);
+        let (disabled, height_without_tip) = draw(&mut pane, 80, 24);
+        assert!(!disabled.contains("Tip  "), "{disabled}");
+        assert_eq!(height_with_tip, height_without_tip);
+
+        pane.enable_tips(started_at);
+        assert!(pane.pre_draw_tick(started_at + std::time::Duration::from_secs(24)));
+        let (second, _) = draw(&mut pane, 80, 24);
+        assert!(
+            second.contains("Tip  Ctrl+O opens the live transcript"),
+            "{second}"
+        );
+        let (narrow, _) = draw(&mut pane, 40, 8);
+        assert!(!narrow.contains("Tip  "), "{narrow}");
+        assert!(
+            narrow.contains("Working") && narrow.contains("latest reply"),
+            "{narrow}"
+        );
+
+        pane.composer.set_text("unsent draft");
+        let (editing, _) = draw(&mut pane, 80, 24);
+        assert!(
+            editing.contains("unsent draft") && !editing.contains("Tip  "),
+            "{editing}"
+        );
     }
 
     #[test]
@@ -1236,7 +1269,7 @@ mod compact_surface_tests {
             assert_eq!(buffer[(x - 1, y)].symbol(), "i");
             if height == 8 {
                 assert!(
-                    text.contains("ship staging") && text.contains("> ship production"),
+                    text.contains("ship staging") && text.contains("› ship production"),
                     "{text}"
                 );
             } else {
@@ -1276,8 +1309,10 @@ mod compact_surface_tests {
             pane.handle_session_key_at(tab, Instant::now(), &history);
             assert_eq!(pane.composer.text(), query);
 
-            assert!(draw(&mut pane, 8).contains(candidate));
-            let short = draw(&mut pane, 6);
+            // The unframed composer leaves a row for suggestions at six
+            // rows. At five it preserves the input, live reply and status.
+            assert!(draw(&mut pane, 6).contains(candidate));
+            let short = draw(&mut pane, 5);
             assert!(
                 short.contains(query) && short.contains("Working"),
                 "{short}"
@@ -1289,7 +1324,7 @@ mod compact_surface_tests {
             pane.handle_session_key_at(tab, Instant::now(), &history);
             assert_eq!(pane.composer.text(), query);
 
-            assert!(draw(&mut pane, 8).contains(candidate));
+            assert!(draw(&mut pane, 6).contains(candidate));
             pane.handle_session_key_at(tab, Instant::now(), &history);
             assert_eq!(pane.composer.text(), candidate);
         }
@@ -2472,7 +2507,7 @@ mod multi_agent_strip_tests {
             let mut buffer = Buffer::empty(area);
             render_primary_workspace(area, &mut buffer, &mut pane, Some(&activity));
             let text = buffer_to_string(&buffer);
-            assert!(text.contains("Reviewer · Transcript"), "{height}: {text}");
+            assert!(text.contains("Transcript · Reviewer"), "{height}: {text}");
             assert!(text.contains("visible child evidence"), "{height}: {text}");
             assert!(text.to_lowercase().contains("approval"), "{height}: {text}");
         }

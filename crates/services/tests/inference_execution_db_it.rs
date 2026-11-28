@@ -1106,7 +1106,7 @@ async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
     }
     for chunk in rows.chunks(128) {
         let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "INSERT INTO model_request_context_events (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, terminal_status, topology, provider, model_family, purpose, event_json, created_at) ",
+            "INSERT INTO model_request_context_events (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, terminal_status, event_json, created_at) ",
         );
         insert.push_values(chunk, |mut row, (owner, sid, event, attempt, stage)| {
             row.push_bind(owner)
@@ -1121,10 +1121,6 @@ async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
                 } else {
                     "NULL"
                 })
-                .push("'server_only'")
-                .push("'openai'")
-                .push("'test'")
-                .push("'primary_agent'")
                 .push("'{}'")
                 .push("DATE_SUB(NOW(6), INTERVAL 1 MINUTE)");
         });
@@ -1311,17 +1307,15 @@ async fn combined_first_attempt_admission_is_atomic_and_replay_safe() {
 
     let counts = sqlx::query(
         "SELECT
-            (SELECT COUNT(*) FROM inference_routes
-             WHERE user_id = ? AND route_id = ?) AS route_count,
             (SELECT COUNT(*) FROM inference_invocations
-             WHERE user_id = ? AND invocation_id = ?) AS invocation_count,
+             WHERE user_id = ? AND invocation_id = ?
+               AND offering_id = 'combined-admission-offering'
+               AND upstream_model_name = 'combined-admission-model') AS invocation_count,
             (SELECT COUNT(*) FROM inference_provider_attempts
              WHERE user_id = ? AND attempt_id = ?) AS attempt_count,
             (SELECT COUNT(*) FROM model_request_context_events
              WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted') AS context_count",
     )
-    .bind(&user_id)
-    .bind(plan.route_id())
     .bind(&user_id)
     .bind(plan.invocation_id())
     .bind(&user_id)
@@ -1331,7 +1325,6 @@ async fn combined_first_attempt_admission_is_atomic_and_replay_safe() {
     .fetch_one(pool)
     .await
     .expect("load combined admission facts");
-    assert_eq!(counts.get::<i64, _>("route_count"), 1);
     assert_eq!(counts.get::<i64, _>("invocation_count"), 1);
     assert_eq!(counts.get::<i64, _>("attempt_count"), 1);
     assert_eq!(counts.get::<i64, _>("context_count"), 1);
@@ -1871,53 +1864,30 @@ async fn exact_attempt_debt_recovers_success_without_degrading_provider_facts() 
     .await
     .expect("load exact recovered logical invocation");
     assert_eq!(invocation_status, "succeeded");
-    let context_rows = sqlx::query(
-        "SELECT event_stage, terminal_status, input_tokens, output_tokens,
-                cache_read_tokens, cache_creation_tokens
-         FROM model_request_context_events
-         WHERE user_id = ? AND attempt_id = ? ORDER BY event_stage",
-    )
-    .bind(&user_id)
-    .bind(attempt.attempt_id())
-    .fetch_all(pool)
-    .await
-    .expect("load recovered request-context evidence");
-    assert_eq!(context_rows.len(), 2);
-    let terminal_context = context_rows
+    let context =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 2)
+            .await
+            .expect("load recovered request-context evidence");
+    assert_eq!(context.len(), 2);
+    let terminal_context = context
         .iter()
-        .find(|row| row.get::<String, _>("event_stage") == "terminal")
+        .find(|row| row.stage == astra_services::ModelRequestEventStage::Terminal)
         .expect("recovery emits terminal request-context evidence");
     assert_eq!(
-        terminal_context.get::<Option<String>, _>("terminal_status"),
-        Some("succeeded".to_string())
+        terminal_context.terminal_status.as_deref(),
+        Some("succeeded")
     );
     assert_eq!(
-        terminal_context.get::<Option<i64>, _>("input_tokens"),
-        Some(21)
+        terminal_context.event.identity.request_id,
+        attempt.request_id()
     );
     assert_eq!(
-        terminal_context.get::<Option<i64>, _>("output_tokens"),
-        Some(5)
+        terminal_context.event.usage,
+        Some(astra_services::ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(11, 7, 3),
+            output_tokens: 5,
+        })
     );
-    assert_eq!(
-        terminal_context.get::<Option<i64>, _>("cache_read_tokens"),
-        Some(7)
-    );
-    assert_eq!(
-        terminal_context.get::<Option<i64>, _>("cache_creation_tokens"),
-        Some(3)
-    );
-    let metric = astra_services::aggregate_model_request_metrics(&shared_pool)
-        .await
-        .expect("load recovered exact-attempt metrics")
-        .into_iter()
-        .find(|row| row.provider == provider && row.terminal_status == "succeeded")
-        .expect("exact-attempt recovery updates its metric shard once");
-    assert_eq!(metric.requests, 1);
-    assert_eq!(metric.input_tokens, 21);
-    assert_eq!(metric.output_tokens, 5);
-    assert_eq!(metric.cache_read_tokens, 7);
-    assert_eq!(metric.cache_creation_tokens, 3);
     let debt_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?",
@@ -2589,10 +2559,6 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
             session_id,
         ),
         (
-            "DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?",
-            session_id,
-        ),
-        (
             "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             run_id,
         ),
@@ -2789,7 +2755,7 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn context_expiry_preserves_recovery_and_counts_each_terminal_once() {
+async fn context_expiry_preserves_recovery_and_physical_attempt() {
     let (shared, _) = common::setup_pool_and_settings().await;
     let pool = shared.get();
     for physical_success in [false, true] {
@@ -2797,11 +2763,7 @@ async fn context_expiry_preserves_recovery_and_counts_each_terminal_once() {
         let session = Uuid::new_v4().to_string();
         let run = Uuid::new_v4().to_string();
         seed_run(pool, &user, &session, &run).await;
-        let mut input = run_input(&user, &session, &run, 0, "retention-recovery");
-        // Metrics are deliberately low-cardinality, not tenant-scoped. Give
-        // this fixture its own provider dimension to assert exact increments.
-        input.provider = format!("retention-{user}");
-        let provider = input.provider.clone();
+        let input = run_input(&user, &session, &run, 0, "retention-recovery");
         let plan = plan_inference_invocation(input).unwrap();
         let attempt = provider_attempt(&plan, 0);
         admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt)
@@ -2935,18 +2897,20 @@ async fn context_expiry_preserves_recovery_and_counts_each_terminal_once() {
             .bind(&user).fetch_one(pool).await.unwrap();
         assert_eq!(marked, 1);
         reconcile_inference_settlements(&shared, 256).await.unwrap();
-        let requests: i64 = sqlx::query_scalar("SELECT CAST(SUM(requests) AS SIGNED) FROM model_request_metric_shards WHERE provider=?")
-            .bind(&provider).fetch_one(pool).await.unwrap();
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM inference_provider_attempts
+             WHERE user_id = ? AND invocation_id = ?",
+        )
+        .bind(&user)
+        .bind(plan.invocation_id())
+        .fetch_one(pool)
+        .await
+        .unwrap();
         assert_eq!(
-            requests, 1,
-            "reconciliation and pruning never count a request twice"
+            attempts, 1,
+            "recovery and pruning preserve the physical attempt"
         );
         cleanup(pool, &user, &session, &run).await;
-        sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
-            .bind(&provider)
-            .execute(pool)
-            .await
-            .unwrap();
     }
 }
 
@@ -3338,12 +3302,8 @@ async fn deleting_session_fences_new_run_and_session_inference_admission() {
     }
 
     let durable_rows: i64 = sqlx::query_scalar(
-        "SELECT
-             (SELECT COUNT(*) FROM inference_routes WHERE user_id = ? AND session_id = ?)
-           + (SELECT COUNT(*) FROM inference_invocations WHERE user_id = ? AND session_id = ?)",
+        "SELECT COUNT(*) FROM inference_invocations WHERE user_id = ? AND session_id = ?",
     )
-    .bind(&user_id)
-    .bind(&session_id)
     .bind(&user_id)
     .bind(&session_id)
     .fetch_one(pool)
@@ -4025,10 +3985,10 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     assert_eq!(duplicate_conflicts, 1);
     let route = sqlx::query(
         "SELECT offering_id, upstream_model_name, execution_placement, access_kind, purpose
-         FROM inference_routes WHERE user_id = ? AND route_id = ?",
+         FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
-    .bind(plan.route_id())
+    .bind(plan.invocation_id())
     .fetch_one(pool)
     .await
     .expect("durable route exists");
@@ -4272,18 +4232,6 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     );
     assert!(failed_context.event.usage.is_none());
     assert!(failed_context.event.budget.measured_input_tokens.is_none());
-    let missing_usage_columns: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM model_request_context_events
-         WHERE user_id = ? AND attempt_id = ? AND event_stage = 'terminal'
-           AND input_tokens IS NULL AND output_tokens IS NULL
-           AND cache_read_tokens IS NULL AND cache_creation_tokens IS NULL",
-    )
-    .bind(&user_id)
-    .bind(first_attempt.request_id())
-    .fetch_one(pool)
-    .await
-    .expect("unavailable usage persists as unknown rather than measured zero");
-    assert_eq!(missing_usage_columns, 1);
     let successful_context = context_events
         .iter()
         .find(|event| event.terminal_status.as_deref() == Some("succeeded"))
@@ -4308,30 +4256,6 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
             open_requests: 0,
         }
     );
-    let metric_rows = astra_services::aggregate_model_request_metrics(&shared_pool)
-        .await
-        .expect("aggregate durable model request metrics");
-    let metric_totals = metric_rows
-        .iter()
-        .filter(|row| {
-            row.topology == "server_only"
-                && row.provider == provider
-                && row.purpose == "primary_agent"
-        })
-        .fold([0_u64; 5], |mut totals, row| {
-            totals[0] += row.requests;
-            totals[1] += row.input_tokens;
-            totals[2] += row.output_tokens;
-            totals[3] += row.cache_read_tokens;
-            totals[4] += row.cache_creation_tokens;
-            totals
-        });
-    assert_eq!(
-        metric_totals,
-        [2, 210, 24, 80, 10],
-        "aggregate metrics must decode MatrixOne count/sum values and reconcile all outcomes: {metric_rows:?}"
-    );
-
     let invocation = sqlx::query(
         "SELECT admission_token, status, input_tokens, output_tokens, cache_read_tokens,
                 cache_creation_tokens, provider_response_id
@@ -4845,11 +4769,11 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
         .expect("admit session-scoped inference");
 
     let route = sqlx::query(
-        "SELECT scope_kind, run_id FROM inference_routes
-         WHERE user_id = ? AND route_id = ?",
+        "SELECT scope_kind, run_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
-    .bind(plan.route_id())
+    .bind(plan.invocation_id())
     .fetch_one(pool)
     .await
     .expect("load session-scoped route");
@@ -4926,13 +4850,13 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
 
     let rows = sqlx::query(
         "SELECT scope_kind, session_id, run_id
-         FROM inference_routes
-         WHERE user_id = ? AND route_id IN (?, ?)
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id IN (?, ?)
          ORDER BY scope_kind",
     )
     .bind(&user_id)
-    .bind(run_plan.route_id())
-    .bind(session_plan.route_id())
+    .bind(run_plan.invocation_id())
+    .bind(session_plan.invocation_id())
     .fetch_all(pool)
     .await
     .expect("load concurrent mixed-scope routes");
@@ -5668,7 +5592,6 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",
-        "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE 'lease-fair-%'");
         sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
@@ -5687,37 +5610,22 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
             format!("{user_prefix}-quiet-{index}")
         };
         let session_id = format!("fair-session-{index}-{suffix}");
-        let route_id = format!("fair-route-{index}-{suffix}");
         let invocation_id = format!("fair-inv-{index}-{suffix}");
         sqlx::query(
-            "INSERT INTO inference_routes
-             (route_id, user_id, session_id, scope_kind, run_id,
-              offering_id, resolved_model_name, upstream_model_name, provider,
-              execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, 'session', NULL, 'fair-offering', 'fair-model',
-                     'fair-model', 'openai', 'server', 'self_hosted',
-                     'primary_agent', NOW(6))",
-        )
-        .bind(&route_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&mut *tx)
-        .await
-        .expect("seed fair route");
-        sqlx::query(
             "INSERT INTO inference_invocations
-             (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+             (invocation_id, user_id, session_id, scope_kind, run_id,
               admission_token, owner_token, owner_generation,
               owner_lease_expires_at, turn_index, round_index, operation_id,
-              logical_attempt, purpose, status, terminal_fingerprint, usage_status,
+              logical_attempt, purpose, offering_id, resolved_model_name, upstream_model_name,
+              provider, execution_placement, access_kind, status, terminal_fingerprint, usage_status,
               provider_delivery_state, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, 'session', NULL, ?, ?, 1,
+             VALUES (?, ?, ?, 'session', NULL, ?, ?, 1,
                      TIMESTAMP('1970-01-01 00:00:00.000001'), 1, ?, 'fair_recovery', 0,
-                     'primary_agent', 'admitted', NULL, 'unavailable', 'unknown',
+                     'primary_agent', 'fair-offering', 'fair-model', 'fair-model',
+                     'openai', 'server', 'self_hosted', 'admitted', NULL, 'unavailable', 'unknown',
                      NOW(6), NULL)",
         )
         .bind(&invocation_id)
-        .bind(&route_id)
         .bind(&user_id)
         .bind(&session_id)
         .bind(Uuid::new_v4().simple().to_string())
@@ -5826,7 +5734,6 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",
-        "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE ?");
         sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))

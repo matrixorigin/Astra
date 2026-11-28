@@ -56,7 +56,6 @@ use astra_turn_core::{
         agent_fanout_control_receipt_kind,
     },
 };
-use ratatui::text::Line;
 
 /// Events the ChatWidget knows how to route. Grouped by origin so
 /// `handle_event` can scale to more variants without bloating a
@@ -1855,40 +1854,17 @@ pub(crate) struct ChatWidget {
     history_cell_ids: Vec<u64>,
     active_cell: Option<Box<dyn HistoryCell>>,
     active_cell_id: Option<u64>,
-    /// Mutable canonical Explain projection is independent of active answer/tool cells.
-    explain_analyze_projection: Option<astra_turn_types::ExplainAnalyzeGraphV1>,
-    /// Redacted typed facts retained long enough to publish the completed
-    /// Explain Analyze snapshot as a session artifact.
-    explain_analyze_events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
-    /// Whether the current turn has an Explain capture that still needs to be
-    /// committed. A later user submit also closes the previous transcript
-    /// boundary, so an empty projection after a successful turn must be a
-    /// no-op rather than a new unavailable capture.
-    explain_analyze_capture_pending: bool,
-    /// Transport coverage for the active Explain Analyze projection.
+    /// Typed facts for the settled report and artifact. Do not build a graph
+    /// on the event or draw path while the turn is still running.
+    explain_analyze_events: Option<Vec<astra_turn_types::ExplainAnalyzeEventV1>>,
+    /// Integrity failures reported by any confirmed snapshot of this turn.
     explain_analyze_delivery_degraded: bool,
-    /// A live observer fact or gap has not yet been confirmed by the
-    /// terminal canonical snapshot for the current logical turn. This is a
-    /// recoverable projection condition: a later snapshot can repair it.
+    /// A streamed fact or gap has not been covered by a terminal snapshot.
     explain_analyze_snapshot_pending: bool,
-    /// A server-reported Explain Analyze stream gap is visible immediately
-    /// in the live lane, but is cleared when a canonical snapshot repairs the
-    /// projection. This is intentionally separate from sticky integrity
-    /// failures carried by a snapshot.
-    explain_analyze_live_gap: bool,
-    /// Whether the current logical turn has received its terminal canonical
-    /// Explain Analyze snapshot. This is kept separate from the durable
-    /// degradation bit so a stalled/closed stream cannot freeze a lossy
-    /// prefix as a complete report.
-    explain_analyze_snapshot_confirmed: bool,
     /// Whether Explain Analyze detail rows are expanded for the current UI
     /// mode. The measured graph itself is identical for `on` and `verbose`;
     /// only the presentation detail level changes.
     explain_analyze_verbose: bool,
-    /// Maximum number of rows reserved for the live Explain Analyze lane.
-    /// This is configured through `/config` and remains bounded by the
-    /// renderer's hard five-row ceiling.
-    explain_analyze_live_rows: u8,
     /// Derived local Explain Analyze artifact format for the next completed
     /// turn. The canonical JSON snapshot is written regardless of this view.
     explain_analyze_report_format: astra_config::runtime_config::ExplainReportFormat,
@@ -1968,15 +1944,10 @@ impl ChatWidget {
             history_cell_ids: Vec::new(),
             active_cell: None,
             active_cell_id: None,
-            explain_analyze_projection: None,
-            explain_analyze_events: Vec::new(),
-            explain_analyze_capture_pending: false,
+            explain_analyze_events: None,
             explain_analyze_delivery_degraded: false,
             explain_analyze_snapshot_pending: false,
-            explain_analyze_live_gap: false,
-            explain_analyze_snapshot_confirmed: false,
             explain_analyze_verbose: false,
-            explain_analyze_live_rows: 5,
             explain_analyze_report_format:
                 astra_config::runtime_config::ExplainReportFormat::default(),
             active_tool_use_id: None,
@@ -2871,12 +2842,7 @@ impl ChatWidget {
         config: &astra_config::runtime_config::ExplainConfig,
     ) {
         self.set_explain_verbose(verbose);
-        self.set_explain_live_rows(config.effective_live_rows());
         self.set_explain_report_format(config.effective_report_format());
-    }
-
-    pub(crate) fn set_explain_live_rows(&mut self, rows: u8) {
-        self.explain_analyze_live_rows = rows.clamp(1, 5);
     }
 
     pub(crate) fn set_explain_report_format(
@@ -2893,81 +2859,41 @@ impl ChatWidget {
         self.explain_analyze_report_format
     }
 
-    pub(crate) fn explain_analyze_live_lines(
-        &self,
-        width: u16,
-        rows: u16,
-    ) -> Option<Vec<Line<'static>>> {
-        if let Some(graph) = self
-            .explain_analyze_projection
-            .as_ref()
-            .filter(|graph| !graph.nodes().is_empty())
-        {
-            Some(ExplainAnalyzeCell::live_lines(
-                graph,
-                width,
-                rows.min(u16::from(self.explain_analyze_live_rows)),
-                self.explain_analyze_delivery_degraded || self.explain_analyze_live_gap,
-                self.explain_analyze_verbose,
-            ))
-        } else if self.explain_analyze_delivery_degraded || self.explain_analyze_live_gap {
-            Some(ExplainAnalyzeCell::live_lines(
-                &Default::default(),
-                width,
-                rows.min(u16::from(self.explain_analyze_live_rows)),
-                self.explain_analyze_delivery_degraded || self.explain_analyze_live_gap,
-                self.explain_analyze_verbose,
-            ))
-        } else {
-            None
-        }
-    }
-
     fn commit_explain_analyze_projection(&mut self) {
-        let capture_pending = std::mem::take(&mut self.explain_analyze_capture_pending);
-        let snapshot_pending = std::mem::take(&mut self.explain_analyze_snapshot_pending);
-        let snapshot_confirmed = std::mem::take(&mut self.explain_analyze_snapshot_confirmed);
-        let live_gap = std::mem::take(&mut self.explain_analyze_live_gap);
-        // A live fact/gap is only a projection. If its terminal canonical
-        // confirmation never arrived, the report must remain explicitly
-        // incomplete even when the local prefix happens to contain a finished
-        // looking node. Canonical integrity failures are sticky across all
-        // physical SSE rounds in the logical turn.
-        let delivery_degraded = std::mem::take(&mut self.explain_analyze_delivery_degraded)
-            || live_gap
-            || (capture_pending && snapshot_pending && !snapshot_confirmed);
-        if !capture_pending
-            && self.explain_analyze_projection.is_none()
-            && self.explain_analyze_events.is_empty()
-            && !delivery_degraded
-        {
+        let pending = std::mem::take(&mut self.explain_analyze_snapshot_pending);
+        let delivery_degraded =
+            std::mem::take(&mut self.explain_analyze_delivery_degraded) || pending;
+        let events = self.explain_analyze_events.take();
+        if events.is_none() && !delivery_degraded {
             return;
         }
-        let Some(mut graph) = self.explain_analyze_projection.take() else {
-            let events = std::mem::take(&mut self.explain_analyze_events);
-            let run_id = events.first().map(|event| event.run_id.as_str());
-            let turn_id = events.first().map(|event| event.turn_id.as_str());
+        let events = events.unwrap_or_default();
+        if events.is_empty() {
             let reason = if delivery_degraded {
-                "Explain Analyze stream delivery was interrupted before a graph could be completed"
+                "Explain Analyze stream delivery was interrupted before runtime facts could be recovered."
             } else {
-                "no Explain Analyze runtime facts were captured"
+                "No Explain Analyze runtime facts were captured."
             };
             if let Err(error) = crate::explain_analyze_artifact::mark_unavailable(
                 &self.session_id,
-                run_id,
-                turn_id,
+                None,
+                None,
                 reason,
             ) {
                 tracing::warn!("failed to record unavailable Explain Analyze artifact: {error}");
             }
             if delivery_degraded {
-                self.commit_cell(Box::new(SystemCell::warning(
-                    "Explain Analyze · incomplete · stream delivery was interrupted before runtime facts could be recovered.",
-                )));
+                self.commit_cell(Box::new(SystemCell::warning(format!(
+                    "Explain Analyze · incomplete · {reason}"
+                ))));
             }
             return;
-        };
-        let events = std::mem::take(&mut self.explain_analyze_events);
+        }
+
+        let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+        for fact in &events {
+            graph.apply(fact.clone());
+        }
         graph.finish_ingest();
         let mut publication_error = None;
         let publication = match crate::explain_analyze_artifact::persist_rendered_report(
@@ -3239,7 +3165,7 @@ impl ChatWidget {
         ) {
             self.commit_active();
         }
-        self.commit_cell(Box::new(UserCell::new(text.into())));
+        self.commit_cell(Box::new(UserCell::submitted(text)));
     }
 
     /// Single choke-point for routing events into state mutation.
@@ -3355,12 +3281,7 @@ impl ChatWidget {
                 events,
                 delivery_degraded,
             } => self.on_explain_analyze_snapshot(events, delivery_degraded),
-            WireEvent::ExplainAnalyzeGap => {
-                self.explain_analyze_capture_pending = true;
-                self.explain_analyze_snapshot_pending = true;
-                self.explain_analyze_snapshot_confirmed = false;
-                self.explain_analyze_live_gap = true;
-            }
+            WireEvent::ExplainAnalyzeGap => self.explain_analyze_snapshot_pending = true,
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
             WireEvent::Compaction(event) => {
                 self.commit_system(SystemCell::info(event.summary));
@@ -3384,7 +3305,7 @@ impl ChatWidget {
         self.commit_explain_analyze_projection();
         self.drain_all_live_tasks();
         self.end_turn_agent_observation();
-        let cell = UserCell::new(text);
+        let cell = UserCell::submitted(text);
         self.commit_cell(Box::new(cell));
     }
 
@@ -3454,8 +3375,9 @@ impl ChatWidget {
             self.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Assistant)
         ) {
-            let mut cell = AssistantCell::new_streaming();
-            cell.model_item_id = model_item_id.map(str::to_owned);
+            let cell = AssistantCell::new_streaming().with_model_item(model_item_id, || {
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            });
             self.install_active_cell(Box::new(cell));
         }
 
@@ -4659,13 +4581,10 @@ impl ChatWidget {
 
     fn on_explain_analyze(&mut self, fact: astra_turn_types::ExplainAnalyzeEventV1) {
         if fact.is_valid() {
-            self.explain_analyze_capture_pending = true;
             self.explain_analyze_snapshot_pending = true;
-            self.explain_analyze_snapshot_confirmed = false;
-            self.explain_analyze_events.push(fact.clone());
-            self.explain_analyze_projection
-                .get_or_insert_with(Default::default)
-                .apply(fact);
+            self.explain_analyze_events
+                .get_or_insert_default()
+                .push(fact);
         }
     }
 
@@ -4680,11 +4599,7 @@ impl ChatWidget {
         // previous snapshot would discard an earlier round. A later snapshot
         // can still repair a lossy live suffix because conflicting ids are
         // replaced and the graph is rebuilt from this canonical set.
-        let mut canonical = std::mem::take(&mut self.explain_analyze_events);
-        let mut positions = HashSet::with_capacity(canonical.len() + events.len());
-        for fact in &canonical {
-            positions.insert(fact.event_id.clone());
-        }
+        let mut canonical = self.explain_analyze_events.take().unwrap_or_default();
         let mut by_id = std::collections::HashMap::with_capacity(canonical.len());
         for (index, fact) in canonical.iter().enumerate() {
             by_id.insert(fact.event_id.clone(), index);
@@ -4700,27 +4615,15 @@ impl ChatWidget {
                     snapshot_degraded = true;
                     canonical[index] = fact;
                 }
-            } else if positions.insert(fact.event_id.clone()) {
+            } else {
                 by_id.insert(fact.event_id.clone(), canonical.len());
                 canonical.push(fact);
             }
         }
-        let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
-        for fact in &canonical {
-            graph.apply(fact.clone());
-        }
-        self.explain_analyze_events = canonical;
-        self.explain_analyze_projection = Some(graph);
-        // A terminal snapshot confirms the current live projection, so a
-        // recoverable observer gap can be cleared here. Integrity failures
-        // carried by a canonical snapshot are different: once observed in
-        // any physical SSE round they remain sticky for the whole logical
-        // turn and cannot be erased by a later healthy round.
+        self.explain_analyze_events = Some(canonical);
+        // A later snapshot repairs stream gaps, while a snapshot that
+        // declares degraded delivery stays degraded for the whole turn.
         self.explain_analyze_snapshot_pending = false;
-        self.explain_analyze_live_gap = false;
-        self.explain_analyze_snapshot_confirmed = true;
-        self.explain_analyze_capture_pending =
-            !self.explain_analyze_events.is_empty() || snapshot_degraded;
         self.explain_analyze_delivery_degraded |= snapshot_degraded;
     }
 
@@ -5260,13 +5163,11 @@ mod tests {
             ExplainReportFormat::Text,
         ] {
             let config = ExplainConfig {
-                live_rows: Some(2),
                 report_format: Some(format),
             };
             let mut widget = fresh();
             widget.restore_explain_preferences(true, &config);
             assert_eq!(widget.explain_analyze_report_format, format);
-            assert_eq!(widget.explain_analyze_live_rows, 2);
             assert!(widget.explain_analyze_verbose);
         }
     }
@@ -5326,7 +5227,7 @@ mod tests {
     }
 
     #[test]
-    fn explain_tree_streams_beside_the_answer_and_commits_after_it_once() {
+    fn explain_tree_appears_only_after_the_answer_and_commits_once() {
         let mut widget = fresh();
         let fact = explain_turn_start();
         widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
@@ -5341,22 +5242,7 @@ mod tests {
             .and_then(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>())
             .expect("Explain Analyze must leave the streamed answer active");
         assert_eq!(answer.source(), "answer in progress");
-        let live = widget
-            .explain_analyze_live_lines(80, 10)
-            .expect("the independent live graph should render");
-        let live_text = live
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(live_text.contains("recording"), "{live_text}");
-        assert!(!live_text.contains("incomplete"), "{live_text}");
+        assert!(widget.history().is_empty());
 
         widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
 
@@ -5540,19 +5426,11 @@ mod tests {
     }
 
     #[test]
-    fn explain_gap_without_facts_is_visible_live_and_at_turn_end() {
+    fn explain_gap_without_facts_is_reported_at_turn_end() {
         let mut widget = fresh();
         widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeGap));
 
-        let live = widget
-            .explain_analyze_live_lines(80, 10)
-            .expect("a gap before the first fact must still be visible");
-        let live_text = live
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(live_text.contains("incomplete · stream gap"), "{live_text}");
+        assert!(widget.history().is_empty());
 
         widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
         assert!(widget.history[0].as_any_ref().is::<SystemCell>());

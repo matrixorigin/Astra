@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70.0"
 name = "crossterm"
-version = "0.29.0"
+version = "0.29.1"
 authors = ["T. Post"]
 build = false
 exclude = [

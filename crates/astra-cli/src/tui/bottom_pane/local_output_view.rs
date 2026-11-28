@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 
 use super::view::{
@@ -49,16 +49,27 @@ impl LocalOutputView {
 
 impl BottomPaneView for LocalOutputView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
         let theme = crate::tui::theme::current();
         let dim = Style::default().fg(theme.dim);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(dim)
-            .title(format!(" Shell output · {} · private ", self.task_id))
-            .title_style(Style::default().fg(theme.accent).bold());
-        let inner = block.inner(area);
-        block.render(area, buf);
+        buf.set_line(
+            area.x,
+            area.y,
+            &Line::from(vec![
+                Span::styled("  Shell output", Style::default().fg(theme.fg).bold()),
+                Span::styled(format!(" · {} · private", self.task_id), dim),
+            ]),
+            area.width,
+        );
+        let padding = 2.min(area.width.saturating_sub(1));
+        let inner = Rect::new(
+            area.x + padding,
+            area.y + 1,
+            area.width.saturating_sub(padding * 2),
+            area.height - 1,
+        );
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -137,7 +148,7 @@ impl BottomPaneView for LocalOutputView {
             }
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = self.max_scroll.get(),
-            KeyCode::Char('r') => {
+            KeyCode::Char('r' | 'R') if crate::tui::event::is_text_key(&key) => {
                 self.pending_action = Some(ViewActionRequest {
                     action: BottomPaneViewAction::ViewShellOutput {
                         task_id: self.task_id.clone(),
@@ -169,7 +180,15 @@ impl BottomPaneView for LocalOutputView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("↑↓ scroll · PgUp/PgDn page · R refresh · Esc back".into())
+        Some("Esc back · R refresh · ↑↓ scroll · PgUp/PgDn page".into())
+    }
+
+    fn owns_primary_canvas(&self) -> bool {
+        true
+    }
+
+    fn reserve_status_footer(&self) -> bool {
+        true
     }
 }
 

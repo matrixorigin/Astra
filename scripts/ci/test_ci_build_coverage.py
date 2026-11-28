@@ -387,16 +387,23 @@ rm() {
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         producer = workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
         step = producer.split("      - name: Test CLI recovery and journal harness\n", 1)[1].split("      - name:", 1)[0]
-        for required in (
-            "--test cli_journal", "--test tui_pty_journey", "binary(cli_journal)",
-            "unknown_root_message_can_be_rechecked_after_turn_completion",
-            "unknown_root_message_is_read_only_while_receipt_is_pending",
-            "old_root_receipt_is_visible_during_a_quiet_next_turn",
-            "guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes",
-        ):
-            self.assertIn(required, step)
+        self.assertEqual(
+            shlex.split(step.split("run: >-\n", 1)[1]),
+            shlex.split(
+                "cargo nextest run --locked -p astra-cli "
+                "--test cli_journal --test tui_pty_journey --profile strict "
+                "--test-threads 1 --retries 0"
+            ),
+            "Run the full offline journal and PTY inventories without case filters",
+        )
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
+        cli = ROOT / "crates/astra-cli"
+        vendored = ROOT / "vendor/crossterm"
+        dependency = tomllib.loads((cli / "Cargo.toml").read_text())["dependencies"]["crossterm"]
+        version = tomllib.loads((vendored / "Cargo.toml").read_text())["package"]["version"]
+        self.assertEqual((cli / dependency["path"]).resolve(), vendored)
+        self.assertEqual(dependency["version"], f"={version}")
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         lanes = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
         self.assertIn("run-macos-lanes.sh vendored", workflow)

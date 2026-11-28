@@ -460,6 +460,7 @@ pub(crate) fn evidence_revision(
         // successful observation has no tool-error entry and therefore does
         // not churn this revision.
         "tool_errors": snapshot.tool_errors,
+        "provider_failures": snapshot.provider_failures,
         // Successful observer dispatch/completion changes aggregate counters
         // on every read. Only terminal anomalies and reconciliation gaps are
         // evidence for convergence; ordinary observer lifecycle churn is not.
@@ -657,6 +658,7 @@ fn runtime_event_count(snapshot: &IntrospectSnapshot) -> i64 {
         .recent_rounds
         .len()
         .saturating_add(snapshot.tool_errors.len())
+        .saturating_add(snapshot.provider_failures.len())
         .saturating_add(snapshot.stall_state.events.len())
         .saturating_add(snapshot.alerts.len())
         .saturating_add(snapshot.semantic_cache_decisions.len())
@@ -764,7 +766,7 @@ fn introspect_data_coverage(
 }
 
 fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {
-    let summary = match request.facet {
+    let mut summary = match request.facet {
         ObservationFacet::Errors => {
             if snapshot.tool_errors.is_empty() {
                 "No recent tool errors recorded".to_string()
@@ -796,7 +798,7 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
                     |value| format!("{value:.0}%"),
                 );
                 format!(
-                    "Runtime snapshot healthy - pressure {}, prompt_cache_read_share {} (scope=current_runtime_snapshot), turns {}",
+                    "Runtime snapshot - pressure {}, prompt_cache_read_share {} (scope=current_runtime_snapshot), turns {}",
                     pressure,
                     cache_share,
                     turn_budget_label(snapshot),
@@ -804,6 +806,13 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
             },
         ),
     };
+    if matches!(
+        request.facet,
+        ObservationFacet::Errors | ObservationFacet::Session | ObservationFacet::Overview
+    ) && let Some(failures) = super::provider_failure_summary(snapshot)
+    {
+        summary = format!("{failures}. {summary}");
+    }
     if matches!(
         request.facet,
         ObservationFacet::Session | ObservationFacet::Overview
@@ -848,7 +857,7 @@ fn composite_diagnostic_summary(snapshot: &IntrospectSnapshot) -> String {
     }
 
     if snapshot.tool_errors.is_empty() {
-        summary.push_str(" errors_live=none");
+        summary.push_str(" tool_errors_live=none");
     } else {
         let samples = snapshot
             .tool_errors
@@ -910,11 +919,35 @@ fn build_introspect_observations(
 ) -> Vec<ObservationRecord> {
     let mut observations = Vec::new();
 
+    if matches!(
+        request.facet,
+        ObservationFacet::Errors | ObservationFacet::Overview | ObservationFacet::Session
+    ) {
+        for (index, failure) in snapshot.provider_failures.iter().enumerate() {
+            observations.push(ObservationRecord {
+                ref_id: format!("urn:astra:observation:local:introspect:provider_failure:{index}"),
+                topic: "execution".into(),
+                facet: request.facet.as_str().into(),
+                kind: "provider_failure".into(),
+                severity: "warning".into(),
+                summary: format!(
+                    "Current run; recent 512-event window: {}",
+                    failure.summary()
+                ),
+                confidence: ObservationConfidence::evidence(0.85),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
+            });
+        }
+    }
+
     // ── facet-specific observations ──
     match request.facet {
         ObservationFacet::Session | ObservationFacet::Overview => {
             // Session health observation
-            if snapshot.alerts.is_empty() && snapshot.tool_errors.is_empty() {
+            if snapshot.alerts.is_empty()
+                && snapshot.tool_errors.is_empty()
+                && snapshot.provider_failures.is_empty()
+            {
                 observations.push(ObservationRecord {
                     ref_id: "urn:astra:observation:local:introspect:runtime:health".to_string(),
                     topic: request.topic.as_str().to_string(),

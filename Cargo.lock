@@ -171,7 +171,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
- "crossterm 0.29.0",
+ "crossterm 0.29.1",
  "derive_more 1.0.0",
  "dirs",
  "dotenvy",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "crossterm"
-version = "0.29.0"
+version = "0.29.1"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm_winapi",
@@ -3629,7 +3629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6654738b8024300cf062d04a1c13c10c8e2cea598ec1c47dc9b6641159429756"
 dependencies = [
  "bitflags 2.13.0",
- "crossterm 0.29.0",
+ "crossterm 0.29.1",
  "dyn-clone",
  "fuzzy-matcher",
  "unicode-segmentation",
@@ -5230,7 +5230,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "567584a3b0e6a8203c23de40b4861497266725eb5363dbfd18a1edd603cca9f0"
 dependencies = [
  "cfg-if",
- "crossterm 0.29.0",
+ "crossterm 0.29.1",
  "instability",
  "ratatui-core",
 ]

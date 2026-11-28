@@ -194,7 +194,7 @@ fn error_event(msg: &str) -> String {
 
 // ─── Scenario bodies ─────────────────────────────────────────────────────────
 
-fn body_complete(agent_id: &str, turn: u32) -> String {
+fn body_complete(agent_id: &str, turn: u32, explain: bool) -> String {
     let run_id = format!("mock-run-{turn}");
     let msg = format!(
         "Task completed by {agent_id} (turn {turn}). \
@@ -204,8 +204,48 @@ fn body_complete(agent_id: &str, turn: u32) -> String {
     s.push_str(&session_info(&run_id));
     s.push_str(&text_delta(&msg));
     s.push_str(&text_done(&msg));
+    if explain {
+        s.push_str(&mock_explain_facts(&run_id));
+    }
     s.push_str(&server_terminal_event(&run_id, &msg, 200));
     s
+}
+
+fn mock_explain_facts(run_id: &str) -> String {
+    let turn_id = format!("{run_id}-turn");
+    let fact = |node: &str, kind: &str, label: &str, start| {
+        serde_json::json!({
+            "type": astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE,
+            "schema_version": astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            "event_id": format!("{node}-started"),
+            "run_id": run_id, "turn_id": turn_id, "node_id": node,
+            "producer_id": "mock-server", "clock_domain_id": "mock-clock",
+            "kind": kind, "label": label, "transition": "started", "elapsed_ms": start
+        })
+    };
+    let mut turn = fact("turn", "turn", "Conversation turn", 0);
+    let mut attempt = fact("answer", "provider_attempt", "Provider answer", 120);
+    attempt["parent_node_id"] = "turn".into();
+    attempt["round_index"] = 0.into();
+    attempt["attempt_index"] = 0.into();
+    let mut body = sse_line(&turn);
+    body.push_str(&sse_line(&attempt));
+    for (event, node, start) in [(&mut attempt, "answer", 120), (&mut turn, "turn", 0)] {
+        event["event_id"] = format!("{node}-finished").into();
+        event["transition"] = "finished".into();
+        event["start_elapsed_ms"] = start.into();
+        event["elapsed_ms"] = 1_200.into();
+        event["duration_ms"] = (1_200 - start).into();
+        event["outcome"] = "completed".into();
+        if node == "answer" {
+            event["usage"] = serde_json::json!({
+                "basis": "provider_exact", "fresh_input_tokens": 120, "output_tokens": 8
+            });
+        }
+        debug_assert!(astra_turn_types::decode_explain_analyze_wire(event).is_ok());
+        body.push_str(&sse_line(event));
+    }
+    body
 }
 
 fn body_tool_then_complete(agent_id: &str, turn: u32) -> String {
@@ -253,12 +293,13 @@ async fn body_slow(
     agent_id: &str,
     turn: u32,
     held_response_release: Option<&tokio::sync::Notify>,
+    explain: bool,
 ) -> String {
     match held_response_release {
         Some(release) => release.notified().await,
         None => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
     }
-    body_complete(agent_id, turn)
+    body_complete(agent_id, turn, explain)
 }
 
 fn server_message(body: &Value) -> Option<&str> {
@@ -843,7 +884,14 @@ async fn handle_chat_turn(
             unreachable!("tool scenarios use one orchestration stream")
         }
         MockScenario::Slow => {
-            let body = body_slow(&agent_id, turn, state.held_response_release.as_deref()).await;
+            let explain = request_body["explain"].as_bool() == Some(true);
+            let body = body_slow(
+                &agent_id,
+                turn,
+                state.held_response_release.as_deref(),
+                explain,
+            )
+            .await;
             state
                 .completed_slow_runs
                 .lock()

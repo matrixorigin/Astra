@@ -1,25 +1,5 @@
-//! TUI-native `/config edit` — a two-column list+detail view with
-//! inline per-kind editors pushed as a child view on Enter.
-//!
-//! Modelled after the reference implementation's Config.tsx:
-//!   * flat catalog of `SettingItem` rows built from the resolved
-//!     `RuntimeConfig` (see `astra_config::config_overlay`);
-//!   * left column = searchable list with a live `filter` string that
-//!     types/backspaces into the search state;
-//!   * right column = detail pane showing label / id / kind metadata /
-//!     current value for the highlighted row;
-//!   * Enter opens an inline editor (Bool toggle, Number input, Enum
-//!     selection) scoped to that row; the child lives inside this
-//!     view (no extra push on the `BottomPane` stack) so cancel/accept
-//!     routing is local and the parent keeps its filter/position;
-//!   * Esc in a child cancels the child; Esc on a clean outer view
-//!     exits cleanly; Esc on a dirty outer view surfaces a save prompt
-//!     (SaveToUser / SaveToProject / Discard / Keep editing).
-//!
-//! Writing the resolved config back to disk is the caller's job — the
-//! view merely reports a `ConfigEditAction` via `pending_action()`.
-//! `tui/config_edit_router.rs` resolves the typed completion, writes TOML
-//! to the selected scope, and reloads the process-wide overlay.
+//! Search and edit user or project defaults. The existing config router
+//! handles the typed save action and applies the effective settings.
 
 use astra_config::config_overlay::{
     SettingItem, SettingKind, apply_edit, build_settings_catalog, filter_settings,
@@ -29,11 +9,14 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
+
+use crate::tui::{event::is_text_key, history_cell::truncate_by_width};
 
 use super::view::{
     BottomPaneView, CancellationEvent, ConfigEditDisposition, ViewCompletion, ViewResult,
@@ -195,7 +178,7 @@ impl ConfigEditView {
     fn open_editor_for(&mut self, item: SettingItem) {
         let editor: Box<dyn InnerEditor> = match &item.kind {
             SettingKind::Bool => Box::new(BoolEditor::new(&item)),
-            SettingKind::Number { .. } => Box::new(NumberEditor::new(&item)),
+            SettingKind::Number { .. } | SettingKind::Text => Box::new(ValueEditor::new(&item)),
             SettingKind::Enum { options } => Box::new(EnumEditor::new(&item, options.clone())),
         };
         self.inner = Some(editor);
@@ -237,7 +220,7 @@ impl ConfigEditView {
                     .and_then(|id| filtered.iter().position(|item| item.id == id))
                     .unwrap_or(0);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_text_key(&key) => {
                 self.filter.push(c);
                 self.selected = 0;
             }
@@ -265,7 +248,7 @@ impl BottomPaneView for ConfigEditView {
         }
 
         // Two-column split on sufficient width, single-column otherwise.
-        let split_at_col = 45u16;
+        let split_at_col = 74;
         let two_col = area.width >= split_at_col;
         let layout = if two_col {
             Layout::default()
@@ -305,6 +288,12 @@ impl BottomPaneView for ConfigEditView {
             }
             inner.render(editor_area, buf);
         }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> bool {
+        self.inner
+            .as_mut()
+            .is_some_and(|editor| editor.handle_paste(text))
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
@@ -390,9 +379,6 @@ impl BottomPaneView for ConfigEditView {
     }
 
     fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
-        // Only NumberEditor needs a cursor; a follow-up can compute
-        // the inner editor's absolute position. Returning None here
-        // hides the caret during editing, which is still usable.
         None
     }
 
@@ -442,15 +428,15 @@ impl BottomPaneView for ConfigEditView {
 
     fn hint_keys(&self) -> Option<String> {
         if self.preview {
-            return Some("preview · any key returns".into());
+            return Some("Esc back".into());
         }
         if self.save_prompt.is_some() {
-            return Some("↑↓ move · Enter confirm · Esc back".into());
+            return Some("↑↓ select · Enter confirm · Esc back".into());
         }
         if let Some(ref inner) = self.inner {
             return Some(inner.hint_keys().to_string());
         }
-        Some("↑↓ navigate · Enter edit · type to search · Esc save/close".into())
+        Some("↑↓ select · Enter edit · Esc finish editing · Type to filter".into())
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -460,67 +446,47 @@ impl BottomPaneView for ConfigEditView {
 
 impl ConfigEditView {
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
-        let dim = Style::default().fg(Color::DarkGray);
-        let sel_style = Style::default()
-            .fg(crate::tui::theme::current().accent)
-            .add_modifier(Modifier::BOLD);
-
+        let theme = crate::tui::theme::current();
+        let dim = Style::default().fg(theme.dim);
+        let selected = Style::default()
+            .fg(theme.selected_fg)
+            .bg(theme.selected_bg)
+            .bold();
+        let width = usize::from(area.width.saturating_sub(2));
         let mut y = area.y;
-
-        // Search line
-        if y < area.bottom() {
+        if area.height >= 3 {
             let label = if self.filter.is_empty() {
-                "  Search: (type to filter) ".to_string()
+                "  Settings · type to filter".to_string()
             } else {
-                format!("  Search: {} ", self.filter)
+                format!("  Filter · {}", self.filter)
             };
-            Widget::render(
-                Line::from(Span::styled(label, dim)),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
+            Line::styled(label, dim).render(Rect::new(area.x, y, area.width, 1), buf);
             y += 1;
         }
 
-        // List rows
         let filtered = self.filtered_catalog();
-        const MAX_VISIBLE: usize = 12;
-        let start = if self.selected >= MAX_VISIBLE {
-            self.selected - MAX_VISIBLE + 1
-        } else {
-            0
-        };
-        let end = (start + MAX_VISIBLE).min(filtered.len());
-
-        for (vi, item) in filtered[start..end].iter().enumerate() {
-            if y >= area.bottom() {
-                break;
-            }
-            let idx = start + vi;
-            let is_sel = idx == self.selected;
-            let marker = if is_sel { "› " } else { "  " };
-            let current = render_value_short(&item.value);
-            let raw = format!("{}{}  {} ", marker, short_id(&item.id), current);
-            let line_text = truncate_line(&raw, area.width as usize);
-            let span = if is_sel {
-                Span::styled(line_text, sel_style)
-            } else {
-                Span::raw(line_text)
-            };
-            Widget::render(Line::from(span), Rect::new(area.x, y, area.width, 1), buf);
+        let visible = usize::from(area.bottom().saturating_sub(y)).min(12);
+        let start = self.selected.saturating_add(1).saturating_sub(visible);
+        for (offset, item) in filtered.iter().skip(start).take(visible).enumerate() {
+            let focused = start + offset == self.selected;
+            let value = render_value_short(&item.value);
+            let available = width.saturating_sub(value.width() + 2);
+            let label = truncate_by_width(&item.label, available);
+            let gap = " ".repeat(width.saturating_sub(label.width() + value.width()));
+            let marker = if focused { "› " } else { "  " };
+            let style = if focused { selected } else { Style::default() };
+            let line = Line::styled(format!("{marker}{label}{gap}{value}"), style);
+            line.render(Rect::new(area.x, y, area.width, 1), buf);
             y += 1;
         }
         if filtered.is_empty() && y < area.bottom() {
-            Widget::render(
-                Line::from(Span::styled("  no matches", dim)),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
+            Line::styled("  No matching settings", dim)
+                .render(Rect::new(area.x, y, area.width, 1), buf);
         }
     }
 
     fn render_detail(&self, area: Rect, buf: &mut Buffer) {
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(crate::tui::theme::current().dim);
         let head = Style::default().add_modifier(Modifier::BOLD);
 
         let item = match self.current_item() {
@@ -528,48 +494,29 @@ impl ConfigEditView {
             None => return,
         };
 
+        let value = render_value_short(&item.value);
         let mut lines = vec![
-            Line::from(Span::styled("  Details ", head)),
-            Line::from(Span::raw("")),
-            Line::from(vec![
-                Span::styled("  ", dim),
-                Span::styled(item.label.clone(), head),
-            ]),
-            Line::from(vec![
-                Span::styled("  id:    ", dim),
-                Span::raw(item.id.clone()),
-            ]),
-        ];
-        let kind_desc = match &item.kind {
-            SettingKind::Bool => "bool".to_string(),
-            SettingKind::Number { min, max, .. } => format!("number  range {min}..={max}"),
-            SettingKind::Enum { options } => {
-                let shown: String = options
-                    .iter()
-                    .take(4)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" / ");
-                format!("enum  {shown}")
-            }
-        };
-        lines.push(Line::from(vec![
-            Span::styled("  kind:  ", dim),
-            Span::raw(kind_desc),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  value: ", dim),
-            Span::styled(
-                render_value_short(&item.value),
-                Style::default().fg(Color::Yellow),
+            Line::styled(format!("  {}", item.label), head),
+            Line::styled(
+                format!("  {value}"),
+                Style::default().fg(crate::tui::theme::current().accent),
             ),
-        ]));
+            Line::styled(format!("  {}", item.id), dim),
+        ];
+        match item.kind {
+            SettingKind::Number { min, max, .. } => {
+                lines.push(Line::styled(format!("  Range {min}–{max}"), dim));
+            }
+            SettingKind::Enum { options } => {
+                lines.push(Line::styled(format!("  {}", options.join(" · ")), dim));
+            }
+            SettingKind::Bool | SettingKind::Text => {}
+        }
         if self.is_dirty() {
-            lines.push(Line::from(Span::raw("")));
-            lines.push(Line::from(Span::styled(
-                "  * unsaved changes",
-                Style::default().fg(Color::Yellow),
-            )));
+            lines.push(Line::styled(
+                "  Unsaved changes",
+                Style::default().fg(crate::tui::theme::current().warn),
+            ));
         }
 
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -579,31 +526,11 @@ impl ConfigEditView {
 
 fn render_value_short(v: &Value) -> String {
     match v {
-        Value::Bool(b) => b.to_string(),
+        Value::Bool(value) => (if *value { "On" } else { "Off" }).to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
         Value::Null => "null".into(),
         other => other.to_string(),
-    }
-}
-
-/// Drop the dotted prefix so the list row fits comfortably in the
-/// 55% list column. Keep the tail segment, which is the human-readable
-/// leaf name (`max_turn_input_tokens`, `llm_exchanges`).
-fn short_id(id: &str) -> String {
-    match id.rsplit_once('.') {
-        Some((_, tail)) => tail.to_string(),
-        None => id.to_string(),
-    }
-}
-
-fn truncate_line(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
     }
 }
 
@@ -619,6 +546,9 @@ trait InnerEditor: Send {
     fn hint_keys(&self) -> &'static str;
     fn kind_label(&self) -> &'static str;
     fn set_error(&mut self, _message: String) {}
+    fn handle_paste(&mut self, _text: &str) -> bool {
+        false
+    }
 }
 
 enum InnerOutcome {
@@ -659,7 +589,7 @@ impl BoolEditor {
 
 impl InnerEditor for BoolEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let hint = Style::default().fg(Color::DarkGray);
+        let hint = Style::default().fg(crate::tui::theme::current().dim);
         let sel = Style::default()
             .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
@@ -667,7 +597,7 @@ impl InnerEditor for BoolEditor {
             format!("  ▶ {} ", self.label),
             Style::default().add_modifier(Modifier::BOLD),
         ))];
-        for (i, label) in ["false", "true"].iter().enumerate() {
+        for (i, label) in ["Off", "On"].iter().enumerate() {
             let marker = if i == self.selected { "› " } else { "  " };
             let line = Line::from(vec![
                 Span::styled("  ", hint),
@@ -678,16 +608,11 @@ impl InnerEditor for BoolEditor {
             ]);
             lines.push(line);
         }
-        lines.push(Line::from(Span::styled(
-            "  (↑↓ move, space toggle, Enter save, Esc cancel)",
-            hint,
-        )));
         Widget::render(Paragraph::new(lines), area, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        // label + 2 options + hint = 4 rows
-        4
+        3
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> InnerOutcome {
@@ -709,34 +634,32 @@ impl InnerEditor for BoolEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        "↑↓ move · space toggle · Enter save · Esc cancel"
+        "↑↓ select · Space toggle · Enter apply · Esc back"
     }
     fn kind_label(&self) -> &'static str {
         "bool"
     }
 }
 
-// ── Number ────────────────────────────────────────────────────────────
+// ── Text and number ────────────────────────────────────────────────────────────
 
-struct NumberEditor {
+struct ValueEditor {
     id: String,
     label: String,
     buffer: String,
     error: Option<String>,
-    min: f64,
-    max: f64,
-    allow_fraction: bool,
+    number: Option<(f64, f64, bool)>,
 }
 
-impl NumberEditor {
+impl ValueEditor {
     fn new(item: &SettingItem) -> Self {
-        let (min, max, allow_fraction) = match &item.kind {
+        let number = match &item.kind {
             SettingKind::Number {
                 min,
                 max,
                 allow_fraction,
-            } => (*min, *max, *allow_fraction),
-            _ => (i64::MIN as f64, i64::MAX as f64, false),
+            } => Some((*min, *max, *allow_fraction)),
+            _ => None,
         };
         let buffer = item
             .value_as_number()
@@ -747,15 +670,14 @@ impl NumberEditor {
                     n.to_string()
                 }
             })
+            .or_else(|| item.value_as_string())
             .unwrap_or_default();
         Self {
             id: item.id.clone(),
             label: item.label.clone(),
             buffer,
             error: None,
-            min,
-            max,
-            allow_fraction,
+            number,
         }
     }
 
@@ -763,22 +685,25 @@ impl NumberEditor {
         // Accept fractions only for knobs declared as fractional. Integer
         // knobs still reject values that would silently round.
         let trimmed = self.buffer.trim();
+        let Some((min, max, allow_fraction)) = self.number else {
+            return Some(Value::from(trimmed));
+        };
         let parsed: Result<f64, _> = trimmed.parse();
         match parsed {
             Ok(n) if n.is_finite() => {
-                if !self.allow_fraction && n.fract() != 0.0 {
+                if !allow_fraction && n.fract() != 0.0 {
                     self.error = Some(format!("Fractional values not allowed: {}", self.buffer));
                     return None;
                 }
-                if n < self.min || n > self.max {
+                if n < min || n > max {
                     self.error = Some(format!(
                         "Out of range: {} not in [{}, {}]",
-                        self.buffer, self.min, self.max
+                        self.buffer, min, max
                     ));
                     return None;
                 }
                 self.error = None;
-                if self.allow_fraction {
+                if allow_fraction {
                     Some(Value::from(n))
                 } else {
                     Some(Value::from(n as i64))
@@ -793,7 +718,7 @@ impl NumberEditor {
 
     fn refresh_inline_error(&mut self) {
         let trimmed = self.buffer.trim();
-        self.error = if Self::is_incomplete_number(trimmed) {
+        self.error = if self.number.is_some() && Self::is_incomplete_number(trimmed) {
             Some(Self::incomplete_number_message())
         } else {
             None
@@ -819,9 +744,9 @@ impl NumberEditor {
     }
 }
 
-impl InnerEditor for NumberEditor {
+impl InnerEditor for ValueEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let hint = Style::default().fg(Color::DarkGray);
+        let hint = Style::default().fg(crate::tui::theme::current().dim);
         let val_style = Style::default()
             .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
@@ -834,10 +759,12 @@ impl InnerEditor for NumberEditor {
                 Span::styled("  value: ", hint),
                 Span::styled(self.buffer.clone(), val_style),
                 Span::styled(
-                    format!(
-                        "    (range {}..={}, Enter saves, Esc cancels)",
-                        self.min, self.max
-                    ),
+                    match self.number {
+                        Some((min, max, _)) => {
+                            format!("    range {min}..={max}")
+                        }
+                        None => "    #RRGGBB or auto".to_string(),
+                    },
                     hint,
                 ),
             ]),
@@ -845,7 +772,7 @@ impl InnerEditor for NumberEditor {
         if let Some(ref err) = self.error {
             lines.push(Line::from(Span::styled(
                 format!("  {err}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(crate::tui::theme::current().error),
             )));
         }
         Widget::render(Paragraph::new(lines), area, buf);
@@ -867,14 +794,27 @@ impl InnerEditor for NumberEditor {
                 self.refresh_inline_error();
                 InnerOutcome::Pending
             }
-            KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
-                if c != '-' || (self.min < 0.0 && self.buffer.is_empty()) {
+            KeyCode::Char(c) if self.number.is_none() && is_text_key(&key) => {
+                if self.buffer.len() < 64 {
+                    self.buffer.push(c);
+                    self.error = None;
+                }
+                InnerOutcome::Pending
+            }
+            KeyCode::Char(c) if is_text_key(&key) && (c.is_ascii_digit() || c == '-') => {
+                if c != '-'
+                    || (self.number.is_some_and(|(min, _, _)| min < 0.0) && self.buffer.is_empty())
+                {
                     self.buffer.push(c);
                     self.refresh_inline_error();
                 }
                 InnerOutcome::Pending
             }
-            KeyCode::Char('.') if self.allow_fraction && !self.buffer.contains('.') => {
+            KeyCode::Char('.')
+                if is_text_key(&key)
+                    && self.number.is_some_and(|(_, _, fraction)| fraction)
+                    && !self.buffer.contains('.') =>
+            {
                 self.buffer.push('.');
                 self.refresh_inline_error();
                 InnerOutcome::Pending
@@ -887,14 +827,24 @@ impl InnerEditor for NumberEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        if self.allow_fraction {
-            "digits/decimal to edit · Backspace erase · Enter save · Esc cancel"
-        } else {
-            "digits to edit · Backspace erase · Enter save · Esc cancel"
-        }
+        "Enter apply · Esc back · Backspace erase"
     }
     fn kind_label(&self) -> &'static str {
-        "number"
+        if self.number.is_some() {
+            "number"
+        } else {
+            "text"
+        }
+    }
+    fn handle_paste(&mut self, text: &str) -> bool {
+        self.buffer = text
+            .trim()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(64)
+            .collect();
+        self.error = None;
+        true
     }
     fn set_error(&mut self, message: String) {
         self.error = Some(message);
@@ -925,7 +875,7 @@ impl EnumEditor {
 
 impl InnerEditor for EnumEditor {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let hint = Style::default().fg(Color::DarkGray);
+        let hint = Style::default().fg(crate::tui::theme::current().dim);
         let sel = Style::default()
             .fg(crate::tui::theme::current().accent)
             .add_modifier(Modifier::BOLD);
@@ -944,15 +894,11 @@ impl InnerEditor for EnumEditor {
             ]);
             lines.push(line);
         }
-        lines.push(Line::from(Span::styled(
-            "  (↑↓ move, Enter saves, Esc cancels)",
-            hint,
-        )));
         Widget::render(Paragraph::new(lines), area, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        (2 + self.options.len() as u16).min(8)
+        (1 + self.options.len() as u16).min(8)
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> InnerOutcome {
@@ -983,7 +929,7 @@ impl InnerEditor for EnumEditor {
         &self.id
     }
     fn hint_keys(&self) -> &'static str {
-        "↑↓ move · Enter save · Esc cancel"
+        "↑↓ select · Enter apply · Esc back"
     }
     fn kind_label(&self) -> &'static str {
         "enum"
@@ -1090,19 +1036,19 @@ fn project_path_label() -> String {
 }
 
 fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
-    let head = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
+    let theme = crate::tui::theme::current();
+    let head = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
     let sel = Style::default()
-        .fg(crate::tui::theme::current().accent)
+        .fg(theme.selected_fg)
+        .bg(theme.selected_bg)
         .add_modifier(Modifier::BOLD);
 
     let rows: [(&str, String); 4] = [
-        ("[1]", format!("Save to {}  (user)", user_path_label())),
+        ("[1]", format!("Save for user · {}", user_path_label())),
         (
             "[2]",
-            format!("Save to {}  (project)", project_path_label()),
+            format!("Save for project · {}", project_path_label()),
         ),
         ("[v]", "Preview changes".to_string()),
         ("[d]", "Discard changes".to_string()),
@@ -1123,11 +1069,6 @@ fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
             Span::styled(label.clone(), label_style),
         ]));
     }
-    lines.push(Line::from(Span::raw("")));
-    lines.push(Line::from(Span::styled(
-        "  ↑↓ move · Enter confirm · Esc back · [1][2][v][d] shortcuts",
-        dim,
-    )));
     Widget::render(Paragraph::new(lines), area, buf);
 }
 
@@ -1139,10 +1080,10 @@ fn render_save_prompt(p: &SavePrompt, area: Rect, buf: &mut Buffer) {
 
 fn render_preview(original: &RuntimeConfig, working: &RuntimeConfig, area: Rect, buf: &mut Buffer) {
     let head = Style::default()
-        .fg(Color::Yellow)
+        .fg(crate::tui::theme::current().accent)
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
-    let before = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(crate::tui::theme::current().dim);
+    let before = Style::default().fg(crate::tui::theme::current().dim);
     let after = Style::default()
         .fg(crate::tui::theme::current().accent)
         .add_modifier(Modifier::BOLD);

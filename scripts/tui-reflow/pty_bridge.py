@@ -16,7 +16,7 @@ def resize(fd, columns, rows):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
 
 
-binary, root = sys.argv[1:]
+binary, root, history_rows = sys.argv[1:]
 pid, fd = pty.fork()
 if pid == 0:
     resize(0, 100, 30)
@@ -34,6 +34,8 @@ if pid == 0:
         "MOI_AGENT_CALL": "1",
     }
     # Shell output preceding Astra must survive, including native reflow.
+    for row in range(int(history_rows)):
+        os.write(1, f"REFLOW-{row:02d} ".encode() + b"wide-line " * 21 + b"\r\n")
     os.write(1, b"RESIZE_HISTORY_SENTINEL " + b"history " * 20 + b"\r\n")
     os.execve(binary, [binary, "--api-url", env["ASTRA_API_URL"],
                        "--profile", "resize-test", "--model", "resize-model",

@@ -161,7 +161,6 @@ async fn insert_model_request_fixture(
     event: &astra_services::ModelRequestContextEvent,
     created_at: &str,
 ) {
-    let usage = event.usage.as_ref();
     // Consumer fixture for the current stored contract, not a writer simulation.
     let payload = match event.stage {
         astra_services::ModelRequestEventStage::Accepted => serde_json::to_value(event).unwrap(),
@@ -178,9 +177,8 @@ async fn insert_model_request_fixture(
     sqlx::query(
         "INSERT INTO model_request_context_events \
          (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, \
-          terminal_status, topology, provider, model_family, purpose, input_tokens, \
-          output_tokens, cache_read_tokens, cache_creation_tokens, event_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          terminal_status, event_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(user_id)
     .bind(session_id)
@@ -190,14 +188,6 @@ async fn insert_model_request_fixture(
     .bind(format!("invocation-{attempt_id}"))
     .bind(event.stage.as_str())
     .bind(event.terminal_status.as_deref())
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(&event.identity.model)
-    .bind(&event.identity.inference_purpose)
-    .bind(usage.map(|usage| usage.input.total_input_tokens() as i64))
-    .bind(usage.map(|usage| usage.output_tokens as i64))
-    .bind(usage.map(|usage| usage.input.cache_read_tokens as i64))
-    .bind(usage.map(|usage| usage.input.cache_creation_tokens as i64))
     .bind(serde_json::to_string(&payload).expect("serialize model request fixture"))
     .bind(created_at)
     .execute(pool)
@@ -4782,59 +4772,34 @@ async fn session_audit_prices_historical_physical_attempts_without_catalog_repri
     .expect("insert priced audit event");
 
     let historical_price_snapshot = r#"{"calculation_version":1,"currency":"USD","unit":"per_token","source":"configured","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015,"configuration_updated_at":"2026-09-30"}"#;
-    let route_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
     let invocation_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
-    for (route_id, invocation_id, run_id, operation_id) in [
-        (
-            &route_ids[0],
-            &invocation_ids[0],
-            "audit-root-run",
-            "audit_root_request",
-        ),
-        (
-            &route_ids[1],
-            &invocation_ids[1],
-            "audit-child-run",
-            "audit_child_request",
-        ),
+    for (invocation_id, run_id, operation_id) in [
+        (&invocation_ids[0], "audit-root-run", "audit_root_request"),
+        (&invocation_ids[1], "audit-child-run", "audit_child_request"),
     ] {
         sqlx::query(
-            "INSERT INTO inference_routes \
-             (route_id, user_id, session_id, scope_kind, run_id, offering_id, \
-              resolved_model_name, upstream_model_name, provider, execution_placement, \
-              access_kind, purpose, price_snapshot_json, created_at) \
-             VALUES (?, ?, ?, 'run', ?, 'audit-offering', ?, ?, 'mock', 'server', \
-                     'self_hosted', 'primary_agent', CAST(? AS JSON), NOW(6))",
-        )
-        .bind(route_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .bind(&model_name)
-        .bind(&model_name)
-        .bind(historical_price_snapshot)
-        .execute(&pool)
-        .await
-        .expect("insert historical priced route");
-
-        sqlx::query(
             "INSERT INTO inference_invocations \
-             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, \
+             (invocation_id, user_id, session_id, scope_kind, run_id, \
               admission_token, owner_token, owner_generation, owner_lease_expires_at, \
-              turn_index, round_index, operation_id, logical_attempt, purpose, status, \
-              terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at) \
-             VALUES (?, ?, ?, ?, 'run', ?, ?, ?, 1, DATE_ADD(NOW(6), INTERVAL 60 SECOND), \
-                     1, 0, ?, 0, 'primary_agent', 'succeeded', NULL, \
-                     'provider_exact', 'delivery_authorized', NOW(6), NOW(6))",
+              turn_index, round_index, operation_id, logical_attempt, purpose, offering_id, \
+              resolved_model_name, upstream_model_name, provider, execution_placement, access_kind, \
+              price_snapshot_json, status, terminal_fingerprint, usage_status, provider_delivery_state, \
+              created_at, terminal_at) \
+             VALUES (?, ?, ?, 'run', ?, ?, ?, 1, DATE_ADD(NOW(6), INTERVAL 60 SECOND), \
+                     1, 0, ?, 0, 'primary_agent', 'audit-offering', ?, ?, 'mock', 'server', \
+                     'self_hosted', CAST(? AS JSON), 'succeeded', NULL, 'provider_exact', \
+                     'delivery_authorized', NOW(6), NOW(6))",
         )
         .bind(invocation_id)
-        .bind(route_id)
         .bind(&user_id)
         .bind(&session_id)
         .bind(run_id)
         .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         .bind(operation_id)
+        .bind(&model_name)
+        .bind(&model_name)
+        .bind(historical_price_snapshot)
         .execute(&pool)
         .await
         .expect("insert historical priced invocation");
@@ -5019,13 +4984,6 @@ async fn session_audit_prices_historical_physical_attempts_without_catalog_repri
         .execute(&pool)
         .await
         .expect("delete audit invocations");
-    sqlx::query("DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?")
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("delete audit routes");
-
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &user_id,
@@ -6880,6 +6838,78 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         Some(other_drift_assessment_event_id.as_str())
     );
 
+    // Exercise the actual write and read paths for both turn error projections.
+    let events = DatabaseEventService::new(settings).with_pool(shared.clone());
+    let journal_error = astra_services::session_journal::JournalEvent::turn_error(
+        Some(&session_id),
+        2,
+        Some("model"),
+        "[auth] private prompt",
+        "[stream_transport] private provider detail",
+        7,
+    );
+    let payload = serde_json::to_value(&journal_error).unwrap();
+    let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+    let sync_id = astra_services::sync_outbox_stable_event_id(&journal_error, &hash).unwrap();
+    use astra_services::events::EventIngestionSource;
+    let mut failure_ids = Vec::new();
+    for (ingestion_source, event_id, content, metadata) in [
+        (
+            EventIngestionSource::SyncOutbox,
+            Some(sync_id),
+            payload.to_string(),
+            Some(serde_json::json!({"sync_outbox":{"payload_hash":hash}})),
+        ),
+        (
+            EventIngestionSource::Client,
+            None,
+            r#"{"error":"[auth] private prompt"}"#.into(),
+            None,
+        ),
+    ] {
+        let event = events
+            .create_event(
+                owner_user_id.clone(),
+                EventCreateRequestData {
+                    ingestion_source,
+                    event_id,
+                    content,
+                    metadata,
+                    session_id: session_id.clone(),
+                    event_type: "turn_error".into(),
+                    agent_id: None,
+                    agent_version: None,
+                    parent_event_id: None,
+                    parent_event_ids: None,
+                    causal_chain_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        failure_ids.push(event.record.event_id);
+    }
+    let failures = reflect
+        .build_evidence(
+            &owner_user_id,
+            &session_id,
+            astra_services::reflect::ReflectRequest::from_observation_params(
+                Some("execution"),
+                Some("errors"),
+                None,
+                None,
+                10,
+                "",
+            ),
+        )
+        .await
+        .unwrap();
+    let has_diagnosis = |kind| failures.observations.iter().any(|o| o.kind == kind);
+    assert!(has_diagnosis("diagnosis:stream_transport"));
+    assert!(has_diagnosis("diagnosis:unknown"));
+    assert!(!has_diagnosis("diagnosis:auth"));
+    let rendered = serde_json::to_string(&failures).unwrap();
+    assert!(!rendered.contains("private prompt") && !rendered.contains("private provider detail"));
+
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &owner_user_id,
@@ -6891,7 +6921,10 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_legacy_drift_event_id,
             owner_tool_event_id,
             owner_boundary_event_id,
-        ],
+        ]
+        .into_iter()
+        .chain(failure_ids)
+        .collect::<Vec<_>>(),
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -7442,19 +7475,12 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
 
 async fn cleanup_sync_event_fixture(pool: &sqlx::Pool<sqlx::MySql>, user: &str, session: &str) {
     cleanup_session_delete_fixture_for_owner(pool, user, session).await;
-    for table in [
-        "observation_identity_collisions",
-        "agent_session_lifecycle_fences",
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        )))
+    sqlx::query("DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?")
         .bind(user)
         .bind(session)
         .execute(pool)
         .await
         .unwrap();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8339,7 +8365,7 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             event.cache_creation_tokens = None;
             event.metadata.as_mut().unwrap()["qualified_usage"] = serde_json::json!({});
         }
-        outbox.enqueue_journal_event(&event).unwrap();
+        outbox.enqueue_journal_event(event.clone()).unwrap();
         let projected = outbox.ready_records(10).unwrap().pop().unwrap();
         let payload = projected.payload.clone();
         let id = projected.record_id.clone();

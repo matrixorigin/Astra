@@ -9,25 +9,15 @@ import type {
   WorkObservationReportV1,
   WorkTaskGraphPageV2,
 } from "@astra/sdk";
-import { reconcileWorkEventPageV1 } from "@astra/sdk";
 
 const WORK_ACTIVITY_WINDOW = 12;
-
-export type WorkActivitySnapshot = {
-  eventHead: number;
-  seenThroughEventSeq: number | null;
-  retainedFromEventSeq: number;
-  unseenCount: number;
-  truncated: boolean;
-  events: WorkEventRecordV1[];
-};
 
 export type WorkOverviewSnapshot = {
   report: WorkObservationReportV1;
   criteria: WorkCriteriaPageV1;
   proposals: WorkCriteriaProposalListV1;
   taskGraph: WorkTaskGraphPageV2;
-  activity: WorkActivitySnapshot;
+  activity: WorkEventRecordV1[];
 };
 
 type WorkOverviewReader = Pick<
@@ -126,7 +116,8 @@ async function loadSnapshotOnce(
       ? selectedBranch.criteria_set_revision_ref
       : overview.criteria.revision;
   const graphRevision = selectedBranch?.current_graph_revision ?? overview.graph.revision;
-  const [criteria, proposals, taskGraph, activityMetadata] = await Promise.all([
+  const activityAfter = overview.event_head - WORK_ACTIVITY_WINDOW;
+  const [criteria, proposals, taskGraph, activityPage] = await Promise.all([
     sdk.getWorkCriteria(workId, {
       cursor: {
         criteria_set_revision: criteriaRevision,
@@ -145,8 +136,8 @@ async function loadSnapshotOnce(
       dependencyLimit: 16,
     }),
     sdk.listWorkEvents(workId, {
-      afterEventSeq: overview.event_head,
-      limit: 1,
+      ...(activityAfter > 0 ? { afterEventSeq: activityAfter } : {}),
+      limit: WORK_ACTIVITY_WINDOW,
     }),
   ]);
 
@@ -156,61 +147,15 @@ async function loadSnapshotOnce(
     assertCurrentProjection(report, criteria, proposals, taskGraph);
   }
   if (
-    activityMetadata.event_head !== overview.event_head ||
-    activityMetadata.events.length !== 0 ||
-    activityMetadata.has_more
+    activityPage.work_id !== workId ||
+    activityPage.requested_after_event_seq !== (activityAfter > 0 ? activityAfter : null) ||
+    activityPage.event_head !== overview.event_head ||
+    activityPage.has_more
   ) {
-    throw new WorkSnapshotDrift("Work event head changed during the bounded read");
+    throw new WorkSnapshotDrift("Work events changed during the bounded read");
   }
 
-  const seen = activityMetadata.seen_through_event_seq ?? 0;
-  const unseenCount = overview.event_head - seen;
-  if (unseenCount < 0) {
-    throw new WorkSnapshotDrift("Work seen cursor is ahead of the observed event head");
-  }
-  const visibleAfter = Math.max(
-    seen,
-    activityMetadata.retained_from_event_seq - 1,
-    overview.event_head - WORK_ACTIVITY_WINDOW,
-  );
-  let events: WorkEventRecordV1[] = [];
-  if (unseenCount > 0) {
-    const activityPage = await sdk.listWorkEvents(workId, {
-      ...(visibleAfter > 0 ? { afterEventSeq: visibleAfter } : {}),
-      limit: WORK_ACTIVITY_WINDOW,
-    });
-    const reconciliation = reconcileWorkEventPageV1(
-      {
-        work_id: workId,
-        applied_through_event_seq: visibleAfter > 0 ? visibleAfter : null,
-      },
-      activityPage,
-    );
-    if (
-      reconciliation.kind !== "applied" ||
-      !reconciliation.at_head ||
-      activityPage.event_head !== overview.event_head ||
-      activityPage.has_more
-    ) {
-      throw new WorkSnapshotDrift("Work events changed during the bounded read");
-    }
-    events = reconciliation.events;
-  }
-
-  return {
-    report,
-    criteria,
-    proposals,
-    taskGraph,
-    activity: {
-      eventHead: overview.event_head,
-      seenThroughEventSeq: activityMetadata.seen_through_event_seq,
-      retainedFromEventSeq: activityMetadata.retained_from_event_seq,
-      unseenCount,
-      truncated: visibleAfter > seen,
-      events,
-    },
-  };
+  return { report, criteria, proposals, taskGraph, activity: activityPage.events };
 }
 
 /**

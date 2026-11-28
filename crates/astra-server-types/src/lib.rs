@@ -193,7 +193,8 @@ pub enum WorkBranchActivityV1 {
 }
 
 /// Read-only, owner-scoped status used by Web observers to discover activity
-/// started by another client. It carries no Session or Run identity.
+/// started by another client and compare the current Work event head with the
+/// applied snapshot. The pause cursor identifies the observed Run event position.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkBranchActivityResponseV1 {
@@ -201,7 +202,9 @@ pub struct WorkBranchActivityResponseV1 {
     pub work_id: String,
     pub branch_id: String,
     pub branch_revision: i64,
+    pub event_head: i64,
     pub activity: WorkBranchActivityV1,
+    pub pause_cursor: Option<String>,
     pub observed_at: String,
 }
 
@@ -1086,24 +1089,6 @@ pub struct WorkBranchInteractionReceiptV1 {
     pub run_id: String,
     pub request_id: String,
     pub outcome: WorkInteractionResolutionOutcomeV1,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkReadCursorRequestV1 {
-    pub through_event_seq: i64,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize)]
-pub struct WorkReadCursorResponseV1 {
-    pub schema_version: u16,
-    pub work_id: astra_services::work::WorkId,
-    pub through_event_seq: astra_services::work::WorkEventSeq,
-    pub receipt_revision: astra_services::work::WorkAttentionReceiptRevision,
-    pub receipt_hash: astra_services::work::WorkContentHash,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[cfg(feature = "server")]

@@ -323,132 +323,6 @@ async fn verify_existing_item_revisions(
     }
 }
 
-async fn verify_revised_item_bases(
-    transaction: &mut Transaction<'_, MySql>,
-    change: &WorkGraphChange,
-) -> Result<(), WorkRepositoryError> {
-    let expected = change
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            WorkGraphItemChange::Revised(item) => Some(item.expected_ref()),
-            WorkGraphItemChange::Existing(_) | WorkGraphItemChange::New(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    if expected.is_empty() {
-        return Ok(());
-    }
-    let row = query(
-        "SELECT item_revision_manifest_json, item_count, edge_manifest_json, edge_count
-         FROM work_graph_revisions
-         WHERE owner_id = ? AND work_id = ? AND revision = ? LIMIT 1",
-    )
-    .bind(change.owner_id.as_str())
-    .bind(change.work_id.as_str())
-    .bind(change.expected_graph_revision.get())
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(|source| WorkRepositoryError::persistence("load revised item graph basis", source))?
-    .ok_or(WorkRepositoryError::NotFound)?;
-    let graph = decode_persisted_graph(
-        &row.try_get::<String, _>("item_revision_manifest_json")
-            .map_err(|source| WorkRepositoryError::corrupt("revised item graph basis", source))?,
-        row.try_get("item_count")
-            .map_err(|source| WorkRepositoryError::corrupt("revised item graph basis", source))?,
-        &row.try_get::<String, _>("edge_manifest_json")
-            .map_err(|source| WorkRepositoryError::corrupt("revised item graph basis", source))?,
-        row.try_get("edge_count")
-            .map_err(|source| WorkRepositoryError::corrupt("revised item graph basis", source))?,
-    )?;
-    let current = graph.item_refs.into_iter().collect::<BTreeSet<_>>();
-    let missing = expected.difference(&current).cloned().collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(WorkRepositoryError::MissingWorkItemRevisions { missing })
-    }
-}
-
-async fn allocate_revised_item_revisions(
-    transaction: &mut Transaction<'_, MySql>,
-    change: &mut WorkGraphChange,
-) -> Result<(), WorkRepositoryError> {
-    let mut revised_indices = change
-        .items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| match item {
-            WorkGraphItemChange::Revised(item) => Some((item.item_id.clone(), index)),
-            WorkGraphItemChange::Existing(_) | WorkGraphItemChange::New(_) => None,
-        })
-        .collect::<Vec<_>>();
-    revised_indices.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    for (item_id, index) in revised_indices {
-        let updated = query(
-            "UPDATE work_items SET last_revision = last_revision + 1
-             WHERE owner_id = ? AND work_id = ? AND item_id = ?
-               AND last_revision < 9223372036854775807",
-        )
-        .bind(change.owner_id.as_str())
-        .bind(change.work_id.as_str())
-        .bind(item_id.as_str())
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| WorkRepositoryError::persistence("allocate WorkItem revision", source))?;
-        if updated.rows_affected() != 1 {
-            let last_revision = query(
-                "SELECT last_revision FROM work_items
-                 WHERE owner_id = ? AND work_id = ? AND item_id = ? LIMIT 1",
-            )
-            .bind(change.owner_id.as_str())
-            .bind(change.work_id.as_str())
-            .bind(item_id.as_str())
-            .fetch_optional(&mut **transaction)
-            .await
-            .map_err(|source| {
-                WorkRepositoryError::persistence("read WorkItem revision sequence", source)
-            })?;
-            return match last_revision {
-                None => Err(WorkRepositoryError::NotFound),
-                Some(row)
-                    if row.try_get::<i64, _>("last_revision").map_err(|source| {
-                        WorkRepositoryError::corrupt("WorkItem revision sequence", source)
-                    })? == i64::MAX =>
-                {
-                    Err(super::repository::invalid_mutation(
-                        super::WorkDomainError::RevisionExhausted { field: "work item" },
-                    ))
-                }
-                Some(_) => Err(WorkRepositoryError::corrupt(
-                    "WorkItem revision sequence",
-                    std::io::Error::other("revision allocation updated an unexpected row count"),
-                )),
-            };
-        }
-        let allocated: i64 = query(
-            "SELECT last_revision FROM work_items
-             WHERE owner_id = ? AND work_id = ? AND item_id = ? LIMIT 1",
-        )
-        .bind(change.owner_id.as_str())
-        .bind(change.work_id.as_str())
-        .bind(item_id.as_str())
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("read allocated WorkItem revision", source)
-        })?
-        .try_get("last_revision")
-        .map_err(|source| WorkRepositoryError::corrupt("WorkItem revision sequence", source))?;
-        let revision = WorkItemRevision::new(allocated)
-            .map_err(|source| WorkRepositoryError::corrupt("WorkItem revision sequence", source))?;
-        let WorkGraphItemChange::Revised(item) = &mut change.items[index] else {
-            unreachable!("revised item index remains stable while allocating")
-        };
-        item.assign_result_revision(revision);
-    }
-    Ok(())
-}
-
 async fn insert_new_items(
     transaction: &mut Transaction<'_, MySql>,
     change: &WorkGraphChange,
@@ -464,27 +338,6 @@ async fn insert_new_items(
     if items.is_empty() {
         return Ok(());
     }
-    let mut identities = QueryBuilder::<MySql>::new(
-        "INSERT INTO work_items (owner_id, work_id, item_id, last_revision) ",
-    );
-    identities.push_values(&items, |mut row, item| {
-        row.push_bind(change.owner_id.as_str())
-            .push_bind(change.work_id.as_str())
-            .push_bind(item.item_id.as_str())
-            .push_bind(WorkItemRevision::INITIAL.get());
-    });
-    identities
-        .build()
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::insert(
-                "insert WorkItem identities",
-                WorkConflictResource::WorkItemIdentity,
-                source,
-            )
-        })?;
-
     let mut revisions = QueryBuilder::<MySql>::new(
         "INSERT INTO work_item_revisions
          (owner_id, work_id, item_id, revision, parent_revision, item_kind, objective,
@@ -509,7 +362,7 @@ async fn insert_new_items(
         .map_err(|source| {
             WorkRepositoryError::insert(
                 "insert WorkItem revisions",
-                WorkConflictResource::WorkItemRevision,
+                WorkConflictResource::WorkItemIdentity,
                 source,
             )
         })?;
@@ -657,6 +510,7 @@ pub(super) struct PreparedGraphChange {
     graph: CanonicalGraph,
     encoded: EncodedGraph,
     next_branch_revision: WorkBranchRevision,
+    graph_revision: GraphRevision,
 }
 
 /// Retire execution carriers bound to revisions replaced by this graph
@@ -720,12 +574,23 @@ fn append_revised_attempt_predicates(
     }
 }
 
-pub(super) async fn prepare_graph_change(
-    transaction: &mut Transaction<'_, MySql>,
+pub(super) fn prepare_graph_change(
     mut change: WorkGraphChange,
+    graph_revision: GraphRevision,
 ) -> Result<PreparedGraphChange, WorkRepositoryError> {
-    verify_revised_item_bases(transaction, &change).await?;
-    allocate_revised_item_revisions(transaction, &mut change).await?;
+    if graph_revision <= change.expected_graph_revision {
+        return Err(WorkRepositoryError::corrupt(
+            "Work graph revision",
+            std::io::Error::other("the next Work graph revision must follow the branch graph"),
+        ));
+    }
+    let item_revision =
+        WorkItemRevision::new(graph_revision.get()).map_err(super::repository::invalid_mutation)?;
+    for item in &mut change.items {
+        if let WorkGraphItemChange::Revised(item) = item {
+            item.assign_result_revision(item_revision);
+        }
+    }
     let graph = validate_and_canonicalize_graph(&change.items, &change.edges)
         .map_err(super::repository::invalid_mutation)?;
     let encoded = encode_graph(&graph, &change)?;
@@ -738,6 +603,7 @@ pub(super) async fn prepare_graph_change(
         graph,
         encoded,
         next_branch_revision,
+        graph_revision,
     })
 }
 
@@ -754,52 +620,24 @@ pub(super) async fn apply_prepared_graph_change(
     let next_branch_revision = prepared.next_branch_revision;
     let item_count = i64::try_from(graph.item_refs.len()).expect("bounded Work graph items");
     let edge_count = i64::try_from(graph.edges.len()).expect("bounded Work graph edges");
-    let work = query(
-        "SELECT CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END AS is_archived
-         FROM works WHERE owner_id = ? AND work_id = ? LIMIT 1",
-    )
-    .bind(change.owner_id.as_str())
-    .bind(change.work_id.as_str())
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(|source| WorkRepositoryError::persistence("load graph Work", source))?
-    .ok_or(WorkRepositoryError::NotFound)?;
-    if work
-        .try_get::<i64, _>("is_archived")
-        .map_err(|source| WorkRepositoryError::corrupt("Work", source))?
-        != 0
-    {
-        return Err(WorkRepositoryError::Archived);
-    }
-
+    let graph_revision = prepared.graph_revision;
     let allocated = query(
-        "UPDATE work_graph_sequences SET last_revision = last_revision + 1
-         WHERE owner_id = ? AND work_id = ?",
+        "UPDATE works SET last_graph_revision = ?
+         WHERE owner_id = ? AND work_id = ? AND last_graph_revision = ?",
     )
+    .bind(graph_revision.get())
     .bind(change.owner_id.as_str())
     .bind(change.work_id.as_str())
+    .bind(graph_revision.get() - 1)
     .execute(&mut **transaction)
     .await
-    .map_err(|source| WorkRepositoryError::persistence("allocate graph revision", source))?;
+    .map_err(|source| WorkRepositoryError::persistence("advance Work graph revision", source))?;
     if allocated.rows_affected() != 1 {
         return Err(WorkRepositoryError::corrupt(
-            "Work graph sequence",
-            std::io::Error::other("missing or duplicate graph sequence row"),
+            "Work graph revision",
+            std::io::Error::other("locked Work did not advance its graph revision"),
         ));
     }
-    let allocated_revision: i64 = query(
-        "SELECT last_revision FROM work_graph_sequences
-         WHERE owner_id = ? AND work_id = ? LIMIT 1",
-    )
-    .bind(change.owner_id.as_str())
-    .bind(change.work_id.as_str())
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(|source| WorkRepositoryError::persistence("read graph revision", source))?
-    .try_get("last_revision")
-    .map_err(|source| WorkRepositoryError::corrupt("Work graph sequence", source))?;
-    let graph_revision = GraphRevision::new(allocated_revision)
-        .map_err(|source| WorkRepositoryError::corrupt("Work graph sequence", source))?;
 
     let branch_update = query(
         "UPDATE work_branches

@@ -37,7 +37,6 @@ pub mod runs;
 pub mod runtime_maintenance;
 pub mod self_surface;
 pub mod semantic_judgment_observation;
-pub mod semantic_read_observation_store;
 pub mod service_error;
 pub mod session_analytics;
 pub mod session_artifact_store;
@@ -186,9 +185,8 @@ pub use model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,
     ModelRequestComposition, ModelRequestContextEvent, ModelRequestContextRecord,
     ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestLineage,
-    ModelRequestMetricsRow, ModelRequestRolloutStage, ModelRequestRoute, ModelRequestTopology,
-    ModelRequestTraceCoverage, ModelRequestUsage, ModelRequestWireComposition,
-    aggregate_model_request_metrics, list_model_request_context_events,
+    ModelRequestRolloutStage, ModelRequestRoute, ModelRequestTopology, ModelRequestTraceCoverage,
+    ModelRequestUsage, ModelRequestWireComposition, list_model_request_context_events,
     model_request_trace_coverage,
 };
 pub use models::{
@@ -296,9 +294,9 @@ pub use sync_outbox::{
     SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_SCHEMA_VERSION,
     SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncDomain, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
     SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile,
-    SyncOutboxJournalBatchOutcome, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
-    SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind,
-    SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
+    SyncOutboxJournalBatchOutcome, SyncOutboxJournalDeltaOutcome, SyncOutboxRecord,
+    SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind, SyncOutboxSkippedRecord,
+    SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
     sync_outbox_stable_event_id,
 };
 pub use turn_intent_judge::{

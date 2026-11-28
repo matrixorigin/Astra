@@ -1001,13 +1001,10 @@ async fn load_provider_attempts(
                 a.run_id AS attempt_run_id, i.session_id AS invocation_session_id, \
                 i.scope_kind AS invocation_scope_kind, i.run_id AS invocation_run_id, \
                 i.turn_index, i.round_index, i.logical_attempt, i.operation_id, i.purpose, \
-                r.session_id AS route_session_id, r.scope_kind AS route_scope_kind, \
-                r.run_id AS route_run_id, r.offering_id, r.resolved_model_name \
+                i.offering_id, i.resolved_model_name \
          FROM inference_provider_attempts a \
          INNER JOIN inference_invocations i \
            ON i.user_id = a.user_id AND i.invocation_id = a.invocation_id \
-         INNER JOIN inference_routes r \
-           ON r.user_id = i.user_id AND r.route_id = i.route_id \
          WHERE a.user_id = ",
     );
     query.push_bind(user_id);
@@ -1055,10 +1052,8 @@ async fn load_provider_attempts(
         }
         let attempt_session_id: Option<String> = row.try_get("attempt_session_id")?;
         let invocation_session_id: Option<String> = row.try_get("invocation_session_id")?;
-        let route_session_id: Option<String> = row.try_get("route_session_id")?;
         if attempt_session_id.as_deref() != Some(stream.session_id.as_str())
             || invocation_session_id.as_deref() != Some(stream.session_id.as_str())
-            || route_session_id.as_deref() != Some(stream.session_id.as_str())
         {
             return Err(invalid(format!(
                 "attempt {attempt_id} owner/session join does not match {user_id}/{}",
@@ -1067,9 +1062,7 @@ async fn load_provider_attempts(
         }
         let attempt_run_id: Option<String> = row.try_get("attempt_run_id")?;
         let invocation_run_id: Option<String> = row.try_get("invocation_run_id")?;
-        let route_run_id: Option<String> = row.try_get("route_run_id")?;
         let invocation_scope: String = row.try_get("invocation_scope_kind")?;
-        let route_scope: String = row.try_get("route_scope_kind")?;
         let turn_index = non_negative_u32(
             required_i64(row.try_get("turn_index")?, "turn_index")?,
             "turn_index",
@@ -1085,10 +1078,8 @@ async fn load_provider_attempts(
         match &stream.authority {
             StreamAuthority::DurableRun { run_id } => {
                 if invocation_scope != "run"
-                    || route_scope != "run"
                     || attempt_run_id.as_deref() != Some(run_id)
                     || invocation_run_id.as_deref() != Some(run_id)
-                    || route_run_id.as_deref() != Some(run_id)
                 {
                     return Err(invalid(format!(
                         "attempt {attempt_id} is not owned by exact durable run {run_id}"
@@ -1101,10 +1092,8 @@ async fn load_provider_attempts(
                 ..
             } => {
                 if invocation_scope != "session"
-                    || route_scope != "session"
                     || attempt_run_id.is_some()
                     || invocation_run_id.is_some()
-                    || route_run_id.is_some()
                 {
                     return Err(invalid(format!(
                         "CLI attempt {attempt_id} fabricated durable run ownership"

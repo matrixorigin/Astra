@@ -331,9 +331,7 @@ impl BottomPaneView for InfoView {
 
         let theme = theme::current();
         let dim = Style::default().fg(theme.dim);
-        let title_style = Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD);
+        let title_style = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
         let mut y = area.y;
         if self.primary_workspace {
             // Reserve title, spacer, scroll indicator, spacer, and hint.
@@ -387,15 +385,11 @@ impl BottomPaneView for InfoView {
         }
         if y < area.bottom() {
             let hint = if self.lines.len() > max_visible {
-                "  ↑/↓ scroll  Esc close"
+                "↑↓ scroll · Esc close"
             } else {
-                "  Esc close"
+                "Esc close"
             };
-            Widget::render(
-                Line::from(Span::styled(hint, dim)),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
+            super::render_hint_bar(hint, Rect::new(area.x, y, area.width, 1), buf);
         }
     }
 

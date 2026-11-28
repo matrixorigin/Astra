@@ -7022,6 +7022,17 @@ async fn probe_thinking_behavior_with_protocol_inner(
     .await
 }
 
+/// First 300 bytes of a provider error body, cut on a UTF-8 character boundary
+/// so non-ASCII (for example Chinese) provider messages cannot panic the probe.
+fn thinking_probe_error_detail(text: &str) -> &str {
+    const MAX_DETAIL_BYTES: usize = 300;
+    let mut end = text.len().min(MAX_DETAIL_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 async fn probe_bedrock(
     client: &reqwest::Client,
     model_name: &str,
@@ -7066,7 +7077,7 @@ async fn probe_bedrock(
         Ok(r) => {
             let status = r.status().as_u16();
             let text = r.text().await.unwrap_or_default();
-            let detail = &text[..text.len().min(300)];
+            let detail = thinking_probe_error_detail(&text);
             if status == 400 && text.contains("think") {
                 // 400 mentioning "thinking" = model rejects the thinking param
                 ThinkingProbeResult {
@@ -7128,7 +7139,7 @@ async fn probe_anthropic(
         Ok(r) => {
             let status = r.status().as_u16();
             let text = r.text().await.unwrap_or_default();
-            let detail = &text[..text.len().min(300)];
+            let detail = thinking_probe_error_detail(&text);
             if status == 400 && text.contains("think") {
                 ThinkingProbeResult {
                     capability: ThinkingCapability::None,
@@ -8681,6 +8692,36 @@ mod tests {
         .unwrap_err();
         assert!(matches!(failure, ModelProbeError::Response(_)));
         server.abort();
+    }
+
+    #[test]
+    fn thinking_probe_error_detail_cuts_on_char_boundary() {
+        // Byte 300 falls inside the 100th three-byte character.
+        let text = format!("a{}", "错".repeat(120));
+        let detail = thinking_probe_error_detail(&text);
+        assert_eq!(detail, format!("a{}", "错".repeat(99)));
+        assert_eq!(thinking_probe_error_detail("short"), "short");
+    }
+
+    #[tokio::test]
+    async fn anthropic_thinking_probe_survives_non_ascii_error_body() {
+        use axum::{Router, routing::post};
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async { (StatusCode::BAD_REQUEST, format!("a{}", "错".repeat(120))) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{address}");
+        let result = probe_anthropic(&reqwest::Client::new(), "model", "key", Some(&base)).await;
+        server.abort();
+        assert_eq!(result.capability, ThinkingCapability::Both);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(format!("Anthropic probe 400 (assuming Both): a{}", "错".repeat(99)).as_str())
+        );
     }
 
     #[tokio::test]

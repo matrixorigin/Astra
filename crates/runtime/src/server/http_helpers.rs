@@ -123,7 +123,7 @@ pub(super) fn sse_error_response_with_retryable_and_context(
         http_status = status.as_u16(),
         error_code = status_to_chat_sse_error_code(status),
         retryable,
-        request_id = context.request_id.unwrap_or(""),
+        request_id = %super::request_trace::log_request_id(context.request_id.unwrap_or("")),
         session_id = session_id.unwrap_or(""),
         run_id = context.run_id.unwrap_or(""),
         message = %message,
@@ -197,8 +197,8 @@ pub(super) fn sse_error_event(
         error_code = status_to_chat_sse_error_code(status),
         retryable = status_to_sse_retryable(status),
         domain_error_code = error.error_code.as_deref().unwrap_or(""),
-        request_id = error.request_id.as_deref().unwrap_or(""),
-        caller_request_id = context.request_id.unwrap_or(""),
+        request_id = %super::request_trace::log_request_id(error.request_id.as_deref().unwrap_or("")),
+        caller_request_id = %super::request_trace::log_request_id(context.request_id.unwrap_or("")),
         session_id,
         run_id = context.run_id.unwrap_or(""),
         agent_binding_id = %agent_binding_id,
@@ -404,7 +404,7 @@ pub(super) fn sse_projected_streaming_response(
                 }
                 tracing::warn!(
                     target: "astra_runtime::sse",
-                    request_id = request_id.as_deref().unwrap_or(""),
+                    request_id = %super::request_trace::log_request_id(request_id.as_deref().unwrap_or("")),
                     session_id = %session_id,
                     run_id = %run_id,
                     event_type = "run_error",
@@ -420,7 +420,7 @@ pub(super) fn sse_projected_streaming_response(
                 // an owner that may still recover and continue the run.
                 tracing::warn!(
                     target: "astra_runtime::sse",
-                    request_id = request_id.as_deref().unwrap_or(""),
+                    request_id = %super::request_trace::log_request_id(request_id.as_deref().unwrap_or("")),
                     session_id = %session_id,
                     run_id = %run_id,
                     event_type = "error",
@@ -442,7 +442,7 @@ pub(super) fn sse_projected_streaming_response(
             {
                 tracing::warn!(
                     target: "astra_runtime::sse",
-                    request_id = request_id.as_deref().unwrap_or(""),
+                    request_id = %super::request_trace::log_request_id(request_id.as_deref().unwrap_or("")),
                     session_id = %session_id,
                     run_id = %run_id,
                     event_type = "run_finished",
@@ -496,7 +496,7 @@ pub(super) fn sse_projected_streaming_response(
                     Err(error) => {
                         tracing::error!(
                             target: "astra_runtime::sse",
-                            request_id = request_id.as_deref().unwrap_or(""),
+                            request_id = %super::request_trace::log_request_id(request_id.as_deref().unwrap_or("")),
                             session_id = %session_id,
                             run_id = %run_id,
                             event_type = event

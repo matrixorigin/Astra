@@ -26,7 +26,6 @@ import {
   decodeWorkCriteriaProposalDetailV1,
   decodeWorkCriteriaProposalListV1,
   decodeWorkEventPageV1,
-  decodeWorkReadCursorReceiptV1,
   decodeWorkTurnStreamEventV1,
   decodeWorkBranchInteractionPageV1,
   decodeWorkBranchInteractionReceiptV1,
@@ -298,9 +297,6 @@ const workCatalogPage = {
       graph_item_count: 3,
       pending_decision_count: 1,
       event_head: 4,
-      seen_through_event_seq: 3,
-      unseen_event_count: 1,
-      attention: "needs_review",
       delivery_branch_activity: "waiting",
       created_at: "2026-08-01T02:00:00.000002Z",
       last_activity_at: "2026-08-01T02:01:00.000000Z",
@@ -315,9 +311,6 @@ const workCatalogPage = {
       graph_item_count: 1,
       pending_decision_count: 0,
       event_head: 2,
-      seen_through_event_seq: null,
-      unseen_event_count: 2,
-      attention: "updated",
       delivery_branch_activity: "working",
       created_at: "2026-08-01T02:00:00.000001Z",
       last_activity_at: "2026-08-01T02:00:00.000001Z",
@@ -353,11 +346,11 @@ test("listWorks sends a stable keyset cursor and decodes server-owned attention"
   expect(init.cache).toBe("no-store");
 });
 
-test("Work catalog rejects incoherent attention, ordering, and unbounded input", async () => {
-  const incoherent = structuredClone(workCatalogPage);
-  incoherent.entries[0]!.attention = "updated";
-  expect(() => decodeWorkCatalogPageV1(incoherent)).toThrow(
-    "attention and cursor facts disagree",
+test("Work catalog rejects invalid ordering and unbounded input", async () => {
+  const unboundedDecisions = structuredClone(workCatalogPage);
+  unboundedDecisions.entries[0]!.pending_decision_count = 9;
+  expect(() => decodeWorkCatalogPageV1(unboundedDecisions)).toThrow(
+    "pending_decision_count",
   );
 
   const unknownActivity = structuredClone(workCatalogPage) as {
@@ -990,7 +983,9 @@ test("getWorkBranchActivity reads one owner-scoped, identity-checked status", as
     work_id: "work-1",
     branch_id: "branch-1",
     branch_revision: 3,
+    event_head: 7,
     activity: "working",
+    pause_cursor: null,
     observed_at: "2026-09-15T00:00:00Z",
   } as const;
   const fetchMock = vi.fn().mockResolvedValue(response(200, activity));
@@ -1012,27 +1007,34 @@ test("getWorkBranchActivity reads one owner-scoped, identity-checked status", as
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });
 
-test("Work branch activity decoder rejects drift and backing identities", () => {
+test("Work branch activity requires an opaque cursor only while paused", () => {
+  const idle = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    branch_revision: 1,
+    event_head: 1,
+    activity: "idle",
+    pause_cursor: null,
+    observed_at: "2026-09-15T00:00:00Z",
+  };
+  const pauseCursor = `sha256:${"a".repeat(64)}`;
+  const paused = { ...idle, activity: "paused", pause_cursor: pauseCursor };
+  expect(decodeWorkBranchActivityResponseV1(paused)).toEqual(paused);
   expect(() =>
-    decodeWorkBranchActivityResponseV1({
-      schema_version: 1,
-      work_id: "work-1",
-      branch_id: "branch-1",
-      branch_revision: 1,
-      activity: "running",
-      observed_at: "2026-09-15T00:00:00Z",
-    }),
+    decodeWorkBranchActivityResponseV1({ ...idle, activity: "running" }),
   ).toThrow("activity");
   expect(() =>
-    decodeWorkBranchActivityResponseV1({
-      schema_version: 1,
-      work_id: "work-1",
-      branch_id: "branch-1",
-      branch_revision: 1,
-      activity: "idle",
-      observed_at: "2026-09-15T00:00:00Z",
-      session_id: "must-not-leak",
-    }),
+    decodeWorkBranchActivityResponseV1({ ...idle, activity: "paused" }),
+  ).toThrow("pause_cursor");
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({ ...idle, pause_cursor: pauseCursor }),
+  ).toThrow("pause_cursor");
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({ ...paused, pause_cursor: "run-1" }),
+  ).toThrow("pause_cursor");
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({ ...idle, session_id: "must-not-leak" }),
   ).toThrow("field set");
 });
 
@@ -1637,59 +1639,6 @@ test("typed Work API errors survive the generic HTTP boundary", async () => {
   } satisfies Partial<AstraApiError>);
 });
 
-test("advanceWorkReadCursor sends one exact monotonic cursor and decodes its receipt", async () => {
-  const receipt = {
-    schema_version: 1,
-    work_id: "work-1",
-    through_event_seq: 42,
-    receipt_revision: 3,
-    receipt_hash: `sha256:${"a".repeat(64)}`,
-    updated_at: "2026-08-01T01:02:03.123456Z",
-  };
-  const fetchMock = vi.fn().mockResolvedValue(response(200, receipt));
-  globalThis.fetch = fetchMock;
-  const client = new AstraClient({
-    baseUrl: "https://astra.example",
-    accessToken: "token",
-  });
-
-  await expect(client.advanceWorkReadCursor("work-1", 42)).resolves.toEqual(receipt);
-  const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-  expect(url).toBe("https://astra.example/v1/works/work-1/read-cursor");
-  expect(init.method).toBe("PUT");
-  expect(JSON.parse(String(init.body))).toEqual({ through_event_seq: 42 });
-  expect((init.headers as Record<string, string>)[ASTRA_WORK_API_MAJOR_HEADER]).toBe(
-    ASTRA_WORK_API_MAJOR,
-  );
-});
-
-test("read-cursor boundary rejects ambiguous requests and incoherent receipts", async () => {
-  const fetchMock = vi.fn();
-  globalThis.fetch = fetchMock;
-  const client = new AstraClient({ baseUrl: "https://astra.example" });
-  await expect(client.advanceWorkReadCursor("work-1", 0)).rejects.toThrow(
-    "positive safe integer",
-  );
-  expect(fetchMock).not.toHaveBeenCalled();
-
-  const wrongWork = {
-    schema_version: 1,
-    work_id: "work-2",
-    through_event_seq: 1,
-    receipt_revision: 1,
-    receipt_hash: `sha256:${"b".repeat(64)}`,
-    updated_at: "2026-08-01T01:02:03Z",
-  };
-  globalThis.fetch = vi.fn().mockResolvedValue(response(200, wrongWork));
-  await expect(client.advanceWorkReadCursor("work-1", 1)).rejects.toThrow(
-    "different Work",
-  );
-
-  expect(() =>
-    decodeWorkReadCursorReceiptV1({ ...wrongWork, legacy_session_id: "session-1" }),
-  ).toThrow("unsupported field set");
-});
-
 test("listWorkEvents preserves the exact bounded cursor query", async () => {
   const page = {
     schema_version: 1,
@@ -1698,7 +1647,6 @@ test("listWorkEvents preserves the exact bounded cursor query", async () => {
     next_after_event_seq: 2,
     event_head: 2,
     retained_from_event_seq: 1,
-    seen_through_event_seq: 1,
     coverage: "complete",
     has_more: false,
     events: [
@@ -1740,7 +1688,6 @@ test("event-page decoder rejects gaps and client rejects unbounded limits", asyn
     next_after_event_seq: 2,
     event_head: 2,
     retained_from_event_seq: 1,
-    seen_through_event_seq: null,
     coverage: "complete",
     has_more: false,
     events: [
@@ -1789,7 +1736,6 @@ test("Work event reconciliation is contiguous, duplicate-safe, and fail-closed",
     next_after_event_seq: 4,
     event_head: 4,
     retained_from_event_seq: 1,
-    seen_through_event_seq: 2,
     coverage: "complete",
     has_more: false,
     events: [event(3), event(4)],

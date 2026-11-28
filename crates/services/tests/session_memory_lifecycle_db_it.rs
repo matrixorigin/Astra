@@ -495,6 +495,9 @@ async fn close_enqueues_pending_generation_and_restart_recovers_exact_prepared_w
     assert_eq!(governance.work.completed_turn, Some(3));
     assert!(restarted.claim("foreign-user", &session).await.is_err());
     restarted.release(&governance, false).await.unwrap();
+    let retry = restarted.scan_recovery(16, 30).await.unwrap();
+    assert!(!retry.due.contains(&(user.clone(), session.clone())));
+    assert!(retry.retry_after.unwrap() <= std::time::Duration::from_secs(5));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -720,9 +723,10 @@ async fn close_without_any_journal_recovers_committed_context_after_restart() {
     let restarted = SessionMemoryLifecycleStore::new(pool);
     assert!(
         restarted
-            .list_due(16)
+            .scan_recovery(16, 0)
             .await
             .unwrap()
+            .due
             .contains(&(user.clone(), session.clone()))
     );
     let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
@@ -936,9 +940,10 @@ async fn assert_controller_turn_close_recovers(missed_handoff: bool) {
     let restarted = SessionMemoryLifecycleStore::new(pool.clone());
     assert!(
         restarted
-            .list_due(64)
+            .scan_recovery(64, 0)
             .await
             .unwrap()
+            .due
             .contains(&(user.clone(), session.clone()))
     );
     let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
@@ -984,9 +989,10 @@ async fn assert_controller_turn_close_recovers(missed_handoff: bool) {
     }
     assert!(
         !restarted
-            .list_due(64)
+            .scan_recovery(64, 0)
             .await
             .unwrap()
+            .due
             .contains(&(user.clone(), session.clone()))
     );
     let complete: sqlx::types::Json<astra_services::session_memory_lifecycle::SessionMemoryWork> =

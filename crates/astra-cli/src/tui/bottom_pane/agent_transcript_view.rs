@@ -9,6 +9,7 @@ use ratatui::{buffer::Buffer, layout::Rect, text::Line};
 
 use super::transcript_view::{
     TranscriptItem, TranscriptItemId, TranscriptItemKind, TranscriptSnapshot, TranscriptView,
+    notice_line,
 };
 use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ConversationTabId,
@@ -391,8 +392,10 @@ impl LiveTranscript {
             }
             _ => {
                 self.finish_open_model_item();
-                let mut cell = AssistantCell::new_streaming();
-                cell.model_item_id = model_item_id.map(str::to_owned);
+                let mut cell = AssistantCell::new_streaming()
+                    .with_model_item(model_item_id, || {
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    });
                 cell.push_delta(text);
                 self.push(LiveTranscriptItem::Assistant(Arc::new(Mutex::new(cell))));
             }
@@ -681,7 +684,7 @@ impl AgentTranscriptView {
                 terminal_height,
                 viewport_width,
             )
-            .with_title(format!("{agent_name} · Transcript")),
+            .with_title(format!("Transcript · {agent_name}")),
             session_id: Some(session_id),
             run_id,
             transcript_target: Some(transcript_target),
@@ -735,7 +738,7 @@ impl AgentTranscriptView {
                 terminal_height,
                 viewport_width,
             )
-            .with_title(format!("{agent_name} · Transcript")),
+            .with_title(format!("Transcript · {agent_name}")),
             session_id: None,
             run_id,
             transcript_target,
@@ -1027,44 +1030,37 @@ impl AgentTranscriptView {
                     | None => "No canonical conversation items have synced for this agent yet.",
                 }
             };
-            return TranscriptSnapshot::new(vec![TranscriptItem::rendered(
+            return TranscriptSnapshot::new(vec![TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(0),
-                vec![Line::from(message.to_string())],
-                0,
+                message,
             )]);
         }
 
         let mut projected = self.canonical.items.clone();
         if let Some(activity) = &self.activity {
-            projected.push(TranscriptItem::rendered(
+            let coverage = if activity.events.is_empty() {
+                "No tool activity recorded in this range"
+            } else {
+                "Recorded tool activity · partial coverage"
+            };
+            let older = activity.next_before_event_idx.map_or("", |_| " · A older");
+            projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(1 << 61),
-                vec![Line::from(
-                    "Recorded tool activity (partial coverage) · A older · R refresh",
-                )],
-                0,
+                format!("{coverage}{older}"),
             ));
-            if activity.events.is_empty() {
-                projected.push(TranscriptItem::rendered(
-                    TranscriptItemId::from_widget_id((1 << 61) + 2),
-                    vec![Line::from("No recorded activity in this range. Live-only or dropped events may be unavailable.")], 0));
-            }
             projected.extend(self.activity_items.iter().cloned());
         }
         if let Some(error) = &self.activity_error {
-            projected.push(TranscriptItem::rendered(
+            projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id((1 << 61) + 1),
-                vec![Line::from(error.clone())],
-                0,
+                error,
             ));
         }
         self.append_live_projection(&mut projected);
         if let Some(live) = &self.local_root_live {
-            projected.push(TranscriptItem::rendered(
+            projected.push(TranscriptItem::notice(
                 TranscriptItemId::from_widget_id(u64::MAX - 1),
-                vec![Line::from(
-                    "Live local projection · awaiting durable reconciliation",
-                )],
-                0,
+                "Local live activity · history pending",
             ));
             projected.push(live.item.clone());
         }
@@ -1247,7 +1243,7 @@ impl AgentTranscriptView {
                 } else {
                     TranscriptItemKind::System
                 },
-                vec![Line::from("Live activity · not in loaded history")],
+                vec![notice_line("Live activity · not in loaded history")],
                 0,
             ));
         }
@@ -1761,20 +1757,20 @@ fn project_durable_transcript(
         match item.role.as_str() {
             "user" => projected.push(TranscriptItem::committed(
                 id,
-                Arc::new(crate::tui::history_cell::user::UserCell::new(
-                    item.content.clone(),
-                )),
+                Arc::new(
+                    crate::tui::history_cell::user::UserCell::new(item.content.clone())
+                        .with_timestamp(item.created_at.clone()),
+                ),
                 1,
             )),
             "assistant" | "tool_observation" | "tool_observation_preview"
                 if item.role == "assistant" || !item.tool_calls.is_empty() =>
             {
                 if item.role == "assistant" && !item.content.trim().is_empty() {
-                    let mut cell =
-                        crate::tui::history_cell::assistant::AssistantCell::from_markdown(
-                            item.content.clone(),
-                        );
-                    cell.model_item_id = item.model_item_id.clone().filter(|id| !id.is_empty());
+                    let cell = AssistantCell::from_markdown(item.content.clone()).with_model_item(
+                        item.model_item_id.as_deref().filter(|id| !id.is_empty()),
+                        || item.created_at.clone(),
+                    );
                     projected.push(TranscriptItem::committed(id, Arc::new(cell), 1));
                 }
                 for (index, call) in item.tool_calls.iter().enumerate() {
@@ -1836,11 +1832,12 @@ fn project_durable_transcript(
                         },
                         description.clone(),
                     );
+                    cell.ts = Some(item.created_at.clone());
                     if let Some(result_item) = result_item {
                         let result = result_item.tool_result.as_ref().unwrap();
                         cell.complete(
                             result.status.as_deref().unwrap_or("uncertain"),
-                            result.duration_ms.unwrap_or_default(),
+                            result.duration_ms,
                             description,
                             if conflict {
                                 Some("Conflicting tool identity · details unavailable".into())
@@ -1920,7 +1917,7 @@ fn project_durable_transcript(
                                 format!("{component}:partial"),
                             ),
                             TranscriptItemKind::Tool,
-                            vec![Line::from("Partial retained output")],
+                            vec![notice_line("Partial retained output")],
                             0,
                         ));
                     }
@@ -1988,13 +1985,12 @@ fn project_durable_transcript(
                         .unwrap_or("tool"),
                     "Tool result",
                 );
+                cell.ts = Some(item.created_at.clone());
                 cell.complete(
                     result
                         .and_then(|result| result.status.as_deref())
                         .unwrap_or("uncertain"),
-                    result
-                        .and_then(|result| result.duration_ms)
-                        .unwrap_or_default(),
+                    result.and_then(|result| result.duration_ms),
                     match item.role.as_str() {
                         "tool_observation" => "Observed locally",
                         "tool_observation_preview" => "Observed locally · partial retained output",
@@ -2020,7 +2016,7 @@ fn project_durable_transcript(
                     projected.push(TranscriptItem::rendered_kind(
                         TranscriptItemId::from_canonical(canonical_id, "partial"),
                         TranscriptItemKind::Tool,
-                        vec![Line::from("Partial retained output")],
+                        vec![notice_line("Partial retained output")],
                         0,
                     ));
                 }
@@ -2454,7 +2450,7 @@ impl BottomPaneView for AgentTranscriptView {
         if !row.name.trim().is_empty() && row.name != self.agent_name {
             self.agent_name = row.name.clone();
             self.transcript
-                .set_title(format!("{} · Transcript", self.agent_name));
+                .set_title(format!("Transcript · {}", self.agent_name));
             changed = true;
         }
         if self.run_id.trim().is_empty()
@@ -2562,21 +2558,21 @@ impl BottomPaneView for AgentTranscriptView {
         self.bind_session(session_id)
     }
 
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
+
     fn hint_keys(&self) -> Option<String> {
-        let mut hints = Vec::new();
+        let mut hints = vec![self.transcript.hint_keys()?, "Shift+←/→ switch".into()];
         if self.session_id.is_some() && self.transcript_target.is_some() {
-            hints.push("R refresh");
+            hints.push("R refresh".into());
         } else if self.transcript_target.is_none() {
-            hints.push("live only");
+            hints.push("live only".into());
         }
         if self.has_more {
-            hints.push("O older");
+            hints.push("O older".into());
         }
-        hints.push("Ctrl+E toggle");
-        hints.push("S export");
-        hints.push("Ctrl+G conversations");
-        hints.push("Shift+←/→ switch");
-        hints.push("←/Esc agents");
+        hints.extend(["S export".into(), "Ctrl+G agents".into()]);
         Some(hints.join(" · "))
     }
 
@@ -4412,6 +4408,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_reply_keeps_its_model_item_time_when_the_durable_page_arrives() {
+        let mut view = loading_view(80, 24);
+        let model_item_id = "019a93c5-d340-7000-8000-000000000001";
+        let time = chrono::DateTime::from_timestamp_millis(0x019a93c5d340)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S");
+        let heading = format!("Astra  {time}");
+        assert!(view.apply_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some(model_item_id.into()),
+                text: "Found the race.".into(),
+            },
+        }));
+        let live = rendered(&view);
+        assert!(live.contains(&heading), "{live}");
+        let mut durable = page();
+        durable.items[0].model_item_id = Some(model_item_id.into());
+        // Persisted later than the model item started.
+        durable.items[0].created_at = "2026-07-11T00:00:07".into();
+        view.apply_page(durable.clone(), true, AgentTranscriptSource::DurableServer);
+        let settled = rendered(&view);
+        assert_eq!(settled.matches(&heading).count(), 1, "{settled}");
+        assert_eq!(settled.matches("Found the race.").count(), 1, "{settled}");
+        let mut reopened = loading_view(80, 24);
+        reopened.apply_page(durable, true, AgentTranscriptSource::DurableServer);
+        assert!(rendered(&reopened).contains(&heading));
+    }
+
     fn page() -> astra_thin_client::SessionTranscriptPage {
         astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
@@ -5839,8 +5867,9 @@ mod tests {
     fn agent_transcript_advertises_global_detail_and_conversation_navigation() {
         let view = loading_view(80, 24);
         let hints = view.hint_keys().expect("agent transcript hints");
-        assert!(hints.contains("Ctrl+E toggle"), "{hints}");
-        assert!(hints.contains("Ctrl+G conversations"), "{hints}");
+        assert!(hints.contains("Enter details"), "{hints}");
+        assert!(hints.contains("/ search"), "{hints}");
+        assert!(hints.contains("Ctrl+G agents"), "{hints}");
     }
 
     #[test]

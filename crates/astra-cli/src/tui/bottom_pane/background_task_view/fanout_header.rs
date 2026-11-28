@@ -373,7 +373,10 @@ mod tests {
             &mut buffer,
         );
         let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
-        let line = rendered.lines().nth(1).expect("fanout header row");
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("▣"))
+            .expect("fanout header row");
         assert!(line.contains("1 needs input"), "{rendered}");
         assert!(line.contains("1 failed"), "{rendered}");
         assert!(line.contains("1 unavailable"), "{rendered}");

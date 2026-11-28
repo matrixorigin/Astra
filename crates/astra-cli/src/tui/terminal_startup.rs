@@ -33,13 +33,8 @@ pub(crate) struct StartupTerminal {
     keyboard_enhancement_supported: bool,
 }
 
-fn should_query_colors(profile: Option<&str>, no_color: bool, background_override: bool) -> bool {
-    !no_color
-        && !background_override
-        && profile
-            .and_then(ThemeProfile::parse)
-            .unwrap_or(ThemeProfile::Auto)
-            == ThemeProfile::Auto
+fn should_query_colors(profile: ThemeProfile, no_color: bool, background_override: bool) -> bool {
+    !no_color && !background_override && profile == ThemeProfile::Auto
 }
 
 impl StartupTerminal {
@@ -86,9 +81,12 @@ impl StartupTerminal {
             mode.local_flags |= original_mode.local_flags & LocalFlags::ISIG;
             tcsetattr(io::stdin(), SetArg::TCSANOW, &mode)?;
 
-            let profile = std::env::var("ASTRA_TUI_THEME").ok();
+            let profile = astra_config::RuntimeConfig::cached()
+                .tui
+                .theme
+                .unwrap_or_default();
             let colors = should_query_colors(
-                profile.as_deref(),
+                profile,
                 std::env::var_os("NO_COLOR").is_some(),
                 terminal_palette::has_background_override(),
             );
@@ -189,14 +187,12 @@ mod tests {
 
     #[test]
     fn queries_only_for_auto_without_a_manual_background() {
-        for profile in [None, Some("auto"), Some("invalid")] {
-            assert!(should_query_colors(profile, false, false));
+        assert!(should_query_colors(ThemeProfile::Auto, false, false));
+        for profile in [ThemeProfile::Light, ThemeProfile::Dark, ThemeProfile::Plain] {
+            assert!(!should_query_colors(profile, false, false));
         }
-        for profile in ["light", "dark", "light-ansi", "dark-ansi", "plain"] {
-            assert!(!should_query_colors(Some(profile), false, false));
-        }
-        assert!(!should_query_colors(None, true, false));
-        assert!(!should_query_colors(None, false, true));
+        assert!(!should_query_colors(ThemeProfile::Auto, true, false));
+        assert!(!should_query_colors(ThemeProfile::Auto, false, true));
     }
 }
 

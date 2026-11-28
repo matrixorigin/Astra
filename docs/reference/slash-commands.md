@@ -1,6 +1,6 @@
 # TUI Slash Commands Reference
 
-This is the complete catalog of the 28 slash-command roots with a native TUI
+This is the complete catalog of the slash-command roots with a native TUI
 interaction. The canonical metadata lives in
 [`command_registry.rs`](../../crates/astra-cli/src/cli/command_registry.rs).
 
@@ -9,6 +9,9 @@ interaction. The canonical metadata lives in
 - Type `/` to open the complete TUI command list. Featured actions sort first;
   every other native command remains in the list and is reachable by scrolling
   or typing a filter.
+- Use **↑↓** to select and **Tab** to insert a match for editing. **Enter**
+  runs a recognized command. Type a space after its name to see its actions.
+  **Esc** closes the picker and keeps the draft.
 - Run `/help` for the Featured tab and the complete catalog arranged by task.
   Select an entry to insert it into the composer.
 - Run `/help keys` for the current workbench keyboard shortcuts.
@@ -133,6 +136,7 @@ accepted as an alias for the monitor.
 | Command | What it does |
 | --- | --- |
 | `/explain [on\|verbose\|off] [--format html\|markdown\|text]` | Show measured execution facts at the selected detail and choose the derived local report format. A bare `/explain` is the idempotent `on` form; format-only commands keep the current mode. |
+| `/explain report` | Open the latest settled report in the TUI. Enter toggles evidence, and A drafts a follow-up for the selected run. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |
@@ -145,7 +149,8 @@ view with `/stats cost`, `/stats health`, `/stats history`, `/stats learn`, or
 `/stats tools`. `/context dump [path]` writes a JSON snapshot to a file.
 
 `/explain` changes presentation only; it never changes the recorded execution
-facts. `on` keeps subsequent execution concise, `verbose` adds context,
+facts. Chat keeps its ordinary progress display while work is running and
+adds one execution tree after settlement. `on` shows a concise report, `verbose` adds context,
 dependency, and coverage details, and `off` suppresses the projection for
 subsequent execution while retaining durable evidence and already recorded
 history. The local report defaults to HTML; Markdown and text remain explicit

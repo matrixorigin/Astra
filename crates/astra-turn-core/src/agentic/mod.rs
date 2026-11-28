@@ -1,3 +1,4 @@
+pub mod model_item;
 pub mod post_tool_policy;
 pub mod prepare_payload;
 pub mod recursion_guard;

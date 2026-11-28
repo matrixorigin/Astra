@@ -129,7 +129,7 @@ pub(super) async fn select_delivery_branch(
                 CASE WHEN b.deletion_operation_id IS NULL THEN 0 ELSE 1 END AS branch_deleting,
                 cs.member_count, cs.member_manifest_json,
                 gr.revision AS materialized_graph_revision,
-                s.graph_revision AS subject_graph_revision, s.subject_ref, s.subject_revision
+                b.subject_graph_revision, b.subject_ref, b.subject_revision
          FROM works w
          JOIN work_branches b
            ON b.owner_id = w.owner_id AND b.work_id = w.work_id AND b.branch_id = ?
@@ -141,8 +141,6 @@ pub(super) async fn select_delivery_branch(
          LEFT JOIN work_graph_revisions gr
            ON gr.owner_id = b.owner_id AND gr.work_id = b.work_id
           AND gr.revision = b.current_graph_revision
-         LEFT JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id AND s.work_id = b.work_id AND s.branch_id = b.branch_id
          WHERE w.owner_id = ? AND w.work_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(selection.branch_id.as_str())

@@ -7,17 +7,7 @@ use super::{
     WorkId, WorkOwnerId, WorkSubjectRef,
 };
 use chrono::{DateTime, Utc};
-use sqlx::{MySql, Row, Transaction, query};
-
-const SUBJECT_COLUMNS: &str = "
-    s.subject_record_revision,
-    s.branch_revision AS subject_branch_revision,
-    s.graph_revision AS subject_graph_revision,
-    s.subject_ref,
-    s.subject_revision,
-    s.source_ref,
-    DATE_FORMAT(s.created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS subject_created_at,
-    DATE_FORMAT(s.updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS subject_updated_at";
+use sqlx::{Row, query};
 
 struct SubjectContext {
     branch_revision: WorkBranchRevision,
@@ -35,6 +25,16 @@ fn decode_subject(
         .try_get::<Option<i64>, _>("subject_record_revision")
         .map_err(|source| WorkRepositoryError::corrupt("Work branch subject", source))?
     else {
+        if row
+            .try_get::<Option<&str>, _>("subject_ref")
+            .map_err(|source| WorkRepositoryError::corrupt("Work branch subject", source))?
+            .is_some()
+        {
+            return Err(WorkRepositoryError::corrupt(
+                "Work branch subject",
+                std::io::Error::other("subject reference is missing its record revision"),
+            ));
+        }
         return Ok(None);
     };
     let required_i64 = |field: &'static str| {
@@ -76,7 +76,7 @@ fn decode_subject(
                 WorkRepositoryError::corrupt("Work branch subject", std::io::Error::other(message))
             },
         )?,
-        source_ref: super::WorkChangeRef::parse(required_string("source_ref")?)
+        source_ref: super::WorkChangeRef::parse(required_string("subject_source_ref")?)
             .map_err(|source| WorkRepositoryError::corrupt("Work branch subject", source))?,
         created_at: parse_timestamp("subject_created_at")?,
         updated_at: parse_timestamp("subject_updated_at")?,
@@ -89,19 +89,19 @@ async fn load_context(
     work_id: &WorkId,
     branch_id: &WorkBranchId,
 ) -> Result<SubjectContext, WorkRepositoryError> {
-    let statement = format!(
+    let row = query(
         "SELECT b.branch_revision, b.current_graph_revision,
                 CASE WHEN w.archived_at IS NULL AND b.archived_at IS NULL THEN 0 ELSE 1 END AS archived,
-                {SUBJECT_COLUMNS}
+                b.subject_record_revision, b.subject_branch_revision, b.subject_graph_revision,
+                b.subject_ref, b.subject_revision, b.subject_source_ref,
+                DATE_FORMAT(b.subject_created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS subject_created_at,
+                DATE_FORMAT(b.subject_updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS subject_updated_at
          FROM works w
          LEFT JOIN work_branches b
            ON b.owner_id = w.owner_id AND b.work_id = w.work_id AND b.branch_id = ?
-         LEFT JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id AND s.work_id = b.work_id AND s.branch_id = b.branch_id
          WHERE w.owner_id = ? AND w.work_id = ?
          LIMIT 1"
-    );
-    let row = query(sqlx::AssertSqlSafe(statement))
+    )
         .bind(branch_id.as_str())
         .bind(owner_id.as_str())
         .bind(work_id.as_str())
@@ -190,39 +190,6 @@ pub(super) async fn load_branch_subject(
     Ok(context.subject)
 }
 
-async fn load_subject_in_transaction(
-    transaction: &mut Transaction<'_, MySql>,
-    work_id: &WorkId,
-    branch_id: &WorkBranchId,
-    owner_id: &WorkOwnerId,
-) -> Result<WorkBranchSubject, WorkRepositoryError> {
-    let statement = format!(
-        "SELECT {SUBJECT_COLUMNS}
-         FROM work_branch_subjects s
-         WHERE s.owner_id = ? AND s.work_id = ? AND s.branch_id = ?
-         LIMIT 1"
-    );
-    let row = query(sqlx::AssertSqlSafe(statement))
-        .bind(owner_id.as_str())
-        .bind(work_id.as_str())
-        .bind(branch_id.as_str())
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|source| WorkRepositoryError::persistence("load updated branch subject", source))?
-        .ok_or_else(|| {
-            WorkRepositoryError::corrupt(
-                "Work branch subject",
-                std::io::Error::other("subject update did not leave a current row"),
-            )
-        })?;
-    decode_subject(&row, work_id, branch_id)?.ok_or_else(|| {
-        WorkRepositoryError::corrupt(
-            "Work branch subject",
-            std::io::Error::other("subject row decoded as absent"),
-        )
-    })
-}
-
 pub(super) async fn set_branch_subject(
     repository: &DatabaseWorkRepository,
     change: WorkBranchSubjectChange,
@@ -250,16 +217,30 @@ pub(super) async fn set_branch_subject(
     };
     let updated_at = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
         .expect("current timestamp");
+    let created_at = context
+        .subject
+        .map_or(updated_at, |subject| subject.created_at);
     let mut transaction = repository.pool.get().begin().await.map_err(|source| {
         WorkRepositoryError::persistence("begin branch subject transaction", source)
     })?;
     let update = query(
         "UPDATE work_branches
-         SET branch_revision = ?, updated_at = ?
+         SET branch_revision = ?, updated_at = ?,
+             subject_record_revision = ?, subject_branch_revision = ?, subject_graph_revision = ?,
+             subject_ref = ?, subject_revision = ?, subject_source_ref = ?,
+             subject_created_at = ?, subject_updated_at = ?
          WHERE owner_id = ? AND work_id = ? AND branch_id = ?
            AND branch_revision = ? AND current_graph_revision = ? AND archived_at IS NULL",
     )
     .bind(next_branch_revision.get())
+    .bind(updated_at.naive_utc())
+    .bind(next_subject_revision.get())
+    .bind(next_branch_revision.get())
+    .bind(change.graph_revision.get())
+    .bind(change.subject_ref.as_str())
+    .bind(change.subject_revision.as_str())
+    .bind(change.source_ref.as_str())
+    .bind(created_at.naive_utc())
     .bind(updated_at.naive_utc())
     .bind(change.owner_id.as_str())
     .bind(change.work_id.as_str())
@@ -289,43 +270,6 @@ pub(super) async fn set_branch_subject(
         ));
     }
 
-    let upsert = query(
-        "INSERT INTO work_branch_subjects
-         (owner_id, work_id, branch_id, subject_record_revision, branch_revision,
-          graph_revision, subject_ref, subject_revision, source_ref, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-          subject_record_revision = VALUES(subject_record_revision),
-          branch_revision = VALUES(branch_revision),
-          graph_revision = VALUES(graph_revision),
-          subject_ref = VALUES(subject_ref),
-          subject_revision = VALUES(subject_revision),
-          source_ref = VALUES(source_ref),
-          updated_at = VALUES(updated_at)",
-    )
-    .bind(change.owner_id.as_str())
-    .bind(change.work_id.as_str())
-    .bind(change.branch_id.as_str())
-    .bind(next_subject_revision.get())
-    .bind(next_branch_revision.get())
-    .bind(change.graph_revision.get())
-    .bind(change.subject_ref.as_str())
-    .bind(change.subject_revision.as_str())
-    .bind(change.source_ref.as_str())
-    .bind(updated_at.naive_utc())
-    .bind(updated_at.naive_utc())
-    .execute(&mut *transaction)
-    .await;
-    if let Err(source) = upsert {
-        let error = WorkRepositoryError::persistence("store current branch subject", source);
-        return Err(rollback_transaction(
-            transaction,
-            "rollback failed branch subject transaction",
-            error,
-        )
-        .await);
-    }
-
     if let Err(error) = super::events_repository::append_event(
         &mut transaction,
         &super::events::NewWorkEvent {
@@ -350,17 +294,21 @@ pub(super) async fn set_branch_subject(
         )
         .await);
     }
-    let updated = load_subject_in_transaction(
-        &mut transaction,
-        &change.work_id,
-        &change.branch_id,
-        &change.owner_id,
-    )
-    .await?;
     transaction.commit().await.map_err(|source| {
         WorkRepositoryError::persistence("commit branch subject transaction", source)
     })?;
-    Ok(updated)
+    Ok(WorkBranchSubject {
+        work_id: change.work_id,
+        branch_id: change.branch_id,
+        subject_record_revision: next_subject_revision,
+        branch_revision: next_branch_revision,
+        graph_revision: change.graph_revision,
+        subject_ref: change.subject_ref,
+        subject_revision: change.subject_revision,
+        source_ref: change.source_ref,
+        created_at,
+        updated_at,
+    })
 }
 
 pub(super) async fn invalidate_branch_subject(
@@ -375,12 +323,10 @@ pub(super) async fn invalidate_branch_subject(
                 CASE WHEN w.archived_at IS NULL AND b.archived_at IS NULL
                           AND b.deletion_operation_id IS NULL
                      THEN 0 ELSE 1 END AS unavailable,
-                s.subject_record_revision
+                b.subject_record_revision
          FROM works w
          JOIN work_branches b
            ON b.owner_id = w.owner_id AND b.work_id = w.work_id AND b.branch_id = ?
-         LEFT JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id AND s.work_id = b.work_id AND s.branch_id = b.branch_id
          WHERE w.owner_id = ? AND w.work_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(invalidation.branch_id.as_str())
@@ -430,7 +376,11 @@ pub(super) async fn invalidate_branch_subject(
     let updated_at = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
         .expect("current timestamp");
     let branch_update = query(
-        "UPDATE work_branches SET branch_revision = ?, updated_at = ?
+        "UPDATE work_branches
+         SET branch_revision = ?, updated_at = ?,
+             subject_record_revision = NULL, subject_branch_revision = NULL, subject_graph_revision = NULL,
+             subject_ref = NULL, subject_revision = NULL, subject_source_ref = NULL,
+             subject_created_at = NULL, subject_updated_at = NULL
          WHERE owner_id = ? AND work_id = ? AND branch_id = ?
            AND branch_revision = ? AND current_graph_revision = ?
            AND archived_at IS NULL AND deletion_operation_id IS NULL",
@@ -451,28 +401,6 @@ pub(super) async fn invalidate_branch_subject(
         return Err(WorkRepositoryError::corrupt(
             "Work branch subject invalidation",
             std::io::Error::other("locked branch failed its subject invalidation CAS"),
-        ));
-    }
-    let deleted = query(
-        "DELETE FROM work_branch_subjects
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ?
-           AND subject_record_revision = ? AND branch_revision = ? AND graph_revision = ?",
-    )
-    .bind(invalidation.owner_id.as_str())
-    .bind(invalidation.work_id.as_str())
-    .bind(invalidation.branch_id.as_str())
-    .bind(subject_record_revision.expect("checked present"))
-    .bind(branch_revision.get())
-    .bind(graph_revision.get())
-    .execute(&mut *transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::persistence("remove invalidated branch subject", source)
-    })?;
-    if deleted.rows_affected() != 1 {
-        return Err(WorkRepositoryError::corrupt(
-            "Work branch subject invalidation",
-            std::io::Error::other("locked subject disappeared before invalidation"),
         ));
     }
     super::events_repository::append_event(

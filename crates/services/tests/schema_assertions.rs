@@ -793,6 +793,13 @@ async fn schema_rationalization_runtime_contract() {
         "harness_snapshots",
         "session_state_item_events",
         "user_skill_evaluations",
+        "model_request_metric_shards",
+        "semantic_read_observations",
+        "semantic_read_observation_budgets",
+        "observation_identity_collisions",
+        "inference_routes",
+        "work_attention_receipts",
+        "session_attachment_quarantines",
         "prompt_chunks",
         "harness_sources",
         "harness_decisions",
@@ -810,61 +817,32 @@ async fn schema_rationalization_runtime_contract() {
         );
     }
 
-    let request_context = column_names(&pool, &schema, "model_request_context_events").await;
-    for expected in [
-        "event_id",
-        "user_id",
-        "attempt_id",
-        "invocation_id",
-        "event_stage",
-        "topology",
-        "provider",
-        "model_family",
-        "purpose",
-        "event_json",
-    ] {
-        assert!(
-            request_context.iter().any(|column| column == expected),
-            "model_request_context_events missing {expected}"
-        );
-    }
+    assert!(
+        !column_names(&pool, &schema, "inference_invocations")
+            .await
+            .iter()
+            .any(|name| name == "route_id"),
+        "route identity is derived from invocation identity"
+    );
+    assert_eq!(
+        column_names(&pool, &schema, "model_request_context_events").await,
+        [
+            "event_id",
+            "user_id",
+            "attempt_id",
+            "invocation_id",
+            "session_id",
+            "run_id",
+            "event_stage",
+            "terminal_status",
+            "event_json",
+            "created_at",
+        ]
+    );
     assert_eq!(
         primary_key_columns(&pool, &schema, "model_request_context_events").await,
         ["user_id", "event_id"],
         "model request context events must remain owner scoped"
-    );
-    let request_metric_totals = column_names(&pool, &schema, "model_request_metric_shards").await;
-    for expected in [
-        "metric_shard",
-        "topology",
-        "provider",
-        "model_family",
-        "purpose",
-        "terminal_status",
-        "requests",
-        "input_tokens",
-        "output_tokens",
-        "cache_read_tokens",
-        "cache_creation_tokens",
-    ] {
-        assert!(
-            request_metric_totals
-                .iter()
-                .any(|column| column == expected),
-            "model_request_metric_shards missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "model_request_metric_shards").await,
-        [
-            "metric_shard",
-            "topology",
-            "provider",
-            "model_family",
-            "purpose",
-            "terminal_status"
-        ],
-        "model request metric totals must remain bounded to explicit low-cardinality dimensions"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "agent_sessions").await,
@@ -923,6 +901,16 @@ async fn schema_rationalization_runtime_contract() {
         ["user_id", "registry_id"],
         "edge registry identity must be owner-bound so registry_id lookups never scan across tenants"
     );
+    assert!(
+        index_columns(
+            &pool,
+            &schema,
+            "edge_agent_registry",
+            "idx_edge_registry_user_heartbeat",
+        )
+        .await
+        .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -949,8 +937,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
             "work_graph_revisions",
             &["owner_id", "work_id", "revision"][..],
         ),
-        ("work_graph_sequences", &["owner_id", "work_id"][..]),
-        ("work_items", &["owner_id", "work_id", "item_id"][..]),
         (
             "work_item_revisions",
             &["owner_id", "work_id", "item_id", "revision"][..],
@@ -1047,12 +1033,31 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         );
     }
     assert!(
-        column_names(&pool, &schema, "work_items")
+        column_names(&pool, &schema, "works")
             .await
             .iter()
-            .any(|column| column == "last_revision"),
-        "WorkItem identities require one global revision allocator across sibling branches"
+            .any(|column| column == "last_graph_revision"),
+        "the Work root allocates revisions across sibling branches"
     );
+    let branch_columns = column_names(&pool, &schema, "work_branches").await;
+    for expected in [
+        "subject_record_revision",
+        "subject_branch_revision",
+        "subject_graph_revision",
+        "subject_ref",
+        "subject_revision",
+        "subject_source_ref",
+        "subject_created_at",
+        "subject_updated_at",
+    ] {
+        assert!(branch_columns.iter().any(|column| column == expected));
+    }
+    for retired in ["work_items", "work_graph_sequences", "work_branch_subjects"] {
+        assert!(
+            column_names(&pool, &schema, retired).await.is_empty(),
+            "fresh schema still contains {retired}"
+        );
+    }
     assert_eq!(
         index_columns(
             &pool,
@@ -1098,8 +1103,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         "work_criterion_revisions",
         "work_criterion_sets",
         "work_graph_revisions",
-        "work_graph_sequences",
-        "work_items",
         "work_item_revisions",
         "work_branches",
         "work_branch_deletion_operations",
@@ -1802,17 +1805,6 @@ async fn phase1_run_durability_schema_contract() {
         "one active handoff slot must be serialized by the complete SessionKey"
     );
     assert_eq!(
-        primary_key_columns(&pool, &schema, "session_attachment_quarantines").await,
-        [
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "quarantine_id"
-        ],
-        "divergent local roots must be quarantined inside the complete SessionKey"
-    );
-    assert_eq!(
         primary_key_columns(&pool, &schema, "session_attachments").await,
         [
             "isolation_domain",
@@ -2210,27 +2202,6 @@ async fn phase2_web_hydration_schema_contract() {
         ],
         "archived invocation replay must resolve one bounded identity-key range"
     );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "semantic_read_observations").await,
-        ["user_id", "session_id", "key_id"],
-        "semantic observations must be owner/session scoped and content addressed"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "semantic_read_observation_budgets").await,
-        ["user_id", "session_id"],
-        "semantic cache aggregate accounting must use its own owner/session lock instead of the session authority row"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "semantic_read_observations",
-            "idx_semantic_read_observations_session_state_access"
-        )
-        .await,
-        ["user_id", "session_id", "state", "last_accessed_at"],
-        "capacity and deterministic LRU operations require one session/state/access index"
-    );
 }
 
 #[tokio::test]
@@ -2301,43 +2272,6 @@ async fn transcript_source_identity_is_collation_unique_and_owner_session_scoped
         .execute(pool.get())
         .await
         .unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn observation_collision_schema_contract() {
-    let pool = common::setup_pool().await;
-    let schema = current_schema(&pool).await;
-    let collisions = column_names(&pool, &schema, "observation_identity_collisions").await;
-    for expected in [
-        "user_id",
-        "identity_kind",
-        "identity_id",
-        "stored_payload_hash",
-        "attempted_payload_hash",
-        "collision_count",
-        "expires_at",
-    ] {
-        assert!(
-            collisions.iter().any(|column| column == expected),
-            "observation_identity_collisions missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "observation_identity_collisions").await,
-        ["user_id", "identity_kind", "identity_id"],
-        "collision receipts must have one bounded row per tenant-scoped identity"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "observation_identity_collisions",
-            "idx_observation_collisions_expiry"
-        )
-        .await,
-        ["expires_at", "user_id", "identity_kind", "identity_id"]
-    );
 }
 
 #[tokio::test]

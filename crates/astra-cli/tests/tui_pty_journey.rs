@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -12,7 +13,6 @@ use std::time::{Duration, Instant};
 use nix::pty::{Winsize, openpty};
 
 const CPR_REQUEST: &[u8] = b"\x1b[6n";
-const CPR_RESPONSE: &[u8] = b"\x1b[1;1R";
 const DA1_REQUEST: &[u8] = b"\x1b[c";
 const DA1_RESPONSE_WITHOUT_SIXEL: &[u8] = b"\x1b[?1;2c";
 // Full-workspace nextest runs contend for CPU and linker I/O even though each
@@ -150,6 +150,18 @@ impl PtyAstra {
         self.writer.flush().expect("flush PTY input");
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let size = Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+        assert_eq!(result, 0, "resize the controlling terminal");
+        self.screen.screen_mut().set_size(rows, cols);
+    }
+
     fn paste_and_submit(&mut self, text: &str) {
         // The journey is injecting a whole message, not simulating a human
         // typing one character at a time. Use the terminal's bracketed-paste
@@ -183,7 +195,7 @@ impl PtyAstra {
             })
             .expect("conversation is selectable in the picker");
         self.write(choice.to_string().as_bytes());
-        let selected_row = format!(" {choice}. {name} ·");
+        let selected_row = format!(" {choice}. {name}");
         self.wait_for_screen(&selected_row, UI_TRANSITION_TIMEOUT, |screen| {
             screen
                 .lines()
@@ -194,10 +206,7 @@ impl PtyAstra {
 
     fn select_conversation_run(&mut self, run_id: &str, ordinal: u8, control: Option<&str>) {
         assert!((1..=9).contains(&ordinal));
-        // The renderer's selected footer exposes 17 run characters plus an
-        // ellipsis. Never match identities in the parent transcript or queue
-        // relative navigation ahead of the rendered selection. Number selection
-        // is idempotent even when the row arrives after the picker opens.
+        // Select by the resolved run identity below the run list.
         let identity = run_id.chars().take(17).collect::<String>();
         let selected = |screen: &str| {
             let lines: Vec<_> = screen.lines().collect();
@@ -210,7 +219,7 @@ impl PtyAstra {
                 if prefix.chars().any(char::is_alphanumeric) {
                     return None;
                 }
-                let (run, _) = detail.split_once(" · parent ")?;
+                let (run, _) = detail.split_once(" · ")?;
                 if run.chars().any(char::is_whitespace) {
                     return None; // The identity-unavailable placeholder is not a selection acknowledgement.
                 }
@@ -333,7 +342,8 @@ impl PtyAstra {
     fn answer_terminal_queries(&mut self) {
         let cpr_requests = count_bytes(&self.output, CPR_REQUEST);
         while self.cpr_replies < cpr_requests {
-            self.write(CPR_RESPONSE);
+            let (row, col) = self.screen.screen().cursor_position();
+            self.write(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
             self.cpr_replies += 1;
         }
         let da1_requests = count_bytes(&self.output, DA1_REQUEST);
@@ -390,6 +400,13 @@ impl PtyAstra {
         self.screen.screen().contents()
     }
 
+    fn record_frame(&self, label: &str) {
+        println!(
+            "ASTRA PTY FRAME {label}\n{}\nASTRA PTY END",
+            self.current_screen().trim_end()
+        );
+    }
+
     fn screen_diagnostic(&self) -> String {
         format!(
             "current screen:\n{}\n\nraw PTY tail:\n{}",
@@ -438,22 +455,19 @@ fn required_live_env(name: &str) -> String {
         .unwrap_or_else(|| panic!("ignored live PTY journey requires {name}"))
 }
 
-fn selected_task_slot(screen: &str) -> Option<String> {
+fn selected_task_slot(screen: &str) -> Option<usize> {
     screen.lines().find_map(|line| {
         let numbered = line.trim_start().strip_prefix('›')?.trim_start();
-        let (ordinal, _) = numbered.split_once('.')?;
-        ordinal.parse::<usize>().ok()?;
-        numbered
-            .split_once("slot ")
-            .map(|(_, slot)| slot.split(" · ").next().unwrap().trim().to_string())
+        let (_, slot) = numbered.split_once(". slot ")?;
+        slot.split_once(':')?.0.parse().ok()
     })
 }
 
-fn select_task_slot(astra: &mut PtyAstra, target: &str, timeout: Duration) {
+fn select_task_slot(astra: &mut PtyAstra, target: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let before = selected_task_slot(&astra.current_screen());
-        if before.as_deref() == Some(target) {
+        if before == Some(target) {
             return;
         }
         astra.write(b"\x1b[B");
@@ -516,13 +530,109 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
     astra.wait_for("Approval · Bash", UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for("Which option should I choose?", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_absent("Working", UI_TRANSITION_TIMEOUT);
+
+    astra.wait_for("Shift+↓ manage", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[200~background navigation draft\x1b[201~");
+    astra.wait_for("│› background navigation draft", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[1;2B"); // Shift+Down opens the background manager.
+    astra.wait_for_screen(
+        "background task workspace",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Background tasks")
+                && screen.contains("Enter details · Esc close")
+                && !screen.contains("background navigation draft")
+                && screen.lines().any(|line| {
+                    line.contains("Task") && line.contains("State") && line.contains("Time")
+                })
+        },
+    );
+    astra.record_frame("Background tasks");
+    astra.write(b"\x1b[1;2B"); // The same shortcut returns to the editor.
+    astra.wait_for("│› background navigation draft", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x15]); // Ctrl+U clears this draft.
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
-    // Release the real shell only after the final answer and wait until the
-    // TUI observes it. The previous implementation started a second run here.
+    astra.paste_and_submit("/tasks");
+    astra.wait_for_screen(
+        "running task in the background list",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Background tasks")
+                && screen
+                    .lines()
+                    .any(|line| line.contains("gated background") && line.contains("running"))
+                && screen.contains("Enter details")
+        },
+    );
+    astra.write(b"\r");
+    astra.wait_for_screen(
+        "controls for the running task",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Esc list")
+                && screen.contains("S stop")
+                && screen.contains("gated background task")
+        },
+    );
+
+    // Release the real process while its detail panel is open.
     std::fs::write(home.path().join("release-background"), "go").unwrap();
-    astra.wait_for("Background shell", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("completed", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "retained task output and terminal state",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Latest output")
+                && screen
+                    .lines()
+                    .any(|line| line.trim() == "background-task-finished")
+                && screen
+                    .lines()
+                    .any(|line| line.contains("Esc list") && !line.contains("S stop"))
+        },
+    );
+    astra.record_frame("Background task output");
+    astra.write(b"v");
+    astra.wait_for_screen("private shell streams", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Shell output")
+            && screen.contains("private")
+            && screen.contains("stdout")
+            && screen.contains("Esc back · R refresh")
+    });
+    astra.record_frame("Private shell streams");
+    astra.write(b"\x1b");
+    astra.wait_for_screen(
+        "return from shell streams to task details",
+        UI_TRANSITION_TIMEOUT,
+        |screen| screen.contains("Latest output") && screen.contains("Esc list"),
+    );
+    astra.write(b"\x1b");
+    astra.wait_for_screen(
+        "completed task remains selectable",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Background tasks")
+                && screen
+                    .lines()
+                    .any(|line| line.contains("gated background") && line.contains("completed"))
+        },
+    );
+    astra.write(b"\x1b");
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[200~strt tsk\x1b[201~");
+    astra.wait_for_screen("fuzzy prompt history", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("› Start the task and ask me what to do next.")
+            && screen.contains("History · ↑↓ select · Tab insert")
+    });
+    astra.record_frame("Fuzzy history");
+    astra.write(b"\t");
+    astra.wait_for(
+        "│› Start the task and ask me what to do next.",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         astra.receive(Duration::from_millis(50));
@@ -548,6 +658,45 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
         "the next user turn lost the background update: {}",
         requests[1]
     );
+
+    // Both submitted messages match "the". Look only below the composer so
+    // previous messages in scrollback cannot be mistaken for candidates.
+    let candidate = |screen: &str| {
+        let rows = screen.lines().skip_while(|row| !row.contains("│› the"));
+        rows.skip(1)
+            .take_while(|row| !row.contains("History ·"))
+            .find_map(|row| row.strip_prefix("› ").map(str::to_owned))
+    };
+    for byte in b"the" {
+        astra.write(&[*byte]);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    astra.wait_for_screen("two history choices", UI_TRANSITION_TIMEOUT, |screen| {
+        candidate(screen).is_some() && screen.contains("History · ↑↓ select · Tab insert")
+    });
+    let initial = candidate(&astra.current_screen()).unwrap();
+    astra.write(b"\x1b[A");
+    astra.wait_for_screen(
+        "Up selects the other history entry",
+        UI_TRANSITION_TIMEOUT,
+        |screen| candidate(screen).is_some_and(|selected| selected != initial),
+    );
+    let other = candidate(&astra.current_screen()).unwrap();
+    astra.record_frame("History selection after Up");
+    astra.write(b"\x1b[B");
+    astra.wait_for_screen(
+        "Down restores the first history entry",
+        UI_TRANSITION_TIMEOUT,
+        |screen| candidate(screen).is_some_and(|selected| selected == initial),
+    );
+    astra.write(b"\x1b[A");
+    astra.wait_for_screen("selection before Tab", UI_TRANSITION_TIMEOUT, |screen| {
+        candidate(screen).is_some_and(|selected| selected == other)
+    });
+    astra.write(b"\t");
+    astra.wait_for(&format!("│› {other}"), UI_TRANSITION_TIMEOUT);
+    assert_eq!(mock.received_requests().len(), 2, "Tab must not submit");
+
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
@@ -692,7 +841,7 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         UI_TRANSITION_TIMEOUT,
         |screen| {
             screen.contains("› first instruction")
-                && !screen.contains("received · first instruction")
+                && !screen.contains("Guidance received · current run")
         },
     );
     release_first.notify_one();
@@ -717,7 +866,7 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         )
     );
     astra.wait_for_screen("second POST accepted", UI_TRANSITION_TIMEOUT, |screen| {
-        screen.contains("received · second instruction")
+        screen.contains("Guidance received · current run") && screen.contains("second instruction")
     });
     let (intent_id, content, event_index) = received.lock().unwrap()[1].clone();
     mock.send_held_stream_event(serde_json::json!({
@@ -731,8 +880,7 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
         |screen| {
             screen.contains("› first instruction")
                 && screen.contains("› second instruction")
-                && !screen.contains("received · first instruction")
-                && !screen.contains("received · second instruction")
+                && !screen.contains("Guidance received · current run")
         },
     );
     assert_eq!(
@@ -880,7 +1028,24 @@ async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
     astra.write(b"\x1b[200~task B\x1b[201~\x11");
     astra.wait_for("task B", UI_TRANSITION_TIMEOUT);
     astra.write(b"\x1b[200~task C\x1b[201~\x11");
-    astra.wait_for("task C", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "queued inputs and edge-aligned composer",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Message queued · next turn")
+                && screen
+                    .lines()
+                    .any(|line| line.starts_with('▏') && line.trim_end().ends_with("task B"))
+                && screen
+                    .lines()
+                    .any(|line| line.starts_with('▏') && line.trim_end().ends_with("task C"))
+                && screen
+                    .lines()
+                    .any(|line| line.starts_with('╭') && line.ends_with('╮'))
+                && screen.contains("Enter guide · Ctrl+Q queue")
+        },
+    );
+    astra.record_frame("Queue and live composer");
     assert_eq!(
         lookups.load(Ordering::SeqCst),
         0,
@@ -2126,7 +2291,7 @@ async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"keep_this_turn_active_until_shutdown\r");
+    astra.paste_and_submit("keep_this_turn_active_until_shutdown");
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
     astra.signal(nix::sys::signal::Signal::SIGHUP);
@@ -2202,24 +2367,228 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
 
-    // A single token stays contiguous in the terminal byte stream even when
-    // ratatui positions separately styled words with cursor movement codes.
-    let draft = "draft_survives_transcript_round_trip";
-    astra.write(draft.as_bytes());
-    astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/help");
+    astra.wait_for_screen("command browser actions", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Featured") && screen.contains("Enter insert · Esc close")
+    });
+    astra.record_frame("Command browser");
+    astra.write(b"/");
+    astra.wait_for("│› /", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Tab insert", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    astra.write(b"\x1b[200~/session hstr\x1b[201~");
+    astra.wait_for_screen(
+        "fuzzy subcommand and keyboard actions",
+        UI_TRANSITION_TIMEOUT,
+        |screen| screen.contains("/session history") && screen.contains("Tab insert"),
+    );
+    astra.record_frame("Fuzzy subcommands");
+    astra.write(b"\t");
+    astra.wait_for("│› /session history", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x15]); // Ctrl+U clears the completed command without running it.
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    astra.resize(24, 42);
+    let draft = "检查 patch.rs";
+    astra.write(format!("\x1b[200~{draft}\x1b[201~").as_bytes());
+    astra.wait_for_screen(
+        "42-column composer with CJK",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.lines().any(|line| {
+                line.starts_with('╭') && line.ends_with('╮') && line.chars().count() == 42
+            }) && screen.contains(draft)
+        },
+    );
+    astra.record_frame("42-column composer");
+    astra.resize(30, 100);
+    astra.wait_for_screen("restored wide composer", UI_TRANSITION_TIMEOUT, |screen| {
+        screen
+            .lines()
+            .any(|line| line.starts_with('╭') && line.ends_with('╮') && line.chars().count() == 100)
+            && screen.contains(draft)
+    });
 
     astra.write(&[0x0f]); // Ctrl+O
     astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
     astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("filter:", Duration::from_secs(2));
+    astra.wait_for("Enter details · / search", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Transcript");
 
     astra.write(&[0x0f]); // Ctrl+O
     astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x15]); // Ctrl+U clears the restored draft.
-    astra.write(b"/exit\r");
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/context");
+    astra.wait_for_screen("Context inspector", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Context · partial evidence") && screen.contains("Tab focus")
+    });
+    astra.record_frame("Context inspector");
+    astra.write(b"\x1b");
+    astra.wait_for_screen("chat restored after context", UI_TRANSITION_TIMEOUT, |screen| {
+        let note = screen.lines().position(|line| line.contains("Opened context panel"));
+        let prompt = screen.lines().position(|line| line.contains("Message Astra"));
+        matches!((note, prompt), (Some(note), Some(prompt)) if prompt > note && prompt - note <= 4)
+    });
+    astra.record_frame("Chat after closing context inspector");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_save_updates_composer_tips_in_the_current_terminal() {
+    let _journey = pty_journey_lock().lock().await;
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), "http://127.0.0.1:9");
+    astra.wait_for("· Tip", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/config");
+    astra.wait_for("Settings · type to filter", UI_TRANSITION_TIMEOUT);
+    astra.write(b"tips");
+    astra.wait_for("› Show terminal tips", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("› On", UI_TRANSITION_TIMEOUT);
+    astra.write(b" ");
+    astra.wait_for("› Off", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("› Show terminal tips", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+    astra.wait_for("Save changes?", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Settings save");
+    astra.write(b"\r");
+    astra.wait_for("Saved config to", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "composer with tips disabled",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains("Message Astra") && !line.contains("· Tip"))
+        },
+    );
+    let config = std::fs::read_to_string(home.path().join(".astra/config/runtime.toml")).unwrap();
+    assert!(config.contains("show_tips = false"));
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settled_explain_report_expands_evidence_and_prepares_a_follow_up() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock =
+        astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response(axum::Router::new())
+            .await
+            .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/explain on");
+    astra.wait_for("Explain on · report after each turn", UI_TRANSITION_TIMEOUT);
+    let question = "记录本次执行的证据。";
+    astra.paste_and_submit(question);
+    astra.wait_for_screen(
+        "question, sending state, and composer share the first frame",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains(question)
+                && screen.contains("Sending")
+                && screen.contains("Message Astra")
+        },
+    );
+    astra.record_frame("First frame after submit");
+    assert!(!astra.current_screen().contains("Explain Analyze"));
+
+    mock.release_held_response();
+    astra.wait_for(
+        "Explain Analyze · Completed · 1.2s wall",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.wait_for("Explain Analyze HTML report ready", UI_TRANSITION_TIMEOUT);
+    let settled = astra.current_screen();
+    let lines = settled.lines().collect::<Vec<_>>();
+    let submitted = lines
+        .iter()
+        .position(|line| line.contains(question))
+        .expect("visible user question");
+    let reply = lines
+        .iter()
+        .enumerate()
+        .skip(submitted + 1)
+        .find_map(|(index, line)| line.trim_start().starts_with("Astra").then_some(index))
+        .expect("visible assistant reply");
+    let user_heading = lines[..submitted].last().expect("visible user heading");
+    let reply_heading = lines[reply];
+    assert_eq!(
+        user_heading.find("You"),
+        reply_heading.find("Astra"),
+        "{settled}"
+    );
+    for (line, speaker) in [(*user_heading, "You  "), (reply_heading, "Astra  ")] {
+        let time = line
+            .trim_start()
+            .strip_prefix(speaker)
+            .expect("speaker heading and timestamp");
+        chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").expect("readable local time");
+    }
+    astra.record_frame("Settled exchange with both timestamps");
+    let mut blank = 0;
+    for line in &lines[submitted + 1..reply] {
+        if line.trim().is_empty() {
+            blank += 1;
+            assert!(
+                blank <= 1,
+                "extra vertical space in a short question and answer:\n{settled}"
+            );
+        } else {
+            blank = 0;
+        }
+    }
+    astra.paste_and_submit("/explain report");
+    astra.wait_for_screen("settled report", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Explain · mock-run-1")
+            && screen.contains("Provider answer")
+            && screen.contains("Enter evidence")
+    });
+    astra.write(b"\r");
+    astra.wait_for(
+        "provider reported · in 120 · out 8 tokens",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.record_frame("Explain evidence");
+    astra.write(b"a");
+    astra.wait_for(
+        "About the Explain report for run mock-run-1 and turn mock-run-1-turn",
+        UI_TRANSITION_TIMEOUT,
+    );
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "asking starts with an editable draft"
+    );
+    astra.paste_and_submit("Which call took the longest?");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    loop {
+        let requests = mock.received_requests();
+        if let Some(request) = requests.get(1) {
+            let message = request["message"].as_str().expect("follow-up message");
+            assert!(message.contains("mock-run-1 and turn mock-run-1-turn"));
+            assert!(message.contains("Which call took the longest?"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follow-up did not reach the server"
+        );
+        astra.receive(Duration::from_millis(50));
+    }
+    mock.release_held_response();
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2234,15 +2603,14 @@ async fn exit_after_a_completed_turn_prints_a_copyable_resume_command() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Message", Duration::from_secs(15));
-    astra.write(b"create_a_resumable_session\r");
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit("create_a_resumable_session");
     astra.wait_for("successfully.", Duration::from_secs(10));
     // The completion text can be painted before the input surface has
     // returned to its idle state. Synchronize on the actual prompt before
     // injecting /exit so a loaded workspace cannot race the command parser.
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-    astra.write(b"/exit\r");
-    astra.wait_for("Stopping", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/exit");
 
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -2254,28 +2622,28 @@ async fn exit_after_a_completed_turn_prints_a_copyable_resume_command() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::Slow,
-    )
-    .await
-    .expect("start scripted slow LLM server");
+    let mock =
+        astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response(axum::Router::new())
+            .await
+            .expect("start scripted slow LLM server");
     let home = tempfile::tempdir().expect("temporary isolated Astra home");
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"complete_this_live_transcript_journey\r");
+    astra.paste_and_submit("complete_this_live_transcript_journey");
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]); // Ctrl+O while the HTTP turn is still pending.
     astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
     astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
     astra.wait_for("successfully.", Duration::from_secs(10));
 
     astra.write(&[0x0f]);
     astra.wait_for_absent("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Message Astra", Duration::from_secs(10));
-    astra.write(b"/exit\r");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
@@ -2302,9 +2670,9 @@ async fn exit_during_unbound_turn_reconciles_the_exact_run() {
         tokio::task::yield_now().await;
     }
     astra.write(&[0x0f]);
-    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x0f]);
-    astra.wait_for_absent("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit("/exit");
     astra.wait_for_screen("exit or stopping", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("Stopping") || screen.contains("Exiting")
@@ -2327,24 +2695,24 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"/allow prompt\r");
+    astra.paste_and_submit("/allow prompt");
     astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
-    astra.write(b"exercise_tool_history_in_transcript\r");
+    astra.paste_and_submit("exercise_tool_history_in_transcript");
     // The Server stream continues only after the real host has accepted and
     // executed its tool request and posted the exact callback.
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
+    astra.record_frame("Tool approval");
     astra.write(b"\r");
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
     assert_committed_mock_write(&mock, home.path());
 
     astra.write(&[0x0f]); // Ctrl+O after the compact view observed the tool.
-    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Edited mock-output-astra-cli.txt", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
-    astra.write(b"/exit\r");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
@@ -2362,15 +2730,24 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"/allow prompt\r");
-    astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
-    astra.write(b"request_a_write_and_wait_for_my_approval\r");
+    astra.paste_and_submit("request_a_write_and_wait_for_my_approval");
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
 
     astra.write(&[0x0f]); // Ctrl+O while approval owns the bottom pane.
-    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("write_file", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "transcript with approval suspended",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            (screen.contains("Main conversation · Transcript")
+                || screen.contains("Transcript · Root"))
+                && screen.contains("Enter details · / search")
+                && !screen.contains("Approval · Write File")
+        },
+    );
+    assert!(
+        mock.tool_results().is_empty(),
+        "viewing transcript must not act on the tool"
+    );
 
     astra.write(&[0x0f]);
     astra.wait_for("Approval · Write File", UI_TRANSITION_TIMEOUT);
@@ -2379,7 +2756,7 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     assert_committed_mock_write(&mock, home.path());
     astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
 
-    astra.write(b"/exit\r");
+    astra.paste_and_submit("/exit");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
 }
@@ -3381,15 +3758,15 @@ async fn live_child_pause_guidance_resume_preserves_execution_identity() {
         assert!(Instant::now() < deadline, "member did not pause");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));
-    astra.wait_for("P pause/resume/continue", UI_TRANSITION_TIMEOUT);
+    astra.select_conversation_run(child_id, 2, Some("P resume"));
+    astra.wait_for("P resume", UI_TRANSITION_TIMEOUT);
     let value = format!("release-{}", uuid::Uuid::new_v4().simple());
     let guidance = "正式版刚更新了，请重新读取 final.txt；最终把发布代码转成大写，只输出代码。";
     astra.write(b"g");
     astra.wait_for("What would you like this agent", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit(guidance);
     astra.write(&[0x07]);
-    astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));
+    astra.select_conversation_run(child_id, 2, Some("P resume"));
     astra.write(b"\r");
     astra.wait_for_screen(
         "initial member history loaded",
@@ -3412,7 +3789,7 @@ async fn live_child_pause_guidance_resume_preserves_execution_identity() {
     )
     .unwrap();
     astra.write(&[0x07]);
-    astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));
+    astra.select_conversation_run(child_id, 2, Some("P resume"));
     astra.write(b"p");
     astra.write(b"\x1b");
     // Stay on this member page: no refresh or reopening may substitute for live delivery.
@@ -3558,21 +3935,166 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
                 })
         },
     );
+    for (i, ch) in b"delgt".iter().copied().enumerate() {
+        astra.write(&[ch]);
+        let query = &"delgt"[..=i];
+        astra.wait_for_screen(
+            "prompt history while working",
+            UI_TRANSITION_TIMEOUT,
+            |screen| {
+                screen.contains(&format!("│› {query}"))
+                    && screen.contains("History · ↑↓ select · Tab insert")
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    astra.write(b"\x1b[D\x7f"); // Move inside the query and erase the g.
+    astra.wait_for_screen(
+        "history list with an interior cursor",
+        UI_TRANSITION_TIMEOUT,
+        |screen| screen.contains("│› delt") && screen.contains("History · ↑↓ select · Tab insert"),
+    );
+    astra.record_frame("Live history search");
+
+    astra.resize(5, 40);
+    astra.wait_for_screen(
+        "history yields to the live turn at five rows",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("› delt")
+                && screen.contains("Working")
+                && !screen.contains("› delegate_one_child")
+        },
+    );
+    astra.record_frame("Five-row live history frame");
+    astra.write(b"\t");
+    astra.write(b"e"); // A hidden Tab must leave the cursor inside the draft.
+    astra.wait_for("› delet", UI_TRANSITION_TIMEOUT);
+    // Keep the next Tab separate from the last character. A Tab arriving
+    // within the raw paste-detection interval is literal input.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    astra.resize(30, 100);
+    astra.wait_for_screen(
+        "history returns after growing the terminal",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("│› delet")
+                && screen.contains("› delegate_one_child_and_keep_it_observable")
+                && screen.contains("History · ↑↓ select · Tab insert")
+        },
+    );
+    astra.record_frame("Restored live history frame");
+    astra.write(b"\t");
+    astra.wait_for(
+        "│› delegate_one_child_and_keep_it_observable",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    astra.write(b"\x1b[200~keep this draft\x1b[201~");
+    astra.wait_for("│› keep this draft", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x12]); // Ctrl+R keeps the explicit reverse search.
+    astra.wait_for("(reverse-i-search)", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[200~deleg\x1b[201~");
+    astra.wait_for_screen(
+        "explicit reverse search result",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.lines().any(|line| {
+                line.contains("reverse-i-search") && line.contains("delegate_one_child")
+            })
+        },
+    );
+    astra.write(b"\x1b");
+    astra.wait_for("│› keep this draft", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x15]);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
     astra.write(&[0x07]);
-    astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen("run navigator", UI_TRANSITION_TIMEOUT, |screen| {
+        (screen.contains("Agent runs") || screen.contains("Conversations"))
+            && screen.contains("Last activity")
+            && screen
+                .lines()
+                .any(|line| line.contains("Run") && line.contains("State") && line.contains("Time"))
+    });
     astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.record_frame("Run navigator");
     astra.select_conversation_run("mock-run-agent-child", 1, None);
     astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.wait_for_screen("selected child activity", UI_TRANSITION_TIMEOUT, |screen| {
         screen.contains("child_evidence_visible")
+            && screen.contains("Transcript · Mock child review")
             && screen.lines().any(|line| {
-                line.contains("Mock child review")
-                    && ["working", "starting", "waiting"]
-                        .iter()
-                        .any(|state| line.contains(state))
+                let line = line.trim_start();
+                ["working", "starting", "waiting"]
+                    .iter()
+                    .any(|state| line.starts_with(state))
             })
     });
+    astra.record_frame("Live run transcript");
+    astra.write(b"/");
+    astra.write(b"\x1b[200~child_evidence_visible\x1b[201~");
+    astra.wait_for("Search: /child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for_screen(
+        "aligned transcript search result",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.starts_with("  child_evidence_visible"))
+                && screen.lines().any(|line| {
+                    line.starts_with("  Match ") && line.ends_with("/child_evidence_visible")
+                })
+        },
+    );
+    astra.record_frame("Transcript search result");
+    astra.write(b"\x1b");
+    astra.wait_for_screen("return to selected run", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Last activity")
+            && screen.lines().any(|line| {
+                line.trim_start().starts_with('›') && line.contains("Mock child review")
+            })
+    });
+    astra.write(b"\r");
+    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x0f]); // Open the root transcript as a retained tab.
+    astra.wait_for_screen("aligned root transcript", UI_TRANSITION_TIMEOUT, |screen| {
+        screen
+            .lines()
+            .any(|line| line.starts_with("  Transcript · Root · mock-session"))
+            && screen
+                .lines()
+                .any(|line| line.starts_with("  Parent acknowledged"))
+    });
+    let recorded_root_time = chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S");
+    let recorded_root_heading = format!("  Astra  {recorded_root_time}");
+    astra.wait_for_screen(
+        "root transcript uses the persisted clock",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.trim_end() == recorded_root_heading)
+        },
+    );
+    astra.record_frame("Aligned live root transcript");
+    astra.write(b"\x1b[1;2C"); // Shift+Right follows the retained tab order.
+    astra.wait_for_screen(
+        "switch back to the same child run",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Transcript · Mock child review")
+                && screen.contains("child_evidence_visible")
+        },
+    );
     mock.release_held_response();
     astra.wait_for_screen(
         "child completion in the open conversation",
@@ -3581,17 +4103,29 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
             screen.contains("child_evidence_visible")
                 && screen
                     .lines()
-                    .any(|line| line.contains("done") && line.contains("Mock child review"))
+                    .any(|line| line.trim_start().starts_with("done"))
         },
     );
-    astra.write(&[0x0f]);
+    astra.record_frame("Completed run transcript");
+    astra.write(b"\x1b[1;2D"); // Shift+Left returns to the retained root tab.
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "root clock remains stable after completion",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.trim_end() == recorded_root_heading)
+        },
+    );
+    astra.record_frame("Returned to root transcript");
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");
         astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
         astra.write(&[0x0f]);
-        astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
+        astra.wait_for("Transcript · Root · mock-session", UI_TRANSITION_TIMEOUT);
     }
     assert_eq!(
         mock.received_requests().len(),
@@ -3599,6 +4133,8 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
         "Server owns child execution"
     );
     assert!(mock.tool_results().is_empty());
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3613,16 +4149,15 @@ async fn fanout_partial_refresh_preserves_slot_selection() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"launch_three_reviews_as_one_group\r");
+    astra.paste_and_submit("launch_three_reviews_as_one_group");
     astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     for slot in 1..=3 {
         astra.wait_for(&format!("Mock review {slot}"), UI_TRANSITION_TIMEOUT);
     }
-    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
-    let selected = selected_task_slot(&astra.current_screen()).unwrap();
-    astra.wait_for("stop available (X)", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 2, UI_TRANSITION_TIMEOUT);
+    astra.wait_for("X stop", UI_TRANSITION_TIMEOUT);
     mock.publish_partial_fanout_results();
     let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
     while !astra.current_screen().contains("2 done") {
@@ -3636,10 +4171,7 @@ async fn fanout_partial_refresh_preserves_slot_selection() {
             astra.receive(next_key.saturating_duration_since(Instant::now()));
         }
     }
-    assert_eq!(
-        selected_task_slot(&astra.current_screen()).as_ref(),
-        Some(&selected)
-    );
+    assert_eq!(selected_task_slot(&astra.current_screen()), Some(2));
     let screen = astra.current_screen();
     for slot in 1..=3 {
         assert_eq!(
@@ -3673,12 +4205,12 @@ async fn failed_fanout_slot_cause_is_visible_in_its_transcript() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"review_with_one_failed_slot\r");
+    astra.paste_and_submit("review_with_one_failed_slot");
     astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Mock review 2", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 2, UI_TRANSITION_TIMEOUT);
     mock.publish_partial_fanout_results();
     astra.write(b"r");
     astra.wait_for("1 failed", UI_TRANSITION_TIMEOUT);
@@ -3707,19 +4239,19 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     seed_account(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
     astra.wait_for("Message Astra", Duration::from_secs(15));
-    astra.write(b"inspect_and_cancel_one_child\r");
+    astra.paste_and_submit("inspect_and_cancel_one_child");
     astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Mock review 1", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 1, UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "3: Mock review 3", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 3, UI_TRANSITION_TIMEOUT);
     astra.write(b"r");
-    astra.wait_for("stop available", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("X stop", UI_TRANSITION_TIMEOUT);
     astra.write(b"x");
     let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
     while mock.cancellation_requests().is_empty() {
@@ -3740,8 +4272,8 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.write(b"h");
-    astra.wait_for("Mock review 1", UI_TRANSITION_TIMEOUT);
-    select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("H active only", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, 1, UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
     assert_eq!(mock.received_requests().len(), 1);
@@ -3751,11 +4283,10 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
-        astra_cli::cli::mock_llm::MockScenario::Slow,
-    )
-    .await
-    .unwrap();
+    let mock =
+        astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response(axum::Router::new())
+            .await
+            .unwrap();
     let home = tempfile::tempdir().unwrap();
     seed_trusted_workspace(home.path());
     seed_account(home.path());
@@ -3817,7 +4348,12 @@ async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
         } else {
             assert!(context.contains("first objective"), "{context}");
         }
-        astra.wait_for(&format!("turn {}", index + 1), UI_TRANSITION_TIMEOUT);
+        mock.release_held_response();
+        let completed_turn = format!("turn {}", index + 1);
+        // A streamed reply can appear while the composer still routes input as guidance.
+        astra.wait_for_screen("plan turn settled", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains(&completed_turn) && screen.contains("Ctrl+T tasks · / commands")
+        });
     }
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());

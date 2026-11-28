@@ -56,7 +56,7 @@ async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap = { version = "4.5.38", features = ["derive"] }
-crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
+crossterm = { path = "../../vendor/crossterm", version = "=0.29.1", features = ["bracketed-paste", "event-stream"] }
 derive_more = { version = "1", features = ["is_variant"] }
 dirs = "6.0.0"
 dotenvy.workspace = true

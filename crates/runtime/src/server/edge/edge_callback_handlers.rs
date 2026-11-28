@@ -513,7 +513,7 @@ pub(crate) async fn post_tool_result_handler(
         Err(e) => {
             tracing::warn!(
                 target: "astra_runtime::edge_callback",
-                trace_request_id = %trace.request_id,
+                trace_request_id = %trace.log_id(),
                 user_id = %user.user_id,
                 request_id = %body.request_id,
                 edge_agent_id = %edge_agent_id,
@@ -644,7 +644,7 @@ pub(crate) async fn post_tool_result_handler(
 
     tracing::info!(
         target: "astra_runtime::edge_callback",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         user_id = %user.user_id,
         edge_id = %safe_edge_id,
         callback_request_id = %body.request_id,
@@ -1088,7 +1088,7 @@ async fn post_approval_respond_inner(
         );
         tracing::info!(
             target: "astra_runtime::edge_callback",
-            request_id = %trace.request_id,
+            request_id = %trace.log_id(),
             user_id = %user.user_id,
             edge_id = %safe_edge_id,
             callback_request_id = %body.request_id,
@@ -1246,7 +1246,7 @@ async fn post_approval_respond_inner(
     }
     tracing::info!(
         target: "astra_runtime::edge_callback",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         user_id = %user.user_id,
         edge_id = %edge_id,
         callback_request_id = %body.request_id,
@@ -1467,7 +1467,7 @@ pub(crate) async fn post_user_prompt_respond_handler(
 
     tracing::info!(
         target: "astra_runtime::edge_callback",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         user_id = %user.user_id,
         edge_id = %edge_id,
         callback_request_id = %request_id,
@@ -1878,7 +1878,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
 
     tracing::info!(
         target: "astra_runtime::edge_callback",
-        request_id = %trace.request_id,
+        request_id = %trace.log_id(),
         user_id = %user.user_id,
         callback_request_id = %request_id,
         kind = "provider_interaction_respond",

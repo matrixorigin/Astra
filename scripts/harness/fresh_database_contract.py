@@ -43,7 +43,7 @@ TEST_FIXTURE_TABLES = (
     "agent_sessions",
     "harness_runs",
     "session_transcript_items",
-    "work_items",
+    "work_item_revisions",
     "works",
 )
 BOOT_METADATA_TABLES = frozenset(

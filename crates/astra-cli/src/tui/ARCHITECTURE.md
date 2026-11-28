@@ -80,7 +80,7 @@ read paths:
 |------|-------------|--------------|
 | **Context rail** | Request input occupancy encoded by line length and semantic colour, with one compact absolute readout. | Above the composer once usage is known |
 | **Composer** | Two-row-minimum editing surface with `› ` prefix and an aligned continuation guide. Emacs keybindings, expands for multi-line input without changing the submitted text. | Always (unless an overlay is active) |
-| **Status** | Model and the current permission mode on the left; a pending next-round mode appears as `next: …`; workspace identity stays on the right. Key tutorials stay hidden. | When no popup/overlay is active |
+| **Status** | Model and the current permission mode on the left; a pending mode appears as `requested: …`. Short forms preserve the active mode, model effort and Git branch when space is limited. | When no popup/overlay is active |
 | **Slash Popup** | Full list of TUI-native commands under the composer; featured commands sort first, and typing filters the list. | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
 | **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |
@@ -91,15 +91,31 @@ activity; stopping does not reset it. Completed provider requests update
 the reported run input and output subtotals from runtime feedback. The
 footer continues to show per-request usage and context occupancy. On short terminals the
 composer and approval take priority, followed by the turn indicator and the
-latest live output. Optional task and agent details use remaining space.
-Primary workspaces keep their own canvas. Glyph profiles provide ASCII
+latest live output. Optional task and agent details use remaining space. A Tip can share the
+empty composer’s input row. Tips rotate
+using the existing draw tick and switch between idle and active-run shortcuts.
+They yield to typing, approval, queued messages, and small terminals.
+Primary workspaces use the alternate screen while the normal screen keeps
+conversation scrollback. The composer is redrawn from its draft when the
+workspace closes. The alternate screen resizes from dimensions alone. After
+a lost normal-screen cursor reply, the inline frame appends fresh rows after
+the physical bottom. The old frame may remain above the live composer.
+On exit, pending chat rows are appended in order. Glyph profiles provide ASCII
 fallbacks, and font selection remains under the terminal's control.
+The first visible assistant text uses the start time of its physical model
+item. The runtime assigns that clock when it opens an attempt before dispatch.
+Live text events, durable transcript payloads and local journals carry the
+same model item identity.
 Inside a delegated conversation the activity line reads that exact run's
 existing status and elapsed evidence, instead of attributing the global agent
 summary to the selected child. Unknown and stale status remain qualified;
 completed durations do not continue ticking. Pending tabs retain their place
 when a run identity arrives, and paging uses the actual area left after
 workspace chrome and approval notices.
+
+The `You` and `Astra` headings show local clock times when available.
+A streamed reply keeps its model item time when it settles or is replayed.
+Older items use the available receipt or record timestamp.
 
 Tool result previews preserve output whitespace and expand tabs only for
 display; the transcript's full text export keeps the original logical lines.

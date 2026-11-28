@@ -323,11 +323,6 @@ async fn observed_deliveries_distinguish_insertion_replay_collision_and_session_
         IngestionDeliveryTerminal::Rejected(IngestionRejectionReason::IdentityCollision)
     );
     assert_session_event_count(&pool, &user_id, &session_id, 2).await;
-    let receipts: u64 = sqlx::query_scalar(
-        "SELECT collision_count FROM observation_identity_collisions WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = 'same-event'",
-    ).bind(&user_id).fetch_one(&pool).await.expect("receipt committed before terminal report");
-    assert_eq!(receipts, 2);
-
     sqlx::query(
         "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
     )
@@ -470,14 +465,6 @@ async fn wait_for_event(
 }
 
 async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str) {
-    let _ = sqlx::query(
-        "DELETE FROM observation_identity_collisions \
-         WHERE user_id = ? AND session_id = ? AND identity_kind = 'agent_event'",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .execute(pool)
-    .await;
     let _ = sqlx::query("DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?")
         .bind(user_id)
         .bind(session_id)
@@ -2078,18 +2065,6 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     .expect("load unique edge");
     assert_eq!(unique_parent.as_deref(), Some(unique_parent_id.as_str()));
     assert_session_event_count(&pool, TEST_USER_ID, &session_id, 2).await;
-
-    let receipt = sqlx::query(
-        "SELECT collision_count, source FROM observation_identity_collisions \
-         WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = ?",
-    )
-    .bind(TEST_USER_ID)
-    .bind(&duplicate_event_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load collision receipt");
-    assert_eq!(receipt.get::<u64, _>("collision_count"), 1);
-    assert_eq!(receipt.get::<String, _>("source"), "event_ingestion");
 
     let stats = stats.lock().expect("stats lock").clone();
     assert_eq!(stats.events_flushed, 2);

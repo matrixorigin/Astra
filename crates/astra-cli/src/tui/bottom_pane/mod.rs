@@ -51,7 +51,7 @@ use footer::Footer;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Widget,
 };
@@ -71,7 +71,7 @@ use crate::cli::chat_stream::ApprovalResponse;
 use ask_user_view::AskUserView;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 const MAX_PENDING_INTENTS: usize = 64;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
@@ -172,6 +172,8 @@ pub(crate) struct BottomPane {
     /// only after the current turn settles, so current tools and the footer
     /// cannot disagree about which policy actually governed execution.
     staged_permission_mode: Option<crate::cli::permission_manager::PermissionMode>,
+    /// A local presentation clock. No tip is written to the transcript.
+    tip_rotation: Option<(std::time::Instant, u64)>,
 }
 
 /// Presentation-only entry in the conversation workspace tab strip. The
@@ -472,27 +474,16 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             astra_turn_types::UserIntentStatus::Returned,
         ) => format!("Message returned from {}", target.agent_name()),
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::AcceptedLocal) => {
-            "Waiting for the current task to receive your message".to_string()
+            "Guidance pending · current run".to_string()
         }
         (
             PendingUserIntentTarget::ActiveRun,
             astra_turn_types::UserIntentStatus::AcceptedRemote,
         ) => match task_status {
-            TaskStatus::ToolExecuting { .. } => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
-            TaskStatus::WaitingApproval { .. } => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
-            TaskStatus::WaitingModel => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
             TaskStatus::Cancelling => "Stopping · checking message delivery".to_string(),
-            TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
+            TaskStatus::Exiting => "Exiting · checking message delivery".to_string(),
             TaskStatus::Idle => "Checking whether your message was used".to_string(),
-            TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
-                "Message received · waiting to take effect · Ctrl+C to stop".to_string()
-            }
+            _ => "Guidance received · current run".to_string(),
         },
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Applied) => {
             "Message added to the conversation".to_string()
@@ -532,6 +523,7 @@ impl BottomPane {
             pending_model_setup_read: None,
             interrupt_pending: false,
             staged_permission_mode: None,
+            tip_rotation: None,
         }
     }
 
@@ -2266,16 +2258,15 @@ impl BottomPane {
             .is_some_and(|view| view.owns_primary_canvas())
     }
 
-    /// A focused root or delegated transcript owns the primary terminal
-    /// canvas. This is a conversation switch, not a taller detail pane.
+    /// Fit a focused transcript or report to its actual content area.
     pub(crate) fn prepare_conversation_workspace(&mut self, terminal_height: u16, width: u16) {
         let has_approvals = self.has_pending_approvals();
         if let Some(view) = self.active_view_mut()
-            && view.conversation_tab_id().is_some()
+            && view.is_transcript_view()
         {
             let (approval, hint, status) = visible_view_footers(
                 terminal_height,
-                true,
+                view.conversation_tab_id().is_some(),
                 has_approvals,
                 view.hint_keys().is_some(),
                 view.reserve_status_footer(),
@@ -2567,7 +2558,7 @@ impl BottomPane {
         self.view_stack.get_mut(index)
     }
 
-    fn popup_height(&self) -> u16 {
+    fn command_popup_height(&self) -> u16 {
         if let Some(m) = &self.slash_menu {
             return slash_popup_render::desired_composer_height(m);
         }
@@ -2578,6 +2569,38 @@ impl BottomPane {
             return p.height();
         }
         0
+    }
+
+    pub(super) fn has_composer_hints(&self, width: u16) -> bool {
+        width >= 34
+            && !self.has_active_view()
+            && (!self.composer.is_empty() || !self.has_pending_approvals())
+            && self.mention_menu.is_none()
+            && self.skill_popup.is_none()
+    }
+
+    fn composer_hints(&self) -> &'static str {
+        if let Some(menu) = &self.slash_menu {
+            if menu.is_empty() {
+                "Esc close menu"
+            } else if matches!(
+                super::slash_dispatch::parse_submission(&self.composer.text()),
+                super::slash_dispatch::SubmissionInput::Command(_)
+            ) {
+                "↑↓ select · Tab insert · Enter run · Esc close menu"
+            } else {
+                "↑↓ select · Tab insert · Esc close menu"
+            }
+        } else if matches!(
+            self.task_status,
+            TaskStatus::Cancelling | TaskStatus::Exiting
+        ) {
+            "Ctrl+G agents · Ctrl+O transcript · Shift+↓ background"
+        } else if self.task_status.is_active() {
+            "Enter guide · Ctrl+Q queue · Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · Shift+Enter newline"
+        } else {
+            "Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · / commands · Shift+Enter newline"
+        }
     }
 
     pub fn sync_popups(&mut self) {
@@ -2952,11 +2975,13 @@ impl BottomPane {
         self.composer.set_frame_allowed(allowed);
     }
 
-    pub(crate) fn history_suggestions_height(&self) -> u16 {
+    pub(crate) fn extra_picker_rows(&self) -> u16 {
         if self.has_active_view() {
-            return 0;
+            0
+        } else {
+            self.command_popup_height().saturating_sub(1)
+                + self.composer.history_suggestions_height()
         }
-        self.composer.history_suggestions_height()
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
@@ -2983,7 +3008,7 @@ impl BottomPane {
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
         let next_turn_queue_h = self.next_turn_submission_height();
-        let popup_h = self.popup_height();
+        let popup_h = self.command_popup_height() + self.composer.history_suggestions_height();
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
@@ -2992,14 +3017,14 @@ impl BottomPane {
             + queue_h
             + next_turn_queue_h
             + popup_h
-            + self.history_suggestions_height()
             + 2
+            + u16::from(self.has_composer_hints(width))
             + self.notice_lines(width).len() as u16
     }
 
     /// The composer and its cursor must use the same constrained rectangles,
     /// including when the terminal cannot fit every queue and popup row.
-    fn composer_areas(&self, area: Rect) -> [Rect; 7] {
+    fn composer_areas(&self, area: Rect) -> [Rect; 8] {
         let mut remaining = area.height;
         let mut take = |desired: u16| {
             let height = desired.min(remaining);
@@ -3016,28 +3041,33 @@ impl BottomPane {
                 .desired_height(area.width)
                 .saturating_sub(composer),
         );
-        let popup = take(self.popup_height());
+        let command_rows = self.command_popup_height();
+        let popup = take(command_rows.min(1));
         let queue = take(self.user_intent_height());
         let next_turn_queue = take(self.next_turn_submission_height());
         let context = take(1);
         let footer = take(1);
-        // Ordinary history suggestions yield to the queue and status rows.
-        let popup = popup + take(self.history_suggestions_height());
-        let heights = [
-            approval,
-            queue,
-            next_turn_queue,
-            context,
-            composer,
-            popup,
-            footer,
-        ];
+        // History is optional even when it has a candidate. Leave room for
+        // live output and status before allocating the list on short screens.
+        let popup = popup
+            + take(command_rows.saturating_sub(popup) + self.composer.history_suggestions_height());
+        let hints = take(u16::from(self.has_composer_hints(area.width)));
         let mut y = area.y;
-        std::array::from_fn(|index| {
-            let rect = Rect::new(area.x, y, area.width, heights[index]);
-            y += heights[index];
+        let mut row = |height| {
+            let rect = Rect::new(area.x, y, area.width, height);
+            y += height;
             rect
-        })
+        };
+        [
+            row(approval),
+            row(queue),
+            row(next_turn_queue),
+            row(context),
+            row(composer),
+            row(popup),
+            row(footer),
+            row(hints),
+        ]
     }
 
     // Ctrl+R stays inside the composer; it never opens a view stack overlay.
@@ -3676,12 +3706,78 @@ impl BottomPane {
         self.pre_draw_session_tick(now, &[])
     }
 
+    pub(crate) fn set_tips_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.tip_rotation
+                .get_or_insert_with(|| (std::time::Instant::now(), 0));
+        } else {
+            self.tip_rotation = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_tips(&mut self, now: std::time::Instant) {
+        self.tip_rotation = Some((now, 0));
+    }
+
+    fn tips_visible(&self) -> bool {
+        self.composer.is_empty()
+            && !self.has_active_view()
+            && !self.has_pending_approvals()
+            && !self.has_pending_composer_queue()
+            && !self.interrupt_pending
+            && !matches!(
+                self.task_status,
+                TaskStatus::Exiting | TaskStatus::Cancelling
+            )
+    }
+
+    fn composer_tip(&self) -> Option<&'static str> {
+        const IDLE: &[&str] = &[
+            "Ctrl+R searches prompt history.",
+            "Ctrl+O opens the transcript.",
+            "/explain shows timing and tokens.",
+            "Ctrl+G opens the run navigator.",
+            "/context shows the request budget.",
+            "/help keys lists the shortcuts.",
+        ];
+        const WORKING: &[&str] = &[
+            "Ctrl+Q queues the next turn.",
+            "Ctrl+O opens the live transcript.",
+            "Ctrl+G inspects active runs.",
+        ];
+        let (_, index) = self.tip_rotation?;
+        if !self.tips_visible() {
+            return None;
+        }
+        let working = self.task_status.is_active();
+        let tips = if working { WORKING } else { IDLE };
+        if !working
+            && index.is_multiple_of(3)
+            && self
+                .footer
+                .bg_task_counts
+                .is_some_and(|counts| !counts.is_empty())
+        {
+            Some("Shift+↓ opens background tasks.")
+        } else {
+            Some(tips[(index % tips.len() as u64) as usize])
+        }
+    }
+
     pub(crate) fn pre_draw_session_tick(
         &mut self,
         now: std::time::Instant,
         history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
     ) -> bool {
         let mut changed = self.approval_queue.prune_closed() > 0;
+        if let Some((started_at, index)) = &mut self.tip_rotation {
+            let current = now.saturating_duration_since(*started_at).as_secs() / 24;
+            if current != *index {
+                *index = current;
+                changed |= self.tips_visible();
+            }
+        }
         self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
             changed |= view.is_in_paste_burst();
@@ -3736,8 +3832,8 @@ impl BottomPane {
         if let Some(view) = self.active_view() {
             // Stack optional footers under the view area:
             //   [view]
-            //   [hint bar]        — when hint_keys() is Some
             //   [status line]     — when reserve_status_footer()
+            //   [hint bar]        — when hint_keys() is Some
             let want_status = view.reserve_status_footer();
             let hint = view.hint_keys();
             let hidden_approvals = self.approval_queue.len();
@@ -3763,12 +3859,12 @@ impl BottomPane {
                     );
                     y += 1;
                 }
-                if let Some(h) = hint.filter(|_| show_hint) {
-                    render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
-                    y += 1;
-                }
                 if show_status {
                     self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
+                    y += 1;
+                }
+                if let Some(h) = hint.filter(|_| show_hint) {
+                    render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
                 }
                 return;
             }
@@ -3786,26 +3882,42 @@ impl BottomPane {
             buf,
         );
         let area = content_area;
-        let chunks = self.composer_areas(area);
-        self.render_focused_approval(chunks[0], buf);
-        self.render_pending_user_intents(chunks[1], buf);
-        self.render_queued_next_turn_submissions(chunks[2], buf);
-        self.footer.render_context_bar(chunks[3], buf);
-        self.composer
-            .render(chunks[4], buf, self.has_pending_composer_queue());
+        let [
+            approval,
+            guidance,
+            queued,
+            context,
+            composer,
+            popup,
+            footer,
+            hints,
+        ] = self.composer_areas(area);
+        self.render_focused_approval(approval, buf);
+        self.render_pending_user_intents(guidance, buf);
+        self.render_queued_next_turn_submissions(queued, buf);
+        self.footer.render_context_bar(context, buf);
+        self.composer.render(
+            composer,
+            buf,
+            self.has_pending_composer_queue(),
+            self.composer_tip(),
+        );
         if let Some(ref menu) = self.slash_menu {
-            slash_popup_render::render_composer(menu, chunks[5], buf);
+            slash_popup_render::render_composer(menu, popup, buf);
         } else if let Some(ref menu) = self.mention_menu {
-            mention_popup_render::render(menu, chunks[5], buf);
-        } else if let Some(ref popup) = self.skill_popup {
-            popup.render(chunks[5], buf);
-        } else if chunks[5].is_empty() {
+            mention_popup_render::render(menu, popup, buf);
+        } else if let Some(ref skills) = self.skill_popup {
+            skills.render(popup, buf);
+        } else if popup.is_empty() {
             self.composer
-                .render_compact_history_suggestion(chunks[4], buf);
+                .render_compact_history_suggestion(composer, buf);
         } else {
-            self.composer.render_history_suggestions(chunks[5], buf);
+            self.composer.render_history_suggestions(popup, buf);
         }
-        self.footer.render(chunks[6], buf);
+        self.footer.render(footer, buf);
+        if !hints.is_empty() {
+            render_hint_bar(self.composer_hints(), hints, buf);
+        }
     }
 
     fn notice_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -3882,193 +3994,79 @@ impl BottomPane {
     }
 
     fn user_intent_height(&self) -> u16 {
-        let count = self.visible_pending_intents().take(3).count();
-        if count == 0 {
-            return 0;
-        }
-        let preview_rows = count.min(2) as u16;
-        let more_row = u16::from(count > 2);
-        1 + preview_rows + more_row
+        input_notice_height(self.visible_pending_intents().take(3).count())
     }
 
     fn next_turn_submission_height(&self) -> u16 {
-        let count = self.visible_next_turn_submissions().take(3).count();
-        if count == 0 {
-            return 0;
-        }
-        let preview_rows = count.min(2) as u16;
-        let more_row = u16::from(count > 2);
-        1 + preview_rows + more_row
+        input_notice_height(self.visible_next_turn_submissions().take(3).count())
     }
 
     fn render_pending_user_intents(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        use astra_turn_types::UserIntentStatus::{
+            AcceptedLocal, AcceptedRemote, Applied, Returned,
+        };
+
+        if area.is_empty() {
             return;
         }
-        let theme = crate::tui::theme::current();
-
-        // Distinct panel surface: visibly darker (dark term) / darker still
-        // (light term) than the composer surface so the queue reads as its
-        // own region, not as more of the input box.
-        let panel = crate::tui::style::queue_panel_style();
-        for y in area.y..area.y + area.height {
-            buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
-        }
-        let bg = panel.bg.unwrap_or(ratatui::style::Color::Reset);
-
-        let mut visible = self.visible_pending_intents();
-        let Some(head) = visible.next() else {
-            return;
-        };
-        let second = visible.next();
-        let remaining = if second.is_some() && area.height >= 4 {
-            visible.count()
-        } else {
-            0
-        };
+        let mut intents = self.visible_pending_intents();
+        let Some(first) = intents.next() else { return };
         let title = if self.interrupt_pending {
-            "Stopping · checking message delivery".to_string()
+            "Stopping · checking message delivery".into()
         } else {
-            pending_user_intent_title(head, &self.task_status)
+            pending_user_intent_title(first, &self.task_status)
         };
-        let title_style = Style::default().fg(theme.accent).bg(bg);
-        Widget::render(
-            Line::from(Span::styled(
-                truncate_display(&title, area.width as usize),
-                title_style,
-            )),
-            Rect::new(area.x, area.y, area.width, 1),
-            buf,
-        );
-
-        // Visual hierarchy on the queue band:
-        //   head — accent + bold, it's about to fire.
-        //   tail — `fg` (not `dim`): queued entries are user content that
-        //     must remain legible against the low-contrast queue surface;
-        //     `dim` (DarkGray) sat too close to the panel bg.
-        //   +N more — `accent_dim` keeps the count present without
-        //     competing with the queued text above. Dropped the DIM
-        //     modifier: it doubled up on a color already at low emphasis.
-        let head_style = Style::default()
-            .fg(theme.accent)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
-        let tail_style = panel;
-        let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
-
-        let preview_rows = (area.height as usize).saturating_sub(1);
-        for (idx, pending) in std::iter::once(head)
-            .chain(second)
-            .take(preview_rows)
-            .take(2)
-            .enumerate()
-        {
-            // Truncate by the actual column budget, not a hard-coded 100.
-            let status = if pending.custody == PendingUserIntentCustody::Unconfirmed {
-                "unknown"
+        let theme = super::theme::current();
+        let color = if self.interrupt_pending || first.delivery_is_unconfirmed() {
+            theme.warn
+        } else {
+            theme.accent
+        };
+        let previews = std::iter::once(("", first.text.as_str())).chain(intents.map(|pending| {
+            let prefix = if pending.delivery_is_unconfirmed() {
+                "Delivery unknown · "
+            } else if pending.target == first.target
+                && pending.status == first.status
+                && pending.custody == first.custody
+            {
+                ""
             } else {
                 match pending.status {
-                    astra_turn_types::UserIntentStatus::AcceptedLocal => "waiting",
-                    astra_turn_types::UserIntentStatus::AcceptedRemote => "received",
-                    astra_turn_types::UserIntentStatus::Applied => "applied",
-                    astra_turn_types::UserIntentStatus::Returned => "returned",
+                    AcceptedLocal => "Pending · ",
+                    AcceptedRemote => "Received · ",
+                    Applied => "Applied · ",
+                    Returned => "Returned · ",
                 }
             };
-            let prefix = format!("{}  {status} · ", idx + 1);
-            let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let preview = deferred_followup_preview(&pending.text, budget);
-            let line = format!("{prefix}{preview}");
-            let style = if idx == 0 { head_style } else { tail_style };
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    style,
-                )),
-                Rect::new(area.x, area.y + 1 + idx as u16, area.width, 1),
-                buf,
-            );
-        }
-        if remaining > 0 {
-            let line = format!("  +{remaining} more");
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    more_style,
-                )),
-                Rect::new(area.x, area.y + 3, area.width, 1),
-                buf,
-            );
-        }
+            (prefix, pending.text.as_str())
+        }));
+        render_input_notice(area, buf, &title, color, previews);
     }
 
     fn render_queued_next_turn_submissions(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        if area.is_empty() {
             return;
         }
-        let mut visible = self.visible_next_turn_submissions();
-        let Some(first) = visible.next() else { return };
-        let second = visible.next();
-        let remaining = if second.is_some() && area.height >= 4 {
-            visible.count()
-        } else {
-            0
+        let mut submissions = self.visible_next_turn_submissions();
+        let Some(first) = submissions.next() else {
+            return;
         };
-        let theme = crate::tui::theme::current();
-        let panel = crate::tui::style::queue_panel_style();
-        for y in area.y..area.y + area.height {
-            buf.set_string(area.x, y, " ".repeat(area.width as usize), panel);
-        }
-        let bg = panel.bg.unwrap_or(ratatui::style::Color::Reset);
-        let title_style = Style::default().fg(theme.accent).bg(bg);
-        Widget::render(
-            Line::from(Span::styled(
-                truncate_display(
-                    "Message queued · starts when the current action is ready",
-                    area.width as usize,
-                ),
-                title_style,
-            )),
-            Rect::new(area.x, area.y, area.width, 1),
+        let command = matches!(first, NextTurnSubmission::Interactive(text)
+            if super::slash_dispatch::parse_submission(text).is_command());
+        let title = if command {
+            "Command queued · after current work"
+        } else {
+            "Message queued · next turn"
+        };
+        render_input_notice(
+            area,
             buf,
+            title,
+            super::theme::current().accent,
+            std::iter::once(first)
+                .chain(submissions)
+                .map(|entry| ("", entry.text())),
         );
-
-        let head_style = Style::default()
-            .fg(theme.accent)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
-        let tail_style = panel;
-        let more_style = Style::default().fg(theme.accent_dim()).bg(bg);
-        let preview_rows = (area.height as usize).saturating_sub(1);
-        for (idx, text) in std::iter::once(first)
-            .chain(second)
-            .take(preview_rows)
-            .take(2)
-            .enumerate()
-        {
-            let prefix = format!("{}  queued · ", idx + 1);
-            let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let line = format!("{prefix}{}", deferred_followup_preview(text.text(), budget));
-            let style = if idx == 0 { head_style } else { tail_style };
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    style,
-                )),
-                Rect::new(area.x, area.y + 1 + idx as u16, area.width, 1),
-                buf,
-            );
-        }
-        if remaining > 0 {
-            let line = format!("  +{remaining} more");
-            Widget::render(
-                Line::from(Span::styled(
-                    truncate_display(&line, area.width as usize),
-                    more_style,
-                )),
-                Rect::new(area.x, area.y + 3, area.width, 1),
-                buf,
-            );
-        }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
@@ -4094,8 +4092,8 @@ impl BottomPane {
             (self.notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
         let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
-        let chunks = self.composer_areas(area);
-        self.composer.cursor_position(chunks[4])
+        let [_, _, _, _, composer, ..] = self.composer_areas(area);
+        self.composer.cursor_position(composer)
     }
 }
 
@@ -4140,50 +4138,87 @@ fn reconcile_conversation_tab(
     }
 }
 
-fn deferred_followup_preview(text: &str, limit: usize) -> String {
-    let single_line = text.trim().replace('\n', " ⏎ ");
-    let mut preview: String = single_line.chars().take(limit).collect();
-    if single_line.chars().count() > limit {
-        preview.push('…');
+fn input_notice_height(count: usize) -> u16 {
+    if count == 0 {
+        0
+    } else {
+        1 + count.min(3) as u16
     }
-    preview
 }
 
-fn truncate_display(text: &str, max_width: usize) -> String {
-    if text.width() <= max_width {
-        return text.to_string();
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-    let keep = max_width - 1;
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let width = ch.width().unwrap_or(0);
-        if used + width > keep {
-            break;
+fn render_input_notice<'a>(
+    area: Rect,
+    buf: &mut Buffer,
+    title: &str,
+    color: ratatui::style::Color,
+    mut previews: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    let theme = super::theme::current();
+    let rail = super::glyphs::current().live_gutter.to_string();
+    let dim = Style::default().fg(theme.dim);
+    let indent = 2.min(area.width.saturating_sub(1));
+    let width = area.width - indent;
+    let row_area = |row| Rect::new(area.x + indent, area.y + row, width, 1);
+    let heading = Line::styled(title, Style::default().fg(color).bold());
+    Widget::render(heading, row_area(0), buf);
+    if indent > 0 {
+        for y in area.y..area.bottom() {
+            buf.set_string(area.x, y, &rail, dim);
         }
-        out.push(ch);
-        used += width;
     }
-    out.push('…');
-    out
+    let rows = usize::from(area.height.saturating_sub(1).min(2));
+    for (row, (prefix, text)) in previews.by_ref().take(rows).enumerate() {
+        let budget = usize::from(width).saturating_sub(prefix.width());
+        let preview = chat_composer::input_preview(text, budget);
+        let line = Line::from(vec![
+            Span::styled(prefix, dim),
+            Span::styled(preview, Style::default().fg(theme.fg)),
+        ]);
+        Widget::render(line, row_area(row as u16 + 1), buf);
+    }
+    if area.height >= 4 {
+        let remaining = previews.count();
+        if remaining > 0 {
+            Widget::render(
+                Line::styled(format!("+{remaining} more"), dim),
+                row_area(3),
+                buf,
+            );
+        }
+    }
 }
 
-/// Render a one-row dim hint bar at the bottom of a view area.
+/// Fit whole shortcuts and keep key chords distinct from their labels.
 fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
-    if area.width == 0 || area.height == 0 {
+    if area.is_empty() || area.width <= 2 {
         return;
     }
-    use ratatui::style::{Color, Style};
-    use ratatui::text::{Line, Span};
     use ratatui::widgets::Widget;
-    let styled = Line::from(vec![
-        Span::raw("  "),
-        Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
-    ]);
-    Widget::render(styled, area, buf);
+    use unicode_width::UnicodeWidthStr;
+
+    let theme = super::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let key = Style::default().fg(theme.accent_dim());
+    let mut remaining = usize::from(area.width) - 2;
+    let mut spans = vec![Span::raw("  ")];
+    for item in hint.split(" · ") {
+        let gap = if spans.len() > 1 { " · " } else { "" };
+        let width = gap.width() + item.width();
+        if width > remaining {
+            continue;
+        }
+        remaining -= width;
+        if !gap.is_empty() {
+            spans.push(Span::styled(gap, dim));
+        }
+        if let Some((chord, label)) = item.split_once(' ') {
+            spans.push(Span::styled(chord, key));
+            spans.push(Span::styled(format!(" {label}"), dim));
+        } else {
+            spans.push(Span::styled(item, key));
+        }
+    }
+    Widget::render(Line::from(spans), area, buf);
 }
 
 /// Keep hidden approvals observable without competing with the modal for

@@ -4382,6 +4382,8 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
     let missing = format!("parent-missing-{nonce}");
     let orphan = format!("parent-orphan-{nonce}");
     let session = format!("parent-session-{nonce}");
+    // These fixtures exercise control reads. Keep the deliberately corrupt
+    // run out of recovery scans even if an assertion interrupts cleanup.
     for (user, run, parent, path) in [
         (&owner, &root, None, format!("/{root}")),
         (&owner, &child, Some(&root), format!("/{root}/{child}")),
@@ -4399,7 +4401,7 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
             format!("/{missing}/{orphan}"),
         ),
     ] {
-        sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,status) VALUES (?,?,?,?,?,?,'running')")
+        sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,status) VALUES (?,?,?,?,?,?,'paused')")
             .bind(user).bind(&session).bind(run).bind(parent.unwrap_or(run)).bind(parent).bind(path)
             .execute(pool.get()).await.unwrap();
     }
@@ -4504,10 +4506,19 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
         result.parent.is_none() && result.own == expected_child
     }));
     {
-        let sparse_sql = sparse_sql.0.lock().unwrap();
-        assert_eq!(sparse_sql.len(), 1);
+        let statements = sparse_sql.0.lock().unwrap();
+        // A fresh SQLx checkout can initialize its session inside this span.
+        let reads: Vec<_> = statements
+            .iter()
+            .filter(|sql| !sql.starts_with("SET sql_mode="))
+            .collect();
+        assert_eq!(
+            reads.len(),
+            1,
+            "unexpected sparse batch SQL: {statements:?}"
+        );
         assert!(
-            !sparse_sql[0].contains("JOIN agent_runs parent"),
+            !reads[0].contains("JOIN agent_runs parent"),
             "sparse batches must avoid the parent join"
         );
     }

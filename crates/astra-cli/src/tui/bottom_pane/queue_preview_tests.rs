@@ -443,11 +443,23 @@ fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 10));
     assert!(
-        rendered.contains("Message queued"),
+        rendered.contains("Message queued · next turn"),
         "a locally accepted next turn must be visible immediately; got {rendered:?}"
     );
     assert!(rendered.contains("summarize the findings"), "{rendered:?}");
     assert!(rendered.contains("then prepare the patch"), "{rendered:?}");
+    let lines: Vec<_> = rendered.lines().collect();
+    let rail = super::super::glyphs::current().live_gutter;
+    assert!(
+        lines[..3].iter().all(|line| line.starts_with(rail)),
+        "{rendered:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with('╭') && line.ends_with('╮')),
+        "{rendered:?}"
+    );
 
     assert_eq!(
         pane.take_queued_next_turn_submissions()
@@ -477,6 +489,27 @@ fn narrow_active_composer_does_not_reintroduce_key_chrome() {
         !rendered.contains("Ctrl+C stops") && !rendered.contains("Enter queues"),
         "narrow layouts must reduce chrome rather than invent another shorthand; got {rendered:?}"
     );
+}
+
+#[test]
+fn deferred_commands_show_when_they_run() {
+    let mut pane = BottomPane::new();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    assert!(pane.queue_next_turn_submission("/config".into()));
+
+    let text = render_text(&pane, Rect::new(0, 0, 42, 9));
+    assert!(
+        text.contains("Command queued · after current work"),
+        "{text:?}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.trim_end().ends_with("/config")),
+        "{text:?}"
+    );
+    assert!(text.contains("Enter guide · Ctrl+Q queue"), "{text:?}");
 }
 
 #[test]
@@ -597,11 +630,11 @@ fn locally_accepted_intent_does_not_claim_remote_delivery() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Waiting for the current task"),
+        rendered.contains("Guidance pending · current run"),
         "local acknowledgement must not promise an application boundary; got {rendered:?}"
     );
     assert!(
-        rendered.contains("waiting"),
+        !rendered.contains("Guidance received"),
         "intent panel should show the typed local delivery status; got {rendered:?}"
     );
     assert!(
@@ -643,7 +676,13 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
         assert!(pane.mark_user_intent_unconfirmed("intent-agent-1"));
         assert!(!pane.mark_user_intent_unconfirmed("intent-agent-1"));
         let rendered = render_text(&pane, Rect::new(0, 0, 100, 8));
-        assert!(rendered.contains("unknown"), "{rendered}");
+        let disposition = if accepted { "used" } else { "received" };
+        assert!(
+            rendered.contains(&format!(
+                "Can't confirm Reviewer {disposition} your message"
+            )),
+            "{rendered}"
+        );
         assert!(!rendered.contains("Sending"), "{rendered}");
         assert!(!rendered.contains("sending"), "{rendered}");
         assert!(pane.take_client_recoverable_user_intents().is_empty());
@@ -850,9 +889,14 @@ fn guidance_during_tool_execution_explains_the_real_application_boundary() {
     ));
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-    assert!(rendered.contains("Message received"), "{rendered:?}");
-    assert!(rendered.contains("waiting to take effect"), "{rendered:?}");
-    assert!(rendered.contains("Ctrl+C to stop"), "{rendered:?}");
+    assert!(
+        rendered.contains("Guidance received · current run"),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains("review the latest finding"),
+        "{rendered:?}"
+    );
     assert!(!rendered.contains("Message added"), "{rendered:?}");
     assert!(!rendered.contains("accepted locally"), "{rendered:?}");
 }
@@ -945,7 +989,7 @@ fn snapshot_idle_bottom_surface_80() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_idle_80",
-        snapshot_text(&pane, Rect::new(0, 0, 80, 5))
+        snapshot_text(&pane, Rect::new(0, 0, 80, 6))
     );
 }
 
@@ -958,7 +1002,7 @@ fn snapshot_active_bottom_surface_80() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_active_80",
-        snapshot_text(&pane, Rect::new(0, 0, 80, 5))
+        snapshot_text(&pane, Rect::new(0, 0, 80, 6))
     );
 }
 
@@ -971,7 +1015,7 @@ fn snapshot_active_bottom_surface_narrow_42() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_active_42",
-        snapshot_text(&pane, Rect::new(0, 0, 42, 5))
+        snapshot_text(&pane, Rect::new(0, 0, 42, 6))
     );
 }
 

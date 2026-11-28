@@ -4348,18 +4348,17 @@ mod tests {
                 child
                     .args(["--exact", &test, "--nocapture"])
                     .env(CASE, profile)
-                    .env(
-                        "ASTRA_TUI_THEME",
-                        if profile == "no-color" {
-                            "auto"
-                        } else {
-                            profile
-                        },
-                    )
                     .env_remove("NO_COLOR")
-                    .env_remove("COLORFGBG")
-                    .env_remove("ASTRA_TERMINAL_FG")
-                    .env_remove("ASTRA_TERMINAL_BG");
+                    .env_remove("COLORFGBG");
+                let theme = if profile == "no-color" {
+                    "auto"
+                } else {
+                    profile
+                };
+                let _config = crate::test_utils::configure_terminal(
+                    &mut child,
+                    &format!("theme = {theme:?}"),
+                );
                 if profile == "no-color" {
                     child.env("NO_COLOR", "1");
                 }

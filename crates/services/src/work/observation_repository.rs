@@ -41,9 +41,9 @@ const SELECT_DECLARED_WORK_OBSERVATION_SQL: &str = "SELECT
     b.current_graph_revision,
     DATE_FORMAT(b.created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS branch_created_at,
     DATE_FORMAT(b.archived_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS branch_archived_at,
-    s.graph_revision AS subject_graph_revision,
-    s.subject_ref,
-    s.subject_revision,
+    b.subject_graph_revision,
+    b.subject_ref,
+    b.subject_revision,
     gr.revision AS graph_revision,
     gr.item_count AS graph_item_count,
     gr.edge_count AS graph_edge_count,
@@ -68,10 +68,6 @@ LEFT JOIN work_graph_revisions gr
   ON gr.owner_id = b.owner_id
  AND gr.work_id = b.work_id
  AND gr.revision = b.current_graph_revision
-LEFT JOIN work_branch_subjects s
-  ON s.owner_id = b.owner_id
- AND s.work_id = b.work_id
- AND s.branch_id = b.branch_id
 WHERE w.owner_id = ? AND w.work_id = ?
 LIMIT 1";
 

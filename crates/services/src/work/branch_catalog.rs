@@ -1,7 +1,7 @@
 use super::catalog::{WorkBranchActivity, activity_from_durable_run_status};
 use super::{
     CriterionSetRevision, ForkCursorRef, GoalRevision, GraphRevision, WORK_ACTIVE_BRANCH_MAX,
-    WorkBranchId, WorkBranchRevision, WorkId, WorkOwnerId, WorkRevision,
+    WorkBranchId, WorkBranchRevision, WorkEventSeq, WorkId, WorkOwnerId, WorkRevision,
 };
 use astra_core::SharedPool;
 use chrono::{DateTime, Utc};
@@ -73,7 +73,9 @@ pub struct WorkBranchActivityObservation {
     pub work_id: WorkId,
     pub branch_id: WorkBranchId,
     pub branch_revision: WorkBranchRevision,
+    pub event_head: WorkEventSeq,
     pub activity: WorkBranchActivity,
+    pub pause_cursor: Option<String>,
     pub observed_at: DateTime<Utc>,
 }
 
@@ -229,8 +231,8 @@ impl DatabaseWorkBranchCatalogService {
         })
     }
 
-    /// Read the selected branch's current root Run state using one bounded,
-    /// owner-scoped statement. This deliberately exposes neither the backing
+    /// Read the branch's current root Run state and its Work's event head in
+    /// one bounded, owner-scoped statement. This exposes neither the backing
     /// Session id nor the internal Run id to the caller.
     pub async fn load_activity(
         &self,
@@ -240,8 +242,10 @@ impl DatabaseWorkBranchCatalogService {
     ) -> Result<WorkBranchActivityObservation, WorkBranchCatalogError> {
         let row = sqlx::query(
             "SELECT b.branch_revision, b.session_id AS branch_session_id,
+                    es.last_event_seq,
                     active.run_id AS active_run_id,
                     active.status AS active_run_status,
+                    active.last_event_idx AS active_run_last_event_idx,
                     active.waiting_for AS active_run_waiting_for,
                     active.session_id AS active_run_session_id,
                     active.work_id AS active_run_work_id,
@@ -251,6 +255,8 @@ impl DatabaseWorkBranchCatalogService {
              JOIN work_branches b
                ON b.owner_id = w.owner_id AND b.work_id = w.work_id
               AND b.archived_at IS NULL
+             LEFT JOIN work_event_sequences es
+               ON es.owner_id = w.owner_id AND es.work_id = w.work_id
              LEFT JOIN agent_runs active
            ON active.user_id = w.owner_id AND active.session_id = b.session_id
           AND active.parent_run_id IS NULL AND active.retry_of IS NULL
@@ -269,9 +275,9 @@ impl DatabaseWorkBranchCatalogService {
         .ok_or(WorkBranchCatalogError::NotFound)?;
 
         let branch_session_id = text(&row, "branch_session_id")?;
-        let activity = match optional_text(&row, "active_run_id")? {
-            None => WorkBranchActivity::Idle,
-            Some(_) => {
+        let (activity, pause_cursor) = match optional_text(&row, "active_run_id")? {
+            None => (WorkBranchActivity::Idle, None),
+            Some(run_id) => {
                 let active_run_status =
                     optional_text(&row, "active_run_status")?.ok_or_else(|| {
                         WorkBranchCatalogError::NeedsRepair(
@@ -290,7 +296,7 @@ impl DatabaseWorkBranchCatalogService {
                         "active root projection does not reference this branch's root Run".into(),
                     ));
                 }
-                activity_from_durable_run_status(
+                let activity = activity_from_durable_run_status(
                     &active_run_status,
                     optional_text(&row, "active_run_waiting_for")?.is_some(),
                 )
@@ -298,7 +304,16 @@ impl DatabaseWorkBranchCatalogService {
                     WorkBranchCatalogError::NeedsRepair(
                         "active root projection and durable Run status disagree".into(),
                     )
-                })?
+                })?;
+                let pause_cursor = if activity == WorkBranchActivity::Paused {
+                    let last_event_idx = integer(&row, "active_run_last_event_idx")?;
+                    Some(super::repository::content_hash(&format!(
+                        "{run_id}:{last_event_idx}"
+                    )))
+                } else {
+                    None
+                };
+                (activity, pause_cursor)
             }
         };
 
@@ -307,7 +322,9 @@ impl DatabaseWorkBranchCatalogService {
             branch_id: branch_id.clone(),
             branch_revision: WorkBranchRevision::new(integer(&row, "branch_revision")?)
                 .map_err(repair)?,
+            event_head: WorkEventSeq::new(integer(&row, "last_event_seq")?).map_err(repair)?,
             activity,
+            pause_cursor,
             observed_at: Utc::now(),
         })
     }

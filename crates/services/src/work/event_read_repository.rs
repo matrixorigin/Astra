@@ -12,20 +12,35 @@ pub(super) async fn list_events(
     repository: &DatabaseWorkRepository,
     query_value: WorkEventQuery,
 ) -> Result<WorkEventPage, WorkRepositoryError> {
-    let metadata = query(
+    let requested_after = query_value
+        .after_event_seq
+        .map(WorkEventSeq::get)
+        .unwrap_or(0);
+    let owner_id = query_value.owner_id.as_str();
+    let work_id = query_value.work_id.as_str();
+    let rows = query(
         "SELECT s.last_event_seq, s.retained_from_event_seq,
-                r.seen_through_event_seq
+                e.event_seq, e.branch_id, e.event_kind, e.work_revision, e.goal_revision,
+                e.criterion_set_revision, e.branch_revision, e.graph_revision, e.source_ref,
+                DATE_FORMAT(e.created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at
          FROM work_event_sequences s
-         LEFT JOIN work_attention_receipts r
-           ON r.owner_id = s.owner_id AND r.work_id = s.work_id
-         WHERE s.owner_id = ? AND s.work_id = ? LIMIT 1",
+         LEFT JOIN work_events e
+           ON e.owner_id = s.owner_id AND e.work_id = s.work_id
+          AND e.owner_id = ? AND e.work_id = ? AND e.event_seq > ?
+          AND e.event_seq BETWEEN s.retained_from_event_seq AND s.last_event_seq
+         WHERE s.owner_id = ? AND s.work_id = ?
+         ORDER BY e.event_seq LIMIT ?",
     )
-    .bind(query_value.owner_id.as_str())
-    .bind(query_value.work_id.as_str())
-    .fetch_optional(repository.pool.get())
+    .bind(owner_id)
+    .bind(work_id)
+    .bind(requested_after)
+    .bind(owner_id)
+    .bind(work_id)
+    .bind(i64::from(query_value.limit.get()) + 1)
+    .fetch_all(repository.pool.get())
     .await
-    .map_err(|source| WorkRepositoryError::persistence("load Work event page metadata", source))?
-    .ok_or(WorkRepositoryError::NotFound)?;
+    .map_err(|source| WorkRepositoryError::persistence("load bounded Work events", source))?;
+    let metadata = rows.first().ok_or(WorkRepositoryError::NotFound)?;
     let integer = |field: &'static str| {
         metadata
             .try_get::<i64, _>(field)
@@ -35,26 +50,6 @@ pub(super) async fn list_events(
         .map_err(|source| WorkRepositoryError::corrupt("Work event page", source))?;
     let retained_from_event_seq = WorkEventSeq::new(integer("retained_from_event_seq")?)
         .map_err(|source| WorkRepositoryError::corrupt("Work event page", source))?;
-    let seen_value = metadata
-        .try_get::<Option<i64>, _>("seen_through_event_seq")
-        .map_err(|source| WorkRepositoryError::corrupt("Work attention receipt", source))?
-        .ok_or_else(|| {
-            WorkRepositoryError::corrupt(
-                "Work attention receipt",
-                std::io::Error::other("receipt is missing for an existing Work"),
-            )
-        })?;
-    let seen_through_event_seq = decode_optional_event_seq(seen_value, "seen cursor")?;
-    if seen_through_event_seq.is_some_and(|cursor| cursor > event_head) {
-        return Err(WorkRepositoryError::corrupt(
-            "Work attention receipt",
-            std::io::Error::other("seen cursor is ahead of the event head"),
-        ));
-    }
-    let requested_after = query_value
-        .after_event_seq
-        .map(WorkEventSeq::get)
-        .unwrap_or(0);
     if requested_after > event_head.get() {
         return Err(WorkRepositoryError::EventCursorAhead {
             through_event_seq: requested_after,
@@ -68,25 +63,15 @@ pub(super) async fn list_events(
         WorkEventCoverage::Complete
     };
     let effective_after = requested_after.max(retained_after);
-    let fetch_limit = i64::from(query_value.limit.get()) + 1;
-    let rows = query(
-        "SELECT event_seq, branch_id, event_kind, work_revision, goal_revision,
-                criterion_set_revision, branch_revision, graph_revision, source_ref,
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at
-         FROM work_events
-         WHERE owner_id = ? AND work_id = ? AND event_seq > ?
-         ORDER BY event_seq LIMIT ?",
-    )
-    .bind(query_value.owner_id.as_str())
-    .bind(query_value.work_id.as_str())
-    .bind(effective_after)
-    .bind(fetch_limit)
-    .fetch_all(repository.pool.get())
-    .await
-    .map_err(|source| WorkRepositoryError::persistence("load bounded Work events", source))?;
     let mut events = Vec::with_capacity(rows.len());
     for (index, row) in rows.into_iter().enumerate() {
-        let event = decode_event(row)?;
+        let Some(event_seq) = row
+            .try_get::<Option<i64>, _>("event_seq")
+            .map_err(|source| WorkRepositoryError::corrupt("Work event page", source))?
+        else {
+            break;
+        };
+        let event = decode_event(row, event_seq)?;
         let expected_seq = effective_after
             .checked_add(i64::try_from(index + 1).expect("bounded page index"))
             .ok_or_else(|| {
@@ -129,14 +114,16 @@ pub(super) async fn list_events(
         next_after_event_seq,
         event_head,
         retained_from_event_seq,
-        seen_through_event_seq,
         coverage,
         has_more,
         events,
     })
 }
 
-fn decode_event(row: sqlx::mysql::MySqlRow) -> Result<WorkEventRecord, WorkRepositoryError> {
+fn decode_event(
+    row: sqlx::mysql::MySqlRow,
+    event_seq: i64,
+) -> Result<WorkEventRecord, WorkRepositoryError> {
     let optional_revision = |field: &'static str| {
         row.try_get::<Option<i64>, _>(field)
             .map_err(|source| WorkRepositoryError::corrupt("Work event", source))
@@ -157,11 +144,8 @@ fn decode_event(row: sqlx::mysql::MySqlRow) -> Result<WorkEventRecord, WorkRepos
         )
     })?;
     Ok(WorkEventRecord {
-        event_seq: WorkEventSeq::new(
-            row.try_get::<i64, _>("event_seq")
-                .map_err(|source| WorkRepositoryError::corrupt("Work event", source))?,
-        )
-        .map_err(|source| WorkRepositoryError::corrupt("Work event", source))?,
+        event_seq: WorkEventSeq::new(event_seq)
+            .map_err(|source| WorkRepositoryError::corrupt("Work event", source))?,
         branch_id,
         kind,
         work_revision: optional_revision("work_revision")?
@@ -196,17 +180,4 @@ fn decode_event(row: sqlx::mysql::MySqlRow) -> Result<WorkEventRecord, WorkRepos
                 .map_err(|source| WorkRepositoryError::corrupt("Work event", source))?,
         )?,
     })
-}
-
-fn decode_optional_event_seq(
-    value: i64,
-    entity: &'static str,
-) -> Result<Option<WorkEventSeq>, WorkRepositoryError> {
-    if value == 0 {
-        Ok(None)
-    } else {
-        WorkEventSeq::new(value)
-            .map(Some)
-            .map_err(|source| WorkRepositoryError::corrupt(entity, source))
-    }
 }

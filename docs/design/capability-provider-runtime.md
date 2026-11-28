@@ -505,7 +505,12 @@ policy/context snapshot version where relevant
 ```
 
 Only successful typed pure-read outcomes are eligible. Errors, timeouts,
-rejections, and unknown outcomes are never cached as success.
+rejections, and unknown outcomes are never cached as success. Reuse is limited
+to the current executor, with up to 64 ready entries, 2 MiB of serialized
+results and eight in-flight fills. A fill expires after 90 seconds. A slow
+read can still return its ordinary tool result after cache admission expires.
+A resumed or recreated executor starts with an empty cache and continues to
+use the durable ledger for exact invocation replay.
 
 The durable invocation decision freezes cache eligibility and the exact policy
 and descriptor versions, but it does not freeze a resource revision as current

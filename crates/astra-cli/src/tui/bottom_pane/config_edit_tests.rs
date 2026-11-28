@@ -171,7 +171,7 @@ fn bool_edit_round_trips_and_marks_dirty() {
 
 // ─── bool picker: two options visible, arrow-navigable ──────────────────
 
-/// Reference CLI shows bools as a two-line picker (`› true` / `  false`)
+/// Reference CLI shows bools as a two-line picker (`› On` / `  Off`)
 /// with ↑↓ to move and Enter to confirm. That's the muscle memory we're
 /// importing — a single "value: X, press space to flip" line is less
 /// discoverable and mis-matches Enum's UX in the same panel.
@@ -192,15 +192,12 @@ fn bool_editor_renders_both_options_with_marker_on_current() {
         }
     }
     // Both options must be on screen.
-    assert!(text.contains("true"), "bool editor missing `true`: {text}");
-    assert!(
-        text.contains("false"),
-        "bool editor missing `false`: {text}"
-    );
+    assert!(text.contains("On"), "bool editor missing `true`: {text}");
+    assert!(text.contains("Off"), "bool editor missing `false`: {text}");
     // The cursor/marker (›) must sit on the *current* value, which is
     // `false` by default here. A trailing space avoids matching a prefix
     // of a future label.
-    let marker_on_false = text.contains("› false") || text.contains("›false");
+    let marker_on_false = text.contains("› Off");
     assert!(
         marker_on_false,
         "cursor must start on the current value (false), got: {text}"
@@ -221,6 +218,27 @@ fn bool_editor_arrow_key_moves_selection_between_options() {
             .trace
             .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
         "Down + Enter must commit the other option (true)"
+    );
+}
+
+#[test]
+fn terminal_color_editor_keeps_invalid_input_local_and_accepts_a_pasted_color() {
+    use astra_config::runtime_config::TuiColor;
+
+    let mut view = make_view();
+    view.select_by_id("tui.background");
+    view.handle_key(key(KeyCode::Enter));
+    assert!(view.handle_paste("#invalid"));
+    view.handle_key(key(KeyCode::Enter));
+    assert!(view.has_inner_editor());
+    assert!(!view.is_dirty());
+
+    assert!(view.handle_paste("#263445"));
+    view.handle_key(key(KeyCode::Enter));
+    assert!(!view.has_inner_editor());
+    assert_eq!(
+        view.working_config_for_test().tui.background,
+        Some(TuiColor::Rgb(38, 52, 69))
     );
 }
 
@@ -359,7 +377,7 @@ fn save_prompt_has_a_preview_option_that_shows_diff() {
         "preview must list the changed field id: {text}"
     );
     assert!(
-        text.contains("true"),
+        text.contains("On"),
         "preview must show the new value: {text}"
     );
 }

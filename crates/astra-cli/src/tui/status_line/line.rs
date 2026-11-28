@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) use crate::cli::permission_manager::PermissionMode;
 
@@ -94,10 +94,6 @@ impl BackgroundTaskCounts {
             && self.monitors == 0
     }
 
-    pub(crate) fn has_local_agent_rows(self) -> bool {
-        self.local_agents > 0 || self.failed_local_agents > 0 || self.unavailable_local_agents > 0
-    }
-
     pub(crate) fn from_rows(
         rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
     ) -> Self {
@@ -182,6 +178,7 @@ impl BackgroundTaskCounts {
 pub(crate) struct Segment {
     pub text: String,
     pub style: Style,
+    compact_end: Option<usize>,
 }
 
 impl Segment {
@@ -189,6 +186,7 @@ impl Segment {
         Self {
             text: text.into(),
             style: Style::default(),
+            compact_end: None,
         }
     }
 
@@ -196,7 +194,13 @@ impl Segment {
         Self {
             text: text.into(),
             style,
+            compact_end: None,
         }
+    }
+
+    fn with_compact(mut self) -> Self {
+        self.compact_end = self.text.find(" · ");
+        self
     }
 }
 
@@ -207,6 +211,7 @@ impl Segment {
 pub(crate) struct StatusLine {
     pub left: Vec<Segment>,
     pub right: Vec<Segment>,
+    mode_index: usize,
     current_permission_mode: Option<PermissionMode>,
     pending_permission_mode: Option<PermissionMode>,
 }
@@ -336,6 +341,7 @@ impl StatusLine {
         let theme = crate::tui::theme::current();
         let muted = Style::default().fg(theme.dim);
         let mut out = Self {
+            mode_index: usize::from(ctx.model.is_some()),
             current_permission_mode: Some(ctx.permission_mode),
             pending_permission_mode: ctx.pending_permission_mode,
             ..Self::default()
@@ -402,7 +408,7 @@ impl StatusLine {
                 } else {
                     (format!("Tasks {open}/{total} · Ctrl+T"), muted)
                 };
-                out.left.push(Segment::styled(text, style));
+                out.left.push(Segment::styled(text, style).with_compact());
             }
         }
 
@@ -419,21 +425,20 @@ impl StatusLine {
             && !counts.is_empty()
         {
             let mut parts = background_task_count_parts(counts);
-            if counts.has_local_agent_rows() {
-                parts.push("Ctrl+T tasks".to_string());
-            }
-            if !counts.has_local_agent_rows() {
-                parts
-                    .push(crate::tui::background_shortcut::background_task_open_hint().to_string());
-            }
+            parts.push(crate::tui::background_shortcut::background_task_open_hint().to_owned());
             let style = if counts.failed_total() > 0 {
                 Style::default().fg(theme.error)
-            } else if counts.waiting > 0 {
+            } else if counts.waiting > 0
+                || counts.stale_snapshots > 0
+                || counts.unsettled_shells > 0
+                || counts.unavailable_total() > 0
+            {
                 Style::default().fg(theme.warn)
             } else {
                 muted
             };
-            out.left.push(Segment::styled(parts.join(" · "), style));
+            out.left
+                .push(Segment::styled(parts.join(" · "), style).with_compact());
         }
 
         // ── Right: quiet workspace identity ───────────────────────
@@ -486,9 +491,10 @@ impl StatusLine {
             &mut left_segments,
             &mut right_segments,
             available,
+            self.mode_index,
             self.current_permission_mode
                 .unwrap_or(PermissionMode::Prompt),
-            self.pending_permission_mode,
+            self.pending_permission_mode.is_some(),
         );
 
         let left_spans = join_segments(&left_segments, INNER_GAP, bg);
@@ -573,81 +579,74 @@ fn fit_clusters(
     left: &mut Vec<Segment>,
     right: &mut Vec<Segment>,
     available: usize,
+    mut mode_index: usize,
     current_mode: PermissionMode,
-    pending_mode: Option<PermissionMode>,
+    pending_mode: bool,
 ) {
-    const CLUSTER_GAP: usize = 3;
     let total = |left: &[Segment], right: &[Segment]| {
         cluster_width(left)
             + cluster_width(right)
-            + usize::from(!left.is_empty() && !right.is_empty()) * CLUSTER_GAP
+            + usize::from(!left.is_empty() && !right.is_empty()) * 3
     };
-
-    // Branch and cwd are workspace decoration. Branch yields first, then cwd
-    // yields before actionable permission state when the line is crowded.
-    while right.len() > 1 && total(left, right) > available {
-        right.pop();
-    }
-
-    // The current and next permission modes are actionable. Once the
-    // workspace identity no longer fits, remove it before either mode chip so
-    // a runtime choice cannot disappear exactly when the user needs feedback.
-    if total(left, right) > available && !right.is_empty() {
-        right.clear();
-    }
-
-    let is_current = |segment: &Segment| segment.text == permission_mode_label(current_mode);
-    let pending_label =
-        pending_mode.map(|mode| format!("requested: {}", permission_mode_label(mode)));
-    let is_pending = |segment: &Segment| {
-        pending_label
-            .as_deref()
-            .is_some_and(|label| segment.text == label)
-    };
-
-    // Secondary left chips (model, approval/task summaries, …) yield before
-    // the current/next mode pair. Remove from the tail to keep the existing
-    // stable order for everything that remains.
-    while total(left, right) > available {
-        let Some(index) = left.iter().enumerate().rev().find_map(|(index, segment)| {
-            (!is_current(segment) && !is_pending(segment)).then_some(index)
-        }) else {
-            break;
-        };
-        left.remove(index);
-    }
-
-    // If even the mode pair cannot fit, keep the current policy and elide the
-    // next-turn intent first. This is preferable to showing a stale current
-    // policy or an unlabeled status line on a very narrow terminal.
-    while total(left, right) > available {
-        let Some(index) = left.iter().position(&is_pending) else {
-            break;
-        };
-        left.remove(index);
-    }
-
-    // The current mode still gets a compact, recognizable label if the
-    // terminal is narrower than its full human label (for example `RO` for
-    // `Read-only`).
-    if total(left, right) > available {
-        if let Some(current_index) = left.iter().position(&is_current) {
-            left[current_index].text = compact_permission_mode_label(current_mode).to_string();
-            left.truncate(current_index + 1);
+    let essential_left = mode_index + 1 + usize::from(pending_mode);
+    let mut excess = total(left, right).saturating_sub(available);
+    if excess > 0 {
+        for segment in left.iter_mut().skip(essential_left).rev() {
+            if let Some(end) = segment.compact_end {
+                excess = excess.saturating_sub(segment.text.width() - segment.text[..end].width());
+                segment.text.truncate(end);
+                if excess == 0 {
+                    return;
+                }
+            }
         }
     }
 
-    if total(left, right) > available
-        && let Some(current_index) = left.iter().position(&is_current)
+    // Keep a recognizable checkout name before taking away Git identity.
+    // If the cwd and branch cannot coexist, keep the branch.
+    let excess = total(left, right).saturating_sub(available);
+    if excess > 0
+        && let Some(cwd) = right.first_mut().filter(|cwd| !cwd.text.starts_with("⎇ "))
     {
-        left[current_index].text = truncate_end(&left[current_index].text, available.max(1));
-        left.truncate(current_index + 1);
+        let budget = cwd.text.width().saturating_sub(excess).max(8);
+        cwd.text = truncate_cwd(&cwd.text, budget);
     }
-
-    // A pathological width can still leave a right-side segment after the
-    // mode fit above. Drop it rather than allowing a render overflow.
+    if total(left, right) > available && right.len() == 2 {
+        right.remove(0);
+    }
+    let excess = total(left, right).saturating_sub(available);
+    if excess > 0
+        && let Some(segment) = right.last_mut()
+        && let Some(branch) = segment.text.strip_prefix("⎇ ")
+    {
+        let budget = branch.width().saturating_sub(excess).max(8);
+        segment.text = format!("⎇ {}", truncate_middle(branch, budget));
+    }
     if total(left, right) > available {
         right.clear();
+    }
+
+    // Give the model name and thinking depth a small but useful budget
+    // before removing task or approval feedback at narrow widths.
+    let excess = total(left, right).saturating_sub(available);
+    if mode_index > 0 && excess > 0 {
+        let model = &mut left[0].text;
+        *model = format_model_label(model, model.width().saturating_sub(excess).max(12));
+    }
+    while left.len() > essential_left && total(left, right) > available {
+        left.pop();
+    }
+    if total(left, right) > available && mode_index > 0 {
+        left.remove(0);
+        mode_index = 0;
+    }
+    if total(left, right) > available && pending_mode {
+        left.truncate(mode_index + 1);
+    }
+    if total(left, right) > available
+        && let Some(mode) = left.get_mut(mode_index)
+    {
+        mode.text = truncate_end(compact_permission_mode_label(current_mode), available);
     }
 }
 
@@ -688,7 +687,7 @@ fn truncate_cwd(cwd: &str, max_width: usize) -> String {
         best = Some(candidate);
     }
 
-    best.unwrap_or_else(|| truncate_end(cwd, max_width))
+    best.unwrap_or_else(|| truncate_end(parts.last().copied().unwrap_or(cwd), max_width))
 }
 
 fn format_model_label(model: &str, max_width: usize) -> String {
@@ -701,7 +700,7 @@ fn format_model_label(model: &str, max_width: usize) -> String {
         let suffix_width = compact_suffix.width();
         if suffix_width < max_width {
             let base_budget = max_width.saturating_sub(suffix_width);
-            let truncated_base = truncate_end(base, base_budget.max(8));
+            let truncated_base = truncate_end(base, base_budget);
             let candidate = format!("{truncated_base}{compact_suffix}");
             if candidate.width() <= max_width {
                 return candidate;
@@ -735,18 +734,28 @@ fn compact_model_suffix(suffix: &str) -> String {
 }
 
 fn truncate_middle(text: &str, max_width: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_width {
+    if text.width() <= max_width {
         return text.to_string();
     }
     if max_width <= 1 {
-        return "…".to_string();
+        return truncate_end(text, max_width);
     }
-    let head_len = (max_width - 1) / 2;
-    let tail_len = max_width - 1 - head_len;
-    let head: String = text.chars().take(head_len).collect();
-    let tail: String = text.chars().skip(count - tail_len).collect();
-    format!("{head}…{tail}")
+    let head_budget = (max_width - 1) / 2;
+    let tail_budget = max_width - 1 - head_budget;
+    let take = |used: &mut usize, ch: &char, limit| {
+        *used += ch.width().unwrap_or(0);
+        *used <= limit
+    };
+    let head: String = text
+        .chars()
+        .scan(0, |used, ch| take(used, &ch, head_budget).then_some(ch))
+        .collect();
+    let tail: Vec<char> = text
+        .chars()
+        .rev()
+        .scan(0, |used, ch| take(used, &ch, tail_budget).then_some(ch))
+        .collect();
+    format!("{head}…{}", tail.into_iter().rev().collect::<String>())
 }
 
 fn truncate_end(text: &str, max_width: usize) -> String {

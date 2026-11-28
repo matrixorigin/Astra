@@ -71,6 +71,10 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub explain: ExplainConfig,
 
+    /// Preferences for the local terminal interface.
+    #[serde(default, skip_serializing_if = "TuiConfig::is_empty")]
+    pub tui: TuiConfig,
+
     /// Local `web_fetch` network policy. User-level only: the project layer
     /// cannot set it (see [`USER_ONLY_SECTIONS`]).
     #[serde(default)]
@@ -166,20 +170,9 @@ impl std::fmt::Display for ExplainReportFormat {
     }
 }
 
-/// User-facing Explain Analyze presentation settings.
-///
-/// The live TUI projection is intentionally bounded: it is a compact status
-/// lane, not a second scrollback. The bound is also enforced by the renderer
-/// so hand-written config files cannot make the live pane take over the
-/// terminal.
+/// User-facing Explain Analyze report settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExplainConfig {
-    /// Maximum number of rows used by the live TUI Explain Analyze projection.
-    /// `None` means the built-in five-row default was not explicitly
-    /// configured. Keeping that distinction lets a project config explicitly
-    /// choose `5` over a user config choosing `3`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_rows: Option<u8>,
     /// Derived report format for local human-readable artifacts. `None`
     /// preserves the built-in HTML default while allowing higher-precedence
     /// config layers to explicitly override a lower layer.
@@ -187,23 +180,114 @@ pub struct ExplainConfig {
     pub report_format: Option<ExplainReportFormat>,
 }
 
-fn default_explain_live_rows() -> u8 {
-    5
-}
-
 impl ExplainConfig {
-    /// Effective live-row value used by presentation surfaces. Keep this
-    /// helper public so every UI boundary applies the same defensive cap to
-    /// hand-edited config files.
-    pub fn effective_live_rows(&self) -> u8 {
-        self.live_rows
-            .unwrap_or_else(default_explain_live_rows)
-            .clamp(1, 5)
-    }
-
     /// Resolve the format used for the next report publication.
     pub fn effective_report_format(&self) -> ExplainReportFormat {
         self.report_format.unwrap_or_default()
+    }
+}
+
+/// Local terminal presentation preferences.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_tips: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<TuiThemeProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glyphs: Option<TuiGlyphProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<TuiColor>,
+}
+
+impl TuiConfig {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn show_tips(&self) -> bool {
+        self.show_tips.unwrap_or(true)
+    }
+}
+
+/// Colour profile selected before initializing the terminal.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiThemeProfile {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    DarkAnsi,
+    LightAnsi,
+    Plain,
+}
+
+impl TuiThemeProfile {
+    pub(crate) const OPTIONS: &[&str] =
+        &["auto", "dark", "light", "dark-ansi", "light-ansi", "plain"];
+}
+
+/// Glyph profile selected before rendering the terminal.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiGlyphProfile {
+    #[default]
+    Unicode,
+    Ascii,
+}
+
+impl TuiGlyphProfile {
+    pub(crate) const OPTIONS: &[&str] = &["unicode", "ascii"];
+}
+
+/// Explicit sRGB or automatic terminal color selection.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
+pub enum TuiColor {
+    #[default]
+    Auto,
+    Rgb(u8, u8, u8),
+}
+
+impl TuiColor {
+    pub fn rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::Auto => None,
+            Self::Rgb(r, g, b) => Some((r, g, b)),
+        }
+    }
+}
+
+impl TryFrom<String> for TuiColor {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let error = "Enter #RRGGBB or auto";
+        let hex = value.strip_prefix('#').ok_or(error)?;
+        if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(error);
+        }
+        let color = u32::from_str_radix(hex, 16).map_err(|_| error)?;
+        Ok(Self::Rgb(
+            (color >> 16) as u8,
+            (color >> 8) as u8,
+            color as u8,
+        ))
+    }
+}
+
+impl From<TuiColor> for String {
+    fn from(color: TuiColor) -> Self {
+        match color {
+            TuiColor::Auto => "auto".to_string(),
+            TuiColor::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        }
     }
 }
 
@@ -344,6 +428,7 @@ impl Default for RuntimeConfig {
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
             explain: ExplainConfig::default(),
+            tui: TuiConfig::default(),
             web_fetch: WebFetchConfig::default(),
         }
     }
@@ -1359,8 +1444,6 @@ impl RuntimeConfig {
                 .enabled_categories
                 .push(TraceCategory::LlmExchanges);
         }
-        // ASTRA_FORK_INHERIT_PREFIX is intentionally ignored: fork capture
-        // and eligible inheritance are always on.
     }
 
     /// Get configuration as TOML string.
@@ -1521,7 +1604,6 @@ mod tests {
         // Just verify they exist and serialize
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("[agent_binding_registry]"));
-        assert_eq!(config.explain.effective_live_rows(), 5);
     }
 
     #[test]
@@ -1582,32 +1664,22 @@ mod tests {
 
     #[test]
     fn explicit_explain_defaults_and_null_override_lower_values() {
-        let lower = RuntimeConfigLayer::from_json(
-            r#"{"explain":{"live_rows":3,"report_format":"markdown"}}"#,
-        )
-        .unwrap()
-        .apply_to(&RuntimeConfig::default())
-        .unwrap();
+        let lower = RuntimeConfigLayer::from_json(r#"{"explain":{"report_format":"markdown"}}"#)
+            .unwrap()
+            .apply_to(&RuntimeConfig::default())
+            .unwrap();
         assert_eq!(
             lower.explain.effective_report_format(),
             ExplainReportFormat::Markdown
         );
-        for (json, rows) in [
-            (
-                r#"{"explain":{"live_rows":5,"report_format":"html"}}"#,
-                Some(5),
-            ),
-            (
-                r#"{"explain":{"live_rows":null,"report_format":null}}"#,
-                None,
-            ),
+        for json in [
+            r#"{"explain":{"report_format":"html"}}"#,
+            r#"{"explain":{"report_format":null}}"#,
         ] {
             let selected = RuntimeConfigLayer::from_json(json)
                 .unwrap()
                 .apply_to(&lower)
                 .unwrap();
-            assert_eq!(selected.explain.live_rows, rows);
-            assert_eq!(selected.explain.effective_live_rows(), 5);
             assert_eq!(
                 selected.explain.effective_report_format(),
                 ExplainReportFormat::Html
@@ -1617,7 +1689,6 @@ mod tests {
             .unwrap()
             .apply_to(&lower)
             .unwrap();
-        assert_eq!(unchanged.explain.live_rows, Some(3));
         assert_eq!(
             unchanged.explain.effective_report_format(),
             ExplainReportFormat::Markdown
@@ -1639,7 +1710,6 @@ mod tests {
             let config = RuntimeConfig {
                 explain: ExplainConfig {
                     report_format: Some(format),
-                    ..ExplainConfig::default()
                 },
                 ..RuntimeConfig::default()
             };

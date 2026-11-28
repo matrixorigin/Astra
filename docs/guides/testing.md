@@ -507,8 +507,10 @@ cargo test -p astra-cli --test tui_pty_journey \
 The inline TUI regression drives the real binary through a controlling PTY and
 xterm.js's headless terminal (including native reflow). It checks repeated
 narrow/wide and short/tall transitions, draft input, rapid resizes with delayed
-cursor replies, one live footer/composer across the entire buffer, and
-preservation of pre-existing and committed startup history. A held reply also
+cursor replies, duplicate footer and composer rows, and preservation of
+pre-existing and committed startup history. When native reflow can move old
+composer rows beyond the visible screen, the test checks the full live draft,
+committed history, and a single viewport clear. A held reply also
 outlasts the real cursor-query deadline: paste must remain responsive, no second
 query may overlap the expired request, and releasing its reply must allow a
 fresh resize without damaging history. The initialization cursor getter and
@@ -522,7 +524,7 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-CI runs the default terminal reader, `use-dev-tty` reader and all eight
+CI runs the default terminal reader, `use-dev-tty` reader and the
 production-binary reflow journeys in three parallel Linux jobs. Linux also runs
 the complete vendored units with both reader feature sets. One Mac bundle runs
 the existing default CLI PTY/Bash suite, native workspace coordination/Clippy,
@@ -750,26 +752,6 @@ capacity probes for many readers, multiple server processes, provider quotas,
 and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
-
-The collision-receipt test separates the normal database contract from scale
-diagnostics. Its normal workload processes 1,024 distinct conflicting payloads
-through the bounded batch writer, plus concurrent single-receipt checks. To run
-1,024 independent transactions contending on one identity, opt in explicitly:
-
-```bash
-# Use a dedicated test database and credentials from your environment/.env.
-ASTRA_TEST_DB_IT=1 ASTRA_TEST_STORAGE_SCALE=1 \
-cargo nextest run -p astra-services --test observation_capture_db_it \
-  --run-ignored all --profile strict-online-ci --test-threads 1 \
-  --success-output immediate \
-  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners)'
-```
-
-The scale mode retains the same 60-second online hard deadline and fails on timeout;
-it is not enabled by ordinary integration CI. Keep source, database, machine,
-test profile and workload identical for before/after comparisons. A same-row
-contention result is not a multi-session capacity result; batching does not
-remove contention between independent transactions on the same identity.
 
 For a short batching tradeoff comparison, run the ignored
 `ingestion_batch_tradeoff_db_it` test against a dedicated disposable database.
