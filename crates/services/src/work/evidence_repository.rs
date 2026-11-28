@@ -32,9 +32,9 @@ async fn validate_check_basis(
             CASE WHEN b.archived_at IS NULL THEN 0 ELSE 1 END AS branch_archived,
             b.current_graph_revision AS branch_current_graph_revision,
             b.criteria_set_revision_ref AS branch_criteria_set_revision,
-            s.graph_revision AS subject_graph_revision,
-            s.subject_ref AS current_subject_ref,
-            s.subject_revision AS current_subject_revision,
+            b.subject_graph_revision,
+            b.subject_ref AS current_subject_ref,
+            b.subject_revision AS current_subject_revision,
             gr.revision AS basis_graph_revision,
             gr.item_revision_manifest_json,
             gr.item_count,
@@ -73,10 +73,6 @@ async fn validate_check_basis(
          LEFT JOIN agent_runs r
            ON r.user_id = w.owner_id
           AND r.run_id = ?
-         LEFT JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id
-          AND s.work_id = b.work_id
-          AND s.branch_id = b.branch_id
          LEFT JOIN work_criterion_sets cs
            ON cs.owner_id = w.owner_id
           AND cs.work_id = w.work_id
@@ -393,12 +389,11 @@ pub(super) async fn record_check_run(
          FROM work_branches b
          JOIN works w
            ON w.owner_id = b.owner_id AND w.work_id = b.work_id
-         JOIN work_branch_subjects s
-           ON s.owner_id = b.owner_id AND s.work_id = b.work_id AND s.branch_id = b.branch_id
          WHERE b.owner_id = ? AND b.work_id = ? AND b.branch_id = ?
            AND w.archived_at IS NULL AND b.archived_at IS NULL
            AND b.current_graph_revision = ?
-           AND s.graph_revision = ? AND s.subject_ref = ? AND s.subject_revision = ?
+           AND b.subject_record_revision IS NOT NULL
+           AND b.subject_graph_revision = ? AND b.subject_ref = ? AND b.subject_revision = ?
            AND EXISTS (
              SELECT 1 FROM agent_runs r
              WHERE r.user_id = ? AND r.run_id = ?

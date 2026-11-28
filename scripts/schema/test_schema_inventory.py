@@ -144,14 +144,11 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_graph_revisions",
-            "work_graph_sequences",
-            "work_items",
             "work_item_revisions",
             "work_branches",
             "work_branch_creation_operations",
             "work_branch_control_operations",
             "work_branch_deletion_operations",
-            "work_branch_subjects",
             "work_proposal_sequences",
             "work_proposals",
             "work_proposal_trigger_attempts",
@@ -170,7 +167,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(27, len(actual))
+        self.assertEqual(24, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
@@ -185,7 +182,7 @@ class SchemaInventoryTest(unittest.TestCase):
     def test_work_metadata_locks_authority_boundaries(self) -> None:
         self.assertIn("current pointers", self.tables["works"]["merge_guidance"])
         self.assertIn("immutable", self.tables["work_goal_revisions"]["state_class"])
-        self.assertIn("ordering authority", self.tables["work_graph_sequences"]["rebuildability"])
+        self.assertIn("ordering authority", self.tables["works"]["rebuildability"])
         self.assertIn("idempotency/recovery", self.tables["work_branch_control_operations"]["merge_guidance"])
         self.assertIn("evidence", self.tables["work_check_runs"]["merge_guidance"])
         self.assertIn("canonical history", self.tables["work_events"]["state_class"])
@@ -245,8 +242,8 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("reservation", heads["merge_guidance"])
         self.assertIn("fencing", heads["merge_guidance"])
 
-        subjects = self.tables["work_branch_subjects"]
-        self.assertIn("branch-selected immutable subject authority", subjects["state_class"])
+        subjects = self.tables["work_branches"]
+        self.assertIn("branch-selected immutable subject authority", subjects["merge_guidance"])
         self.assertIn("workspace/materialization", subjects["rebuildability"])
         self.assertNotIn("rebuildable from the current branch/work declarations", subjects["rebuildability"])
 

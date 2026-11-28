@@ -937,8 +937,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
             "work_graph_revisions",
             &["owner_id", "work_id", "revision"][..],
         ),
-        ("work_graph_sequences", &["owner_id", "work_id"][..]),
-        ("work_items", &["owner_id", "work_id", "item_id"][..]),
         (
             "work_item_revisions",
             &["owner_id", "work_id", "item_id", "revision"][..],
@@ -1035,12 +1033,31 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         );
     }
     assert!(
-        column_names(&pool, &schema, "work_items")
+        column_names(&pool, &schema, "works")
             .await
             .iter()
-            .any(|column| column == "last_revision"),
-        "WorkItem identities require one global revision allocator across sibling branches"
+            .any(|column| column == "last_graph_revision"),
+        "the Work root allocates revisions across sibling branches"
     );
+    let branch_columns = column_names(&pool, &schema, "work_branches").await;
+    for expected in [
+        "subject_record_revision",
+        "subject_branch_revision",
+        "subject_graph_revision",
+        "subject_ref",
+        "subject_revision",
+        "subject_source_ref",
+        "subject_created_at",
+        "subject_updated_at",
+    ] {
+        assert!(branch_columns.iter().any(|column| column == expected));
+    }
+    for retired in ["work_items", "work_graph_sequences", "work_branch_subjects"] {
+        assert!(
+            column_names(&pool, &schema, retired).await.is_empty(),
+            "fresh schema still contains {retired}"
+        );
+    }
     assert_eq!(
         index_columns(
             &pool,
@@ -1086,8 +1103,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         "work_criterion_revisions",
         "work_criterion_sets",
         "work_graph_revisions",
-        "work_graph_sequences",
-        "work_items",
         "work_item_revisions",
         "work_branches",
         "work_branch_deletion_operations",

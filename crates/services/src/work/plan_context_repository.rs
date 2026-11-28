@@ -948,13 +948,13 @@ async fn load_item_verifications(
                            c.coverage_state, c.evidence_ref_count,
                            DATE_FORMAT(c.produced_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS produced_at,
                            DATE_FORMAT(c.expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS expires_at,
-                           s.graph_revision AS current_subject_graph_revision,
-                           s.subject_ref AS current_subject_ref,
-                           s.subject_revision AS current_subject_revision
+                           b.subject_graph_revision AS current_subject_graph_revision,
+                           b.subject_ref AS current_subject_ref,
+                           b.subject_revision AS current_subject_revision
                     FROM work_check_runs c
-                    LEFT JOIN work_branch_subjects s
-                      ON s.owner_id = c.owner_id AND s.work_id = c.work_id
-                     AND s.branch_id = c.branch_id
+                    LEFT JOIN work_branches b
+                      ON b.owner_id = c.owner_id AND b.work_id = c.work_id
+                     AND b.branch_id = c.branch_id
                     WHERE c.owner_id = ",
             )
             .push_bind(owner_id.as_str())
