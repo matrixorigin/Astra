@@ -838,35 +838,6 @@ impl DatabaseWorkAttemptSettlementService {
         )
         .await
         .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?;
-        // Only a newly inserted Delivered settlement can make a deferred
-        // trigger set complete. A retry of an already recorded attempt must
-        // preserve the original association instead of claiming every
-        // pending group on the branch; membership in the immutable trigger
-        // set proves the exact item edge of this transition.
-        let due_groups = if settlement_inserted {
-            snapshot
-                .pending_graph_mutations()
-                .iter()
-                .filter(|group| group.trigger_items.iter().any(|item| item == &trigger_item))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        if !due_groups.is_empty() {
-            super::establishment_plan_repository::record_graph_mutation_trigger_attempts(
-                &mut tx,
-                &owner,
-                &session_id,
-                &snapshot,
-                &due_groups,
-                &WorkItemAttemptId::parse(attempt_id.to_string())
-                    .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,
-                &trigger_item,
-            )
-            .await
-            .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?;
-        }
         let advance = match snapshot.next_foreground_task() {
             WorkTaskExecutionNext::Ready(item) => {
                 let executor = sqlx::query(
@@ -987,6 +958,32 @@ impl DatabaseWorkAttemptSettlementService {
                 PrimaryWorkAttemptAdvance::Complete
             }
         };
+        // A new settlement owns only the deferred groups triggered by this
+        // exact item revision. Lock establishment after the Run, in the same
+        // order as new-turn supersession.
+        if settlement_inserted {
+            let due_groups = snapshot
+                .pending_graph_mutations()
+                .iter()
+                .filter(|group| group.trigger_items.iter().any(|item| item == &trigger_item))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !due_groups.is_empty() {
+                super::establishment_plan_repository::record_graph_mutation_trigger_attempts(
+                    &mut tx,
+                    &owner,
+                    &session_id,
+                    &snapshot,
+                    &due_groups,
+                    &WorkItemAttemptId::parse(attempt_id.to_string()).map_err(|error| {
+                        WorkAttemptSettlementError::Persistence(error.to_string())
+                    })?,
+                    &trigger_item,
+                )
+                .await
+                .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?;
+            }
+        }
         tx.commit().await.map_err(persistence)?;
         Ok(RecordedPrimaryWorkAttemptAdvance {
             settlement: recorded,
