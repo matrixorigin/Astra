@@ -2412,7 +2412,6 @@ export type WorkObservationReportV1 = {
   overview: WorkOverviewV1;
 };
 
-export type WorkCatalogAttentionV1 = "needs_review" | "updated" | "none";
 export type WorkBranchActivityV1 = "working" | "waiting" | "paused" | "idle";
 
 export type WorkBranchActivityResponseV1 = {
@@ -2422,6 +2421,7 @@ export type WorkBranchActivityResponseV1 = {
   branch_revision: number;
   event_head: number;
   activity: WorkBranchActivityV1;
+  pause_cursor: WorkContentHash | null;
   observed_at: string;
 };
 
@@ -2693,9 +2693,6 @@ export type WorkCatalogEntryV1 = {
   graph_item_count: number;
   pending_decision_count: number;
   event_head: number;
-  seen_through_event_seq: number | null;
-  unseen_event_count: number;
-  attention: WorkCatalogAttentionV1;
   delivery_branch_activity: WorkBranchActivityV1;
   created_at: string;
   last_activity_at: string;
@@ -3030,15 +3027,6 @@ export type WorkBranchRetentionReceiptV1 = {
   outcome: "applied" | "already_in_state";
 };
 
-export type WorkReadCursorReceiptV1 = {
-  schema_version: 1;
-  work_id: string;
-  through_event_seq: number;
-  receipt_revision: number;
-  receipt_hash: WorkContentHash;
-  updated_at: string;
-};
-
 export type WorkEventKind =
   | "work_created"
   | "criteria_accepted"
@@ -3080,7 +3068,6 @@ export type WorkEventPageV1 = {
   next_after_event_seq: number | null;
   event_head: number;
   retained_from_event_seq: number;
-  seen_through_event_seq: number | null;
   coverage: "complete" | "expired";
   has_more: boolean;
   events: WorkEventRecordV1[];
@@ -3375,7 +3362,6 @@ export type WorkApiErrorV1 = {
     | "invalid_work_criteria_cursor"
     | "invalid_work_proposal_id"
     | "invalid_work_proposal_decision"
-    | "invalid_work_read_cursor_request"
     | "invalid_work_catalog_query"
     | "invalid_work_catalog_cursor"
     | "invalid_work_catalog_limit"

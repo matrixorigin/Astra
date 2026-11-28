@@ -94,7 +94,6 @@ import type {
   WorkCriteriaProposalSummaryV1,
   WorkObservationReportV1,
   WorkEventPageV1,
-  WorkReadCursorReceiptV1,
   WorkTaskGraphCursorV1,
   WorkTaskGraphPageV2,
   WorkSessionBindingV1,
@@ -220,7 +219,6 @@ import {
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
   workBranchCriteriaProposalDecisionPath,
-  workReadCursorPath,
 } from "./paths";
 import { SSEClient, readSseReplay } from "./sse-client";
 import {
@@ -247,7 +245,6 @@ import {
   decodeWorkCriteriaProposalListV1,
   decodeWorkCriteriaProposalSummaryV1,
   decodeWorkEventPageV1,
-  decodeWorkReadCursorReceiptV1,
   decodeWorkTaskGraphPageV2,
   decodeWorkSessionBindingV1,
   decodeWorkBranchActivityResponseV1,
@@ -2257,30 +2254,7 @@ export class AstraClient {
     return detail;
   }
 
-  /** Monotonically mark one exact committed Work event sequence as seen. */
-  async advanceWorkReadCursor(
-    workId: string,
-    throughEventSeq: number,
-  ): Promise<WorkReadCursorReceiptV1> {
-    if (!Number.isSafeInteger(throughEventSeq) || throughEventSeq < 1) {
-      throw new TypeError("throughEventSeq must be a positive safe integer");
-    }
-    const raw = await this.put<unknown>(
-      workReadCursorPath(workId),
-      { through_event_seq: throughEventSeq },
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const receipt = decodeWorkReadCursorReceiptV1(raw);
-    if (receipt.work_id !== workId) {
-      throw new TypeError("Work read-cursor receipt belongs to a different Work");
-    }
-    if (receipt.through_event_seq < throughEventSeq) {
-      throw new TypeError("Work read-cursor receipt did not cover the requested event");
-    }
-    return receipt;
-  }
-
-  /** Read a bounded semantic event page without mutating the seen cursor. */
+  /** Read a bounded semantic event page. */
   async listWorkEvents(
     workId: string,
     options: { afterEventSeq?: number; limit?: number } = {},

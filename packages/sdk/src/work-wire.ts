@@ -46,7 +46,6 @@ import type {
   WorkEventKind,
   WorkEventPageV1,
   WorkEventRecordV1,
-  WorkReadCursorReceiptV1,
   WorkCriteriaCursorV1,
   WorkCriteriaPageV1,
   WorkCriterionV1,
@@ -106,6 +105,7 @@ export function decodeWorkBranchActivityResponseV1(
       "branch_revision",
       "event_head",
       "activity",
+      "pause_cursor",
       "observed_at",
     ],
     path,
@@ -113,17 +113,25 @@ export function decodeWorkBranchActivityResponseV1(
   if (object.schema_version !== 1) {
     throw new TypeError(`${path}.schema_version must be 1`);
   }
+  const activity = oneOf(
+    object.activity,
+    ["working", "waiting", "paused", "idle"] as const,
+    `${path}.activity`,
+  );
+  const pauseCursor = object.pause_cursor === null
+    ? null
+    : contentHash(object.pause_cursor, `${path}.pause_cursor`);
+  if ((activity === "paused") !== (pauseCursor !== null)) {
+    throw new TypeError(`${path}.pause_cursor disagrees with activity`);
+  }
   return {
     schema_version: 1,
     work_id: resourceIdentity(object.work_id, `${path}.work_id`),
     branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
     branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
     event_head: positiveRevision(object.event_head, `${path}.event_head`),
-    activity: oneOf(
-      object.activity,
-      ["working", "waiting", "paused", "idle"] as const,
-      `${path}.activity`,
-    ),
+    activity,
+    pause_cursor: pauseCursor,
     observed_at: timestamp(object.observed_at, `${path}.observed_at`),
   };
 }
@@ -1715,42 +1723,6 @@ export function decodeWorkObservationReportV1(value: unknown): WorkObservationRe
   };
 }
 
-/** Strict decoder for the monotonic Work read-cursor receipt. */
-export function decodeWorkReadCursorReceiptV1(
-  value: unknown,
-): WorkReadCursorReceiptV1 {
-  const path = "work_read_cursor_receipt";
-  const object = exactObject(
-    value,
-    [
-      "schema_version",
-      "work_id",
-      "through_event_seq",
-      "receipt_revision",
-      "receipt_hash",
-      "updated_at",
-    ],
-    path,
-  );
-  if (object.schema_version !== 1) {
-    throw new TypeError(`${path}.schema_version is unsupported`);
-  }
-  return {
-    schema_version: 1,
-    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
-    through_event_seq: positiveRevision(
-      object.through_event_seq,
-      `${path}.through_event_seq`,
-    ),
-    receipt_revision: positiveRevision(
-      object.receipt_revision,
-      `${path}.receipt_revision`,
-    ),
-    receipt_hash: contentHash(object.receipt_hash, `${path}.receipt_hash`),
-    updated_at: timestamp(object.updated_at, `${path}.updated_at`),
-  };
-}
-
 const EVENT_KINDS = [
   "work_created",
   "criteria_accepted",
@@ -1830,7 +1802,6 @@ export function decodeWorkEventPageV1(value: unknown): WorkEventPageV1 {
       "next_after_event_seq",
       "event_head",
       "retained_from_event_seq",
-      "seen_through_event_seq",
       "coverage",
       "has_more",
       "events",
@@ -1853,10 +1824,6 @@ export function decodeWorkEventPageV1(value: unknown): WorkEventPageV1 {
     object.retained_from_event_seq,
     `${path}.retained_from_event_seq`,
   );
-  const seen = nullableRevision(
-    object.seen_through_event_seq,
-    `${path}.seen_through_event_seq`,
-  );
   if (!Array.isArray(object.events) || object.events.length > 100) {
     throw new TypeError(`${path}.events must be a bounded array`);
   }
@@ -1875,9 +1842,6 @@ export function decodeWorkEventPageV1(value: unknown): WorkEventPageV1 {
   if (next !== expectedNext || (!hasMore && (next ?? effectiveAfter) !== head)) {
     throw new TypeError(`${path} cursor and event tail disagree`);
   }
-  if (seen !== null && seen > head) {
-    throw new TypeError(`${path}.seen_through_event_seq is ahead of the event head`);
-  }
   const coverage = oneOf(
     object.coverage,
     ["complete", "expired"] as const,
@@ -1893,7 +1857,6 @@ export function decodeWorkEventPageV1(value: unknown): WorkEventPageV1 {
     next_after_event_seq: next,
     event_head: head,
     retained_from_event_seq: retained,
-    seen_through_event_seq: seen,
     coverage,
     has_more: hasMore,
     events,
@@ -1933,9 +1896,6 @@ function decodeWorkCatalogEntry(value: unknown, index: number): WorkCatalogEntry
       "graph_item_count",
       "pending_decision_count",
       "event_head",
-      "seen_through_event_seq",
-      "unseen_event_count",
-      "attention",
       "delivery_branch_activity",
       "created_at",
       "last_activity_at",
@@ -1943,39 +1903,16 @@ function decodeWorkCatalogEntry(value: unknown, index: number): WorkCatalogEntry
     path,
   );
   const eventHead = positiveRevision(object.event_head, `${path}.event_head`);
-  const seen = nullableRevision(
-    object.seen_through_event_seq,
-    `${path}.seen_through_event_seq`,
-  );
-  const unseen = safeIntegerAtLeast(
-    object.unseen_event_count,
-    0,
-    `${path}.unseen_event_count`,
-  );
   const pending = boundedCount(
     object.pending_decision_count,
     8,
     `${path}.pending_decision_count`,
-  );
-  const attention = oneOf(
-    object.attention,
-    ["needs_review", "updated", "none"] as const,
-    `${path}.attention`,
   );
   const deliveryBranchActivity = oneOf(
     object.delivery_branch_activity,
     ["working", "waiting", "paused", "idle"] as const,
     `${path}.delivery_branch_activity`,
   );
-  if (
-    (seen ?? 0) > eventHead ||
-    unseen !== eventHead - (seen ?? 0) ||
-    (attention === "needs_review") !== (pending > 0) ||
-    (attention === "updated") !== (pending === 0 && unseen > 0) ||
-    (attention === "none") !== (pending === 0 && unseen === 0)
-  ) {
-    throw new TypeError(`${path} attention and cursor facts disagree`);
-  }
   const createdAt = timestamp(object.created_at, `${path}.created_at`);
   const lastActivityAt = timestamp(
     object.last_activity_at,
@@ -2004,9 +1941,6 @@ function decodeWorkCatalogEntry(value: unknown, index: number): WorkCatalogEntry
     ),
     pending_decision_count: pending,
     event_head: eventHead,
-    seen_through_event_seq: seen,
-    unseen_event_count: unseen,
-    attention,
     delivery_branch_activity: deliveryBranchActivity,
     created_at: createdAt,
     last_activity_at: lastActivityAt,

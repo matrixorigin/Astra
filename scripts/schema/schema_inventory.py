@@ -829,10 +829,10 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "works": TableMetadata(
         semantic_owner="astra_services::work::repository",
         state_class="durable Work root and current-state authority",
-        primary_query="current work root by owner_id/work_id with current goal, criteria, delivery branch, revision, archive state, and owner seen cursor",
+        primary_query="current work root by owner_id/work_id with current goal, criteria, delivery branch, revision, and archive state",
         retention_policy="retain for the Work lifecycle and immutable revision/evidence audit; archive through archived_at and delete only with an explicit owner-scoped cleanup policy",
         rebuildability="not rebuildable from Work events because current pointers, delivery branch, revision, and archive state are the Work root authority",
-        merge_guidance="keep Work root/current state separate from immutable goal, criterion, graph, and item revisions; works owns current pointers, lifecycle identity, and the seen cursor independent of event allocation",
+        merge_guidance="keep Work root/current state separate from immutable goal, criterion, graph, and item revisions; works owns current pointers and lifecycle identity independent of event allocation",
         migration_owner="astra_services::work",
         product_owner="Work lifecycle root, current state, and delivery branch",
     ),

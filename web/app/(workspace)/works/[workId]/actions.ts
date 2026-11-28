@@ -21,7 +21,6 @@ import {
   type WorkCriteriaProposalDecisionInput,
   type WorkCriteriaProposalDetailV1,
   type WorkCriteriaProposalSummaryV1,
-  type WorkReadCursorReceiptV1,
   type WorkTranscriptPageV1,
   type WorkTaskGraphCursorV1,
   type WorkTaskGraphPageV2,
@@ -49,10 +48,6 @@ export type ResolveCriteriaProposalResult =
       detail: WorkCriteriaProposalDetailV1;
       snapshot: WorkOverviewSnapshot;
     }
-  | WorkActionError;
-
-export type MarkWorkSeenResult =
-  | { ok: true; receipt: WorkReadCursorReceiptV1 }
   | WorkActionError;
 
 export type LoadWorkTranscriptResult =
@@ -616,11 +611,6 @@ type ResolveCriteriaProposalInput = {
   proposal: WorkCriteriaProposalSummaryV1;
   decision: WorkCriteriaProposalDecisionInput["decision"];
   requestId: string;
-};
-
-type MarkWorkSeenInput = {
-  workId: string;
-  throughEventSeq: number;
 };
 
 type LoadWorkTranscriptInput = {
@@ -1409,52 +1399,6 @@ export async function loadWorkTranscriptPageAction(
         beforeItemSeq: input.beforeItemSeq,
         limit: 50,
       }),
-    };
-  } catch (error) {
-    const known = classifyWorkActionError(error);
-    if (known) return known;
-    throw error;
-  }
-}
-
-function validMarkWorkSeenInput(input: MarkWorkSeenInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  const fields = Object.keys(object).sort();
-  return (
-    fields.length === 2 &&
-    fields[0] === "throughEventSeq" &&
-    fields[1] === "workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    typeof object.throughEventSeq === "number" &&
-    Number.isSafeInteger(object.throughEventSeq) &&
-    object.throughEventSeq >= 1
-  );
-}
-
-export async function markWorkSeenAction(
-  input: MarkWorkSeenInput,
-): Promise<MarkWorkSeenResult> {
-  if (!validMarkWorkSeenInput(input)) {
-    return {
-      ok: false,
-      status: 400,
-      code: "invalid_work_read_cursor_request",
-      retryable: false,
-    };
-  }
-  try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "mark Work updates seen",
-    });
-    return {
-      ok: true,
-      receipt: await runtime.sdk.advanceWorkReadCursor(
-        input.workId,
-        input.throughEventSeq,
-      ),
     };
   } catch (error) {
     const known = classifyWorkActionError(error);

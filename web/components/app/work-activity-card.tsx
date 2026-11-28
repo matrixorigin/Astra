@@ -1,11 +1,6 @@
-"use client";
-
-import type { WorkEventKind } from "@astra/sdk";
+import type { WorkEventKind, WorkEventRecordV1 } from "@astra/sdk";
 import { History } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { markWorkSeenAction } from "@/app/(workspace)/works/[workId]/actions";
 import { Card } from "@/components/ui/card";
-import type { WorkActivitySnapshot } from "@/lib/work-overview";
 
 const EVENT_LABELS: Record<WorkEventKind, string> = {
   work_created: "Work started",
@@ -32,54 +27,13 @@ const EVENT_LABELS: Record<WorkEventKind, string> = {
 
 export function WorkActivityCard({
   id,
-  workId,
-  activity,
+  events,
 }: {
   id?: string;
-  workId: string;
-  activity: WorkActivitySnapshot;
+  events: WorkEventRecordV1[];
 }) {
-  const attemptedHead = useRef(0);
-  const attemptedWorkId = useRef(workId);
-  const visibleWorkId = useRef(workId);
-  const [syncDeferred, setSyncDeferred] = useState(false);
-  const [visibleActivity, setVisibleActivity] = useState(activity);
-
-  useEffect(() => {
-    if (visibleWorkId.current !== workId) {
-      visibleWorkId.current = workId;
-      setVisibleActivity(activity);
-    } else if (activity.events.length > 0) {
-      // Keep the bounded updates on screen even after the read cursor is
-      // acknowledged.  A background page refresh must not make the update
-      // disappear before the user can read it.
-      setVisibleActivity(activity);
-    }
-  }, [activity, workId]);
-
-  useEffect(() => {
-    if (attemptedWorkId.current !== workId) {
-      attemptedWorkId.current = workId;
-      attemptedHead.current = 0;
-    }
-    if (
-      activity.unseenCount === 0 ||
-      attemptedHead.current >= activity.eventHead
-    ) {
-      return;
-    }
-    attemptedHead.current = activity.eventHead;
-    setSyncDeferred(false);
-    void markWorkSeenAction({
-      workId,
-      throughEventSeq: activity.eventHead,
-    })
-      .then((result) => setSyncDeferred(!result.ok))
-      .catch(() => setSyncDeferred(true));
-  }, [activity.eventHead, activity.unseenCount, workId]);
-
-  if (visibleActivity.events.length === 0) return null;
-  const hasUnseen = activity.unseenCount > 0;
+  if (events.length === 0) return null;
+  const truncated = events[0].event_seq > 1;
 
   return (
     <Card id={id} className="scroll-mt-6 overflow-hidden p-0">
@@ -88,28 +42,16 @@ export function WorkActivityCard({
           <History className="size-4" />
         </div>
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-semibold text-text">
-              {hasUnseen ? "Since your last visit" : "Recent activity"}
-            </h2>
-            <span className="text-xs tabular-nums text-text-muted">
-              {hasUnseen ? `${activity.unseenCount} new` : "Recorded here"}
-            </span>
-          </div>
-          {visibleActivity.truncated ? (
+          <h2 className="text-sm font-semibold text-text">Recent activity</h2>
+          {truncated ? (
             <p className="mt-1 text-xs leading-5 text-text-muted">
-              Showing the latest {activity.events.length} updates.
-            </p>
-          ) : null}
-          {syncDeferred ? (
-            <p className="mt-1 text-xs leading-5 text-text-muted">
-              Seen status will sync when the connection recovers.
+              Showing the latest {events.length} updates.
             </p>
           ) : null}
         </div>
       </div>
       <ol className="divide-y divide-border/60">
-        {[...visibleActivity.events].reverse().map((event) => (
+        {[...events].reverse().map((event) => (
           <li
             key={event.event_seq}
             className="flex items-center gap-3 px-5 py-3 text-sm"

@@ -92,10 +92,6 @@ export function workSessionBindingPath(sessionId: string): string {
   return `${PATH_WORKS}/session-bindings/${encodeURIComponent(sessionId)}`;
 }
 
-export function workReadCursorPath(workId: string): string {
-  return `${workPath(workId)}/read-cursor`;
-}
-
 export function workEventsPath(workId: string): string {
   return `${workPath(workId)}/events`;
 }

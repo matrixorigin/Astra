@@ -166,12 +166,9 @@ export function WorkOverviewPage({
   const [snapshot, setSnapshot] = useState(initial);
   const [turnActive, setTurnActive] = useState(false);
   const [branchActivity, setBranchActivity] = useState(initialActivity ?? null);
-  const [branchActivityHealth, setBranchActivityHealth] = useState<"live" | "delayed">(
-    initialActivity ? "live" : "delayed",
-  );
-  const [workEventsHealth, setWorkEventsHealth] = useState<"live" | "delayed" | "refreshing">(
-    "live",
-  );
+  const [workEventsHealth, setWorkEventsHealth] = useState<
+    "live" | "delayed" | "refreshing" | "unavailable"
+  >("live");
   const [expandedProposalId, setExpandedProposalId] = useState<string | null>(
     null,
   );
@@ -219,7 +216,6 @@ export function WorkOverviewPage({
 
   useEffect(() => {
     setBranchActivity(initialActivity ?? null);
-    setBranchActivityHealth(initialActivity ? "live" : "delayed");
   }, [initialActivity, workId, selectedBranchId]);
 
   useEffect(() => {
@@ -273,16 +269,16 @@ export function WorkOverviewPage({
 
   const overview = snapshot.report.overview;
   const branchId = selectedBranch.branch_id;
-  const currentActivity =
+  const currentObservation =
     branchActivity?.work_id === overview.work_id && branchActivity.branch_id === branchId
-      ? branchActivity.activity
+      ? branchActivity
       : null;
+  const currentActivity = currentObservation?.activity ?? null;
   const activityNeedsGraphRefresh =
     currentActivity === "working" || currentActivity === "waiting";
   const refreshWorkObservation = useCallback(async () => {
     const generation = ++observationGeneration.current;
     const markDelayed = () => {
-      setBranchActivityHealth("delayed");
       setWorkEventsHealth("delayed");
       return false;
     };
@@ -292,15 +288,19 @@ export function WorkOverviewPage({
         branchId: selectedBranchId,
       });
       if (generation !== observationGeneration.current) return true;
-      if (
-        !result.ok ||
-        result.activity.work_id !== workId ||
-        result.activity.branch_id !== selectedBranchId
-      ) {
+      if (!result.ok) {
+        if (result.status === 404 && result.code === "work_not_found" && !result.retryable) {
+          setBranchActivity(null);
+          setWorkEventsHealth("unavailable");
+          router.refresh();
+          return true;
+        }
+        return markDelayed();
+      }
+      if (result.activity.work_id !== workId || result.activity.branch_id !== selectedBranchId) {
         return markDelayed();
       }
       setBranchActivity(result.activity);
-      setBranchActivityHealth("live");
       const eventHead = result.activity.event_head;
       if (eventHead > eventHeadRef.current) {
         eventHeadRef.current = eventHead;
@@ -320,7 +320,7 @@ export function WorkOverviewPage({
   }, [router, selectedBranchId, workId]);
 
   useVisiblePoll({
-    enabled: true,
+    enabled: workEventsHealth !== "unavailable",
     intervalMs: turnActive || activityNeedsGraphRefresh
       ? ACTIVE_WORK_OBSERVATION_INTERVAL_MS
       : IDLE_WORK_OBSERVATION_INTERVAL_MS,
@@ -953,19 +953,15 @@ export function WorkOverviewPage({
               role="status"
               aria-live="polite"
             >
-              {currentActivity
-                ? branchActivityHealth === "live"
-                  ? `${branchActivityLabel(currentActivity)} · ${
-                      workEventsHealth === "refreshing"
-                        ? "new update received"
-                        : workEventsHealth === "live"
-                          ? "Live"
-                          : "updates delayed"
-                    }`
-                  : `Connection delayed · last confirmed ${branchActivityLabel(currentActivity)}`
+              {workEventsHealth === "unavailable"
+                ? "Branch unavailable · refreshing"
                 : workEventsHealth === "delayed"
-                  ? "Activity unavailable · reconnecting"
-                  : "Waiting for the first live update"}
+                  ? currentActivity
+                    ? `Connection delayed · last confirmed ${branchActivityLabel(currentActivity)}`
+                    : "Activity unavailable · reconnecting"
+                  : currentActivity
+                    ? `${branchActivityLabel(currentActivity)} · ${workEventsHealth === "refreshing" ? "new update received" : "Live"}`
+                    : "Waiting for the first live update"}
             </p>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-2">
@@ -1021,14 +1017,13 @@ export function WorkOverviewPage({
               id="work-plan"
               initial={snapshot.taskGraph}
               live={turnActive || activityNeedsGraphRefresh}
-              paused={currentActivity === "paused"}
+              pauseCursor={currentObservation?.pause_cursor}
               pollWhileIdle={false}
             />
 
             <WorkActivityCard
               id="work-activity"
-              workId={overview.work_id}
-              activity={snapshot.activity}
+              events={snapshot.activity}
             />
 
             <WorkRecoveryPointsCard points={recoveryPoints} />

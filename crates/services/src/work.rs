@@ -12,8 +12,6 @@ use thiserror::Error;
 mod acceptance;
 mod acceptance_repository;
 mod attempt_settlement;
-mod attention;
-mod attention_repository;
 mod basis;
 mod basis_repository;
 mod branch_catalog;
@@ -67,9 +65,6 @@ pub use attempt_settlement::{
     RecordedWorkAttemptSettlement, WorkAttemptBlockerKind, WorkAttemptExecutionMode,
     WorkAttemptOutcome, WorkAttemptSettlementError,
 };
-pub use attention::{
-    WorkAttentionCursorAdvance, WorkAttentionReceipt, WorkAttentionReceiptRevision,
-};
 pub use basis::WorkBranchBasisChange;
 pub use branch_catalog::{
     DatabaseWorkBranchCatalogService, WORK_ARCHIVED_BRANCH_PAGE_MAX_ITEMS,
@@ -103,8 +98,8 @@ pub use branch_retention::{
     WorkBranchRetentionReceipt,
 };
 pub use catalog::{
-    WORK_CATALOG_PAGE_MAX_ITEMS, WorkBranchActivity, WorkCatalogAttention, WorkCatalogCursor,
-    WorkCatalogEntry, WorkCatalogPage, WorkCatalogPageLimit, WorkCatalogQuery,
+    WORK_CATALOG_PAGE_MAX_ITEMS, WorkBranchActivity, WorkCatalogCursor, WorkCatalogEntry,
+    WorkCatalogPage, WorkCatalogPageLimit, WorkCatalogQuery,
 };
 pub use control_operation::{
     DatabaseWorkBranchControlService, WORK_BRANCH_CONTROL_OPERATION_SCHEMA_VERSION,
@@ -207,9 +202,6 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     current_goal_revision BIGINT NOT NULL,
     current_criteria_set_revision BIGINT NOT NULL,
     delivery_branch_id VARCHAR(64) NOT NULL,
-    seen_through_event_seq BIGINT NOT NULL DEFAULT 0,
-    receipt_revision BIGINT NOT NULL DEFAULT 1,
-    seen_updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     archived_at DATETIME(6) NULL,
@@ -220,8 +212,6 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     CONSTRAINT chk_works_revision CHECK (work_revision > 0),
     CONSTRAINT chk_works_goal_revision CHECK (current_goal_revision > 0),
     CONSTRAINT chk_works_criteria_revision CHECK (current_criteria_set_revision > 0),
-    CONSTRAINT chk_work_attention_revision CHECK (receipt_revision > 0),
-    CONSTRAINT chk_work_attention_seen_cursor CHECK (seen_through_event_seq >= 0),
     CONSTRAINT chk_works_archive_order CHECK (archived_at IS NULL OR archived_at >= created_at)
 )";
 

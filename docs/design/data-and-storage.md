@@ -223,11 +223,10 @@ delivery and usage records. Event identity collisions use the original
 event's hash and emit structured diagnostics. Fresh bootstrap declares
 106 tables.
 
-Fresh schema contract v130 stores the owner seen cursor on the Work root.
-The committed event head bounds each advance and event allocation has its own
-lock. Seen receipts derive their hash from the cursor. A duplicate advance
-uses one read and a new advance uses one conditional write with a committed
-receipt read. An event page at the head needs only its metadata read.
+Fresh schema contract v130 retires Work read receipts and attachment
+quarantines. Event pages read the current head, retention boundary, and
+bounded event slice together. Browsing Work uses read-only activity and
+event queries. The Work event sequence owns event allocation.
 An attachment with a divergent manifest returns
 `fork_required` directly from the manifest read. An explicit fork or a
 compatible attachment can then proceed through its normal authority checks.

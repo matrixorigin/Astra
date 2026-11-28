@@ -3,13 +3,13 @@ use super::{
     CriterionSetRevision, GoalRevision, GraphRevision, InternalSessionId,
     NewWorkAcceptanceDecision, NewWorkCheckRun, NewWorkPlanProposal, OriginalIntentRef, ProjectId,
     RecordedWorkAcceptanceDecision, RecordedWorkCheckRun, RecordedWorkPlanProposal,
-    WorkAttentionCursorAdvance, WorkAttentionReceipt, WorkBranchBasisChange, WorkBranchId,
-    WorkBranchRecord, WorkBranchRecordParts, WorkBranchRevision, WorkBranchSubject,
-    WorkBranchSubjectChange, WorkChangeReason, WorkChangeRef, WorkCriteriaChange, WorkDomainError,
-    WorkEventPage, WorkEventQuery, WorkGoal, WorkId, WorkItemRevisionRef, WorkObservationQuery,
-    WorkObservationReport, WorkOwnerId, WorkPlanContext, WorkPlanProposalAcceptance,
-    WorkProposalStatus, WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding,
-    WorkTaskExecutionSnapshot, WorkTaskGraphPage, WorkTaskGraphQuery,
+    WorkBranchBasisChange, WorkBranchId, WorkBranchRecord, WorkBranchRecordParts,
+    WorkBranchRevision, WorkBranchSubject, WorkBranchSubjectChange, WorkChangeReason,
+    WorkChangeRef, WorkCriteriaChange, WorkDomainError, WorkEventPage, WorkEventQuery, WorkGoal,
+    WorkId, WorkItemRevisionRef, WorkObservationQuery, WorkObservationReport, WorkOwnerId,
+    WorkPlanContext, WorkPlanProposalAcceptance, WorkProposalStatus, WorkRecord, WorkRecordParts,
+    WorkRevision, WorkSessionPlanBinding, WorkTaskExecutionSnapshot, WorkTaskGraphPage,
+    WorkTaskGraphQuery,
 };
 use astra_core::SharedPool;
 use async_trait::async_trait;
@@ -250,7 +250,7 @@ pub enum WorkRepositoryError {
     #[error("acceptance decision references missing verifier runs: {missing:?}")]
     MissingAcceptanceCheckRuns { missing: Vec<CheckRunId> },
     #[error(
-        "Work attention cursor {through_event_seq} is ahead of the committed event head {event_head}"
+        "Work event cursor {through_event_seq} is ahead of the committed event head {event_head}"
     )]
     EventCursorAhead {
         through_event_seq: i64,
@@ -589,11 +589,6 @@ pub trait WorkRepository: Send + Sync {
         &self,
         decision: NewWorkAcceptanceDecision,
     ) -> Result<RecordedWorkAcceptanceDecision, WorkRepositoryError>;
-
-    async fn advance_attention_cursor(
-        &self,
-        advance: WorkAttentionCursorAdvance,
-    ) -> Result<WorkAttentionReceipt, WorkRepositoryError>;
 
     async fn list_events(
         &self,
@@ -1973,13 +1968,6 @@ impl WorkRepository for DatabaseWorkRepository {
         decision: NewWorkAcceptanceDecision,
     ) -> Result<RecordedWorkAcceptanceDecision, WorkRepositoryError> {
         super::acceptance_repository::accept_gaps(self, decision).await
-    }
-
-    async fn advance_attention_cursor(
-        &self,
-        advance: WorkAttentionCursorAdvance,
-    ) -> Result<WorkAttentionReceipt, WorkRepositoryError> {
-        super::attention_repository::advance_cursor(self, advance).await
     }
 
     async fn list_events(

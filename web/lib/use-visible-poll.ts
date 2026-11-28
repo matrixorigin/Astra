@@ -7,17 +7,15 @@ type UseVisiblePollOptions = {
   intervalMs: number;
   maximumIntervalMs: number;
   immediate?: boolean;
-  once?: boolean;
   refresh: () => Promise<boolean>;
 };
 
-/** Run a sequential, jittered poll loop while visible, optionally stopping after success. */
+/** Run a sequential, jittered poll loop while visible. */
 export function useVisiblePoll({
   enabled,
   intervalMs,
   maximumIntervalMs,
   immediate = false,
-  once = false,
   refresh,
 }: UseVisiblePollOptions) {
   const refreshRef = useRef(refresh);
@@ -66,11 +64,6 @@ export function useVisiblePoll({
       }
       if (cancelled) return;
       if (succeeded) {
-        if (once) {
-          cancelled = true;
-          document.removeEventListener("visibilitychange", onVisibilityChange);
-          return;
-        }
         failures = 0;
         schedule(intervalMs);
       } else {
@@ -96,5 +89,5 @@ export function useVisiblePoll({
       clearTimer();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [enabled, immediate, intervalMs, maximumIntervalMs, once]);
+  }, [enabled, immediate, intervalMs, maximumIntervalMs]);
 }

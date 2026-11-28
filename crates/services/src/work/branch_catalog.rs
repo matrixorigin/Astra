@@ -75,6 +75,7 @@ pub struct WorkBranchActivityObservation {
     pub branch_revision: WorkBranchRevision,
     pub event_head: WorkEventSeq,
     pub activity: WorkBranchActivity,
+    pub pause_cursor: Option<String>,
     pub observed_at: DateTime<Utc>,
 }
 
@@ -244,6 +245,7 @@ impl DatabaseWorkBranchCatalogService {
                     es.last_event_seq,
                     active.run_id AS active_run_id,
                     active.status AS active_run_status,
+                    active.last_event_idx AS active_run_last_event_idx,
                     active.waiting_for AS active_run_waiting_for,
                     active.session_id AS active_run_session_id,
                     active.work_id AS active_run_work_id,
@@ -273,9 +275,9 @@ impl DatabaseWorkBranchCatalogService {
         .ok_or(WorkBranchCatalogError::NotFound)?;
 
         let branch_session_id = text(&row, "branch_session_id")?;
-        let activity = match optional_text(&row, "active_run_id")? {
-            None => WorkBranchActivity::Idle,
-            Some(_) => {
+        let (activity, pause_cursor) = match optional_text(&row, "active_run_id")? {
+            None => (WorkBranchActivity::Idle, None),
+            Some(run_id) => {
                 let active_run_status =
                     optional_text(&row, "active_run_status")?.ok_or_else(|| {
                         WorkBranchCatalogError::NeedsRepair(
@@ -294,7 +296,7 @@ impl DatabaseWorkBranchCatalogService {
                         "active root projection does not reference this branch's root Run".into(),
                     ));
                 }
-                activity_from_durable_run_status(
+                let activity = activity_from_durable_run_status(
                     &active_run_status,
                     optional_text(&row, "active_run_waiting_for")?.is_some(),
                 )
@@ -302,7 +304,16 @@ impl DatabaseWorkBranchCatalogService {
                     WorkBranchCatalogError::NeedsRepair(
                         "active root projection and durable Run status disagree".into(),
                     )
-                })?
+                })?;
+                let pause_cursor = if activity == WorkBranchActivity::Paused {
+                    let last_event_idx = integer(&row, "active_run_last_event_idx")?;
+                    Some(super::repository::content_hash(&format!(
+                        "{run_id}:{last_event_idx}"
+                    )))
+                } else {
+                    None
+                };
+                (activity, pause_cursor)
             }
         };
 
@@ -313,6 +324,7 @@ impl DatabaseWorkBranchCatalogService {
                 .map_err(repair)?,
             event_head: WorkEventSeq::new(integer(&row, "last_event_seq")?).map_err(repair)?,
             activity,
+            pause_cursor,
             observed_at: Utc::now(),
         })
     }

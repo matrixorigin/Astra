@@ -2995,21 +2995,9 @@ fn format_work_catalog_entry(entry: &astra_thin_client::WorkCatalogEntryV1) -> S
             entry.graph_item_count,
             if entry.graph_item_count == 1 { "" } else { "s" },
         )
-    } else if entry.unseen_event_count > 0 {
-        format!(
-            "{activity} · {} new update{} · {} task{}",
-            entry.unseen_event_count,
-            if entry.unseen_event_count == 1 {
-                ""
-            } else {
-                "s"
-            },
-            entry.graph_item_count,
-            if entry.graph_item_count == 1 { "" } else { "s" },
-        )
     } else {
         format!(
-            "{activity} · {} task{} · up to date",
+            "{activity} · {} task{}",
             entry.graph_item_count,
             if entry.graph_item_count == 1 { "" } else { "s" },
         )

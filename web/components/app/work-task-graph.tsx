@@ -43,7 +43,7 @@ type WorkTaskGraphProps = {
   id?: string;
   initial: WorkTaskGraphPageV2;
   live?: boolean;
-  paused?: boolean;
+  pauseCursor?: string | null;
   pollWhileIdle?: boolean;
 };
 
@@ -54,10 +54,14 @@ export function WorkTaskGraph({
   id,
   initial,
   live = false,
-  paused = false,
+  pauseCursor = null,
   pollWhileIdle = true,
 }: WorkTaskGraphProps) {
-  const [head, setHead] = useState(initial);
+  const [snapshot, setSnapshot] = useState<{
+    page: WorkTaskGraphPageV2;
+    pauseCursor: string | null;
+  }>({ page: initial, pauseCursor: null });
+  const head = snapshot.page;
   const [items, setItems] = useState(initial.items.entries);
   const [dependencies, setDependencies] = useState(initial.dependencies.entries);
   const [nextCursor, setNextCursor] = useState(initial.next_cursor);
@@ -68,7 +72,7 @@ export function WorkTaskGraph({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [recentlyChanged, setRecentlyChanged] = useState<Set<string>>(new Set());
   const [consumedCursors, setConsumedCursors] = useState<Set<string>>(new Set());
-  const headRef = useRef(initial);
+  const snapshotRef = useRef(snapshot);
   const selectedBranchKey = branchKey(initial);
   const selectedBranchKeyRef = useRef(selectedBranchKey);
   const selectionGeneration = useRef(0);
@@ -105,9 +109,9 @@ export function WorkTaskGraph({
 
   const graphKey = `${initial.basis.work_id}:${initial.basis.branch_id}:${initial.basis.graph_revision}:${initial.basis.graph_manifest_hash}`;
   useEffect(() => {
-    revealTaskChanges(headRef.current.items.entries, initial.items.entries);
-    headRef.current = initial;
-    setHead(initial);
+    revealTaskChanges(snapshotRef.current.page.items.entries, initial.items.entries);
+    snapshotRef.current = { page: initial, pauseCursor: null };
+    setSnapshot(snapshotRef.current);
     setItems(initial.items.entries);
     setDependencies(initial.dependencies.entries);
     setNextCursor(initial.next_cursor);
@@ -128,7 +132,11 @@ export function WorkTaskGraph({
 
   const refreshHead = useCallback(async () => {
     if (liveRefreshInFlight.current || pageLoadInFlight.current) return false;
-    const currentHead = headRef.current;
+    const current = snapshotRef.current;
+    const currentHead = current.page;
+    if (!live && !pollWhileIdle && pauseCursor === current.pauseCursor && !hasActiveAttempt(currentHead)) {
+      return true;
+    }
     const requestedBranchKey = branchKey(currentHead);
     if (requestedBranchKey !== selectedBranchKeyRef.current) return true;
     const requestedGeneration = selectionGeneration.current;
@@ -140,7 +148,8 @@ export function WorkTaskGraph({
       });
       if (
         requestedGeneration !== selectionGeneration.current ||
-        requestedBranchKey !== selectedBranchKeyRef.current
+        requestedBranchKey !== selectedBranchKeyRef.current ||
+        snapshotRef.current !== current
       ) {
         return true;
       }
@@ -160,42 +169,39 @@ export function WorkTaskGraph({
         setLiveError(true);
         return false;
       }
-      if (next.basis.graph_revision < currentHead.basis.graph_revision) return true;
-      if (next.basis.graph_revision > currentHead.basis.graph_revision) {
-        revealTaskChanges(currentHead.items.entries, next.items.entries);
-        headRef.current = next;
-        setHead(next);
+      if (next.basis.graph_revision < currentHead.basis.graph_revision) return false;
+      const graphReplaced = next.basis.graph_revision > currentHead.basis.graph_revision;
+      if (!graphReplaced && !sameGraph(currentHead, next)) {
+        liveFailureCount.current = 3;
+        setLiveError(true);
+        return false;
+      }
+      revealTaskChanges(currentHead.items.entries, next.items.entries);
+      snapshotRef.current = { page: next, pauseCursor };
+      setSnapshot(snapshotRef.current);
+      if (graphReplaced) {
         setItems(next.items.entries);
         setDependencies(next.dependencies.entries);
         setNextCursor(next.next_cursor);
         setConsumedCursors(new Set());
         setExpanded(new Set());
         setError(null);
-        liveFailureCount.current = 0;
-        setLiveError(false);
-        return true;
+      } else {
+        const refreshed = new Map(
+          next.items.entries.map((item) => [`${item.item_id}:${item.revision}`, item]),
+        );
+        setItems((current) =>
+          current.map((item) => refreshed.get(`${item.item_id}:${item.revision}`) ?? item),
+        );
       }
-      if (!sameGraph(currentHead, next)) {
-        liveFailureCount.current = 3;
-        setLiveError(true);
-        return false;
-      }
-      const refreshed = new Map(
-        next.items.entries.map((item) => [`${item.item_id}:${item.revision}`, item]),
-      );
-      revealTaskChanges(currentHead.items.entries, next.items.entries);
-      headRef.current = next;
-      setHead(next);
-      setItems((current) =>
-        current.map((item) => refreshed.get(`${item.item_id}:${item.revision}`) ?? item),
-      );
       liveFailureCount.current = 0;
       setLiveError(false);
       return true;
     } catch {
       if (
         requestedGeneration !== selectionGeneration.current ||
-        requestedBranchKey !== selectedBranchKeyRef.current
+        requestedBranchKey !== selectedBranchKeyRef.current ||
+        snapshotRef.current !== current
       ) {
         return true;
       }
@@ -205,21 +211,15 @@ export function WorkTaskGraph({
     } finally {
       liveRefreshInFlight.current = false;
     }
-  }, [revealTaskChanges]);
+  }, [live, pauseCursor, pollWhileIdle, revealTaskChanges]);
 
-  // The Run can become inactive before the displayed attempt transitions.
-  const hasActiveAttempt = head.items.entries.some(({ execution }) =>
-    execution.status === "running" || execution.status === "waiting",
-  );
-  const keepPolling = live || pollWhileIdle || hasActiveAttempt;
-  const readAfterPause = paused && !keepPolling &&
-    !head.items.entries.some(({ execution }) => execution.status === "paused");
+  const keepPolling = live || pollWhileIdle || hasActiveAttempt(head);
+  const readAfterPause = pauseCursor !== null && pauseCursor !== snapshot.pauseCursor;
   useVisiblePoll({
     enabled: keepPolling || readAfterPause,
     intervalMs: live || readAfterPause ? LIVE_REFRESH_INTERVAL_MS : QUIET_REFRESH_INTERVAL_MS,
     maximumIntervalMs: 120_000,
     immediate: live || readAfterPause,
-    once: readAfterPause,
     refresh: refreshHead,
   });
 
@@ -268,7 +268,7 @@ export function WorkTaskGraph({
         return;
       }
       const page = result.page;
-      const currentHead = headRef.current;
+      const currentHead = snapshotRef.current.page;
       if (
         requested.graph_revision !== currentHead.basis.graph_revision ||
         !sameGraph(currentHead, page)
@@ -659,6 +659,13 @@ function taskToneClasses(tone: WorkTaskTone): { dot: string; text: string } {
 
 function cursorKey(cursor: WorkTaskGraphCursorV1): string {
   return `${cursor.graph_revision}:${cursor.item_offset}:${cursor.dependency_offset}`;
+}
+
+// The Run can become inactive before the displayed attempt transitions.
+function hasActiveAttempt(page: WorkTaskGraphPageV2): boolean {
+  return page.items.entries.some(({ execution }) =>
+    execution.status === "running" || execution.status === "waiting",
+  );
 }
 
 function branchKey(page: WorkTaskGraphPageV2): string {

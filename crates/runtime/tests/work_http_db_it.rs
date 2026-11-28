@@ -1015,31 +1015,6 @@ async fn get_work_criteria(
     (status, value, length)
 }
 
-async fn put_read_cursor(
-    app: Router,
-    user_id: &str,
-    work_id: &str,
-    body_json: Value,
-) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .method("PUT")
-        .uri(format!("/v1/works/{work_id}/read-cursor"))
-        .header("authorization", format!("Bearer {user_id}"))
-        .header(WORK_API_MAJOR_HEADER, "1")
-        .header("content-type", "application/json")
-        .body(body::Body::from(
-            serde_json::to_vec(&body_json).expect("request JSON"),
-        ))
-        .expect("request");
-    let response = app.oneshot(request).await.expect("response");
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 8 * 1024)
-        .await
-        .expect("read-cursor response is bounded");
-    let value = serde_json::from_slice(&bytes).expect("JSON response");
-    (status, value)
-}
-
 async fn get_work_events(
     app: Router,
     user_id: &str,
@@ -1668,7 +1643,7 @@ async fn post_work_is_atomic_owner_scoped_and_exactly_idempotent_under_race() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
+async fn work_catalog_is_owner_scoped_and_projects_pending_decisions() {
     let Some((app, pool)) = setup().await else {
         return;
     };
@@ -1762,7 +1737,8 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
         .expect("delivery runtime binding");
     let active_run_id = id("catalog-active-run");
     let now = chrono::Utc::now().to_rfc3339();
-    DatabaseRunStateStore::new(pool.clone())
+    let run_store = DatabaseRunStateStore::new(pool.clone());
+    run_store
         .insert_run(DurableRunRecord {
             opening: Default::default(),
             opening_hash: None,
@@ -1818,10 +1794,9 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     assert!(first_bytes < 64 * 1024);
     assert_eq!(first["entries"].as_array().map(Vec::len), Some(1));
     assert_eq!(first["entries"][0]["work_id"], newer_id);
-    assert_eq!(first["entries"][0]["attention"], "needs_review");
     assert_eq!(first["entries"][0]["delivery_branch_activity"], "working");
     assert_eq!(first["entries"][0]["pending_decision_count"], 1);
-    assert_eq!(first["entries"][0]["unseen_event_count"], 2);
+    assert_eq!(first["entries"][0]["event_head"], 2);
     assert_field_absent(&first, "session_id");
     let cursor_time = first["next_cursor"]["created_at"]
         .as_str()
@@ -1846,15 +1821,62 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     assert_eq!(active["branch_revision"], 1);
     assert_eq!(active["event_head"], 2);
     assert_eq!(active["activity"], "working");
+    assert_eq!(active["pause_cursor"], Value::Null);
     assert!(active["observed_at"].as_str().is_some());
     assert_field_absent(&active, "session_id");
     assert_field_absent(&active, "run_id");
+
+    let mut previous_pause_cursor = None;
+    for expected_status in ["running", "paused", "running"] {
+        let pausing = expected_status == "running";
+        let (status, waiting_for, event_type) = if pausing {
+            ("paused", Some("user_resume"), "run_paused")
+        } else {
+            ("running", None, "run_resumed")
+        };
+        assert!(
+            run_store
+                .update_run_status_with_events_if_current(
+                    &owner_id,
+                    binding.session_id.as_str(),
+                    &active_run_id,
+                    &[expected_status],
+                    None,
+                    status,
+                    waiting_for,
+                    None,
+                    &[serde_json::json!({"event_type": event_type, "data": {}})],
+                )
+                .await
+                .expect("persist Run transition")
+        );
+        if !pausing {
+            continue;
+        }
+        let (status, paused, _) =
+            get_work_branch_activity(app.clone(), &owner_id, newer_id, newer_branch).await;
+        assert_eq!(status, StatusCode::OK, "activity: {paused}");
+        assert_eq!(paused["activity"], "paused");
+        assert_eq!(paused["event_head"], active["event_head"]);
+        let pause_cursor = paused["pause_cursor"]
+            .as_str()
+            .expect("opaque pause cursor");
+        WorkContentHash::parse(pause_cursor).expect("canonical pause cursor");
+        assert_ne!(previous_pause_cursor.as_deref(), Some(pause_cursor));
+        previous_pause_cursor = Some(pause_cursor.to_owned());
+        let (status, observed_again, _) =
+            get_work_branch_activity(app.clone(), &owner_id, newer_id, newer_branch).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(observed_again["pause_cursor"], paused["pause_cursor"]);
+        assert_field_absent(&paused, "run_id");
+    }
 
     let (idle_status, idle, idle_bytes) =
         get_work_branch_activity(app.clone(), &owner_id, older_id, older_branch).await;
     assert_eq!(idle_status, StatusCode::OK, "activity: {idle}");
     assert!(idle_bytes < 4 * 1024);
     assert_eq!(idle["activity"], "idle");
+    assert_eq!(idle["pause_cursor"], Value::Null);
     assert_eq!(idle["event_head"], 1);
     assert_eq!(idle["work_id"], older_id);
     assert_eq!(idle["branch_id"], older_branch);
@@ -3970,6 +3992,11 @@ async fn work_fork_is_exact_durable_owner_scoped_and_preserves_a_retained_prefix
     .await;
     assert_eq!(archive_replay_status, StatusCode::OK);
     assert_eq!(archive_replay, archived);
+    let (activity_status, activity, _) =
+        get_work_branch_activity(app.clone(), &owner_id, work_id, origin_branch_id).await;
+    assert_eq!(activity_status, StatusCode::NOT_FOUND);
+    assert_eq!(activity["code"], "work_not_found");
+    assert_eq!(activity["retryable"], false);
     let (_, archived_catalog, _) = get_work_branches(app.clone(), &owner_id, work_id).await;
     assert_eq!(archived_catalog["work_revision"], 3);
     assert_eq!(archived_catalog["branches"].as_array().unwrap().len(), 1);
@@ -5841,7 +5868,7 @@ async fn work_branch_deletion_is_terminal_owner_scoped_and_delivery_safe() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
+async fn work_event_page_is_bounded_owner_scoped_and_conflict_typed() {
     let Some((app, pool)) = setup().await else {
         return;
     };
@@ -5859,7 +5886,7 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
                 session_id: InternalSessionId::parse(id("session")).expect("session"),
                 project_id: None,
                 original_intent_ref: OriginalIntentRef::parse(id("intent")).expect("intent"),
-                goal: WorkGoal::parse("Persist one exact user read watermark.").expect("goal"),
+                goal: WorkGoal::parse("Read the bounded semantic timeline.").expect("goal"),
                 criteria: Vec::new(),
             })
             .expect("Work genesis"),
@@ -5867,33 +5894,12 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
         .await
         .expect("genesis");
 
-    let (status, receipt) = put_read_cursor(
-        app.clone(),
-        &owner_id,
-        &work_id,
-        serde_json::json!({"through_event_seq": 1}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {receipt}");
-    assert_eq!(receipt["schema_version"], 1);
-    assert_eq!(receipt["work_id"], work_id);
-    assert_eq!(receipt["through_event_seq"], 1);
-    assert_eq!(receipt["receipt_revision"], 2);
-    assert!(
-        receipt["receipt_hash"]
-            .as_str()
-            .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71)
-    );
-    assert!(receipt.get("owner_id").is_none());
-    assert!(receipt.get("delivered_through_event_seq").is_none());
-
     let (events_status, events, events_length) =
         get_work_events(app.clone(), &owner_id, &work_id, "?limit=1").await;
     assert_eq!(events_status, StatusCode::OK, "body: {events}");
     assert!(events_length < 64 * 1024);
     assert_eq!(events["schema_version"], 1);
     assert_eq!(events["event_head"], 1);
-    assert_eq!(events["seen_through_event_seq"], 1);
     assert_eq!(events["coverage"], "complete");
     assert_eq!(events["events"][0]["kind"], "work_created");
     assert!(events["events"][0].get("session_id").is_none());
@@ -5901,37 +5907,17 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
         get_work_events(app.clone(), &owner_id, &work_id, "?after_event_seq=2").await;
     assert_eq!(future_events_status, StatusCode::CONFLICT);
     assert_eq!(future_events["code"], "work_event_cursor_ahead");
+    assert_eq!(
+        future_events["action_hints"],
+        serde_json::json!(["refresh_work"])
+    );
+    let (current_status, current, _) =
+        get_work_events(app.clone(), &owner_id, &work_id, "?after_event_seq=1").await;
+    assert_eq!(current_status, StatusCode::OK);
+    assert_eq!(current["events"], serde_json::json!([]));
+    assert_eq!(current["has_more"], false);
+    assert_eq!(current["coverage"], "complete");
 
-    let (replay_status, replay) = put_read_cursor(
-        app.clone(),
-        &owner_id,
-        &work_id,
-        serde_json::json!({"through_event_seq": 1}),
-    )
-    .await;
-    assert_eq!(replay_status, StatusCode::OK);
-    assert_eq!(replay, receipt, "exact PUT replay must return one receipt");
-
-    let (future_status, future) = put_read_cursor(
-        app.clone(),
-        &owner_id,
-        &work_id,
-        serde_json::json!({"through_event_seq": 2}),
-    )
-    .await;
-    assert_eq!(future_status, StatusCode::CONFLICT);
-    assert_eq!(future["code"], "work_event_cursor_ahead");
-    assert_eq!(future["action_hints"], serde_json::json!(["refresh_work"]));
-
-    let (foreign_status, foreign) = put_read_cursor(
-        app.clone(),
-        &other_owner_id,
-        &work_id,
-        serde_json::json!({"through_event_seq": 1}),
-    )
-    .await;
-    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
-    assert_eq!(foreign["code"], "work_not_found");
     let (foreign_events_status, foreign_events, _) =
         get_work_events(app.clone(), &other_owner_id, &work_id, "").await;
     assert_eq!(foreign_events_status, StatusCode::NOT_FOUND);
@@ -5942,40 +5928,14 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
     assert_eq!(limit_status, StatusCode::BAD_REQUEST);
     assert_eq!(limit_error["code"], "invalid_work_event_limit");
 
-    let (unknown_status, unknown) = put_read_cursor(
-        app.clone(),
-        &owner_id,
-        &work_id,
-        serde_json::json!({"through_event_seq": 1, "session_id": "legacy"}),
-    )
-    .await;
+    let (unknown_status, unknown, _) =
+        get_work_events(app.clone(), &owner_id, &work_id, "?session_id=legacy").await;
     assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
-    assert_eq!(unknown["code"], "invalid_work_read_cursor_request");
-    let (zero_status, zero) = put_read_cursor(
-        app,
-        &owner_id,
-        &work_id,
-        serde_json::json!({"through_event_seq": 0}),
-    )
-    .await;
+    assert_eq!(unknown["code"], "invalid_work_event_query");
+    let (zero_status, zero, _) =
+        get_work_events(app, &owner_id, &work_id, "?after_event_seq=0").await;
     assert_eq!(zero_status, StatusCode::BAD_REQUEST);
     assert_eq!(zero["code"], "invalid_work_event_cursor");
-
-    let stored_revision = sqlx::query(
-        "SELECT receipt_revision FROM works
-         WHERE owner_id = ? AND work_id = ?",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("stored read receipt")
-    .try_get::<i64, _>("receipt_revision")
-    .expect("receipt revision");
-    assert_eq!(
-        stored_revision, 2,
-        "replay and rejected requests must not mutate the receipt"
-    );
 
     cleanup_owner(&pool, &owner_id).await;
     cleanup_owner(&pool, &other_owner_id).await;

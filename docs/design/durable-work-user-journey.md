@@ -280,11 +280,13 @@ detail page reads the selected branch's root Run activity and its Work's event
 head in one request. It checks about every two seconds while active and every
 ten seconds while idle. A Run started from another surface is visible through
 the same read, and a newer event head triggers a bounded snapshot refresh.
-The read-cursor endpoint advances the owner seen cursor on the Work root up to
-the committed event head. The latest `/now` page refreshes its first
-20-entry keyset page about every 10 seconds. Work detail refreshes its task
-graph while the Run is active. A pause without an observed attempt triggers
-one graph reconciliation. When the Run becomes inactive, an observed running
+The detail snapshot reads up to 12 recent semantic events in one bounded
+request. The latest `/now` page refreshes its first 20-entry keyset page about
+every 10 seconds and groups pending decisions using their count. Work detail
+refreshes its task graph while the Run is active. A newly observed Run pause
+position triggers one graph reconciliation, even when the Work event head
+stays the same. If another client archives the selected branch, the page
+refreshes the route and stops observing the old branch. When the Run becomes inactive, an observed running
 or waiting attempt still gets a quiet reconciliation read every 30 seconds
 until its state catches up. Quiescent detail views use the Work
 event head to invalidate the snapshot. Hidden tabs pause refresh. Each visible
@@ -461,9 +463,9 @@ until that execution has settled.
   while visible. Opening a Work loads bounded, revision-pinned Server
   projections, attaches a read-only branch view, and reads the selected
   branch's authoritative activity. Visible Work pages discover remote Run
-  activity with an owner-scoped single-branch read about every 1.2 seconds;
-  active task graphs refresh their first bounded page every 2 seconds even for
-  TUI-originated Runs. Both
+  activity with an owner-scoped single-branch read about every 2 seconds while
+  active and every 10 seconds while idle. Active task graphs refresh their
+  first bounded page about every 2 seconds even for TUI-originated Runs. Both
   loops pause in hidden tabs, add jitter, back off after errors, and avoid
   overlapping requests. The Web page uses one stable read-attachment identity
   per browser instance and Work/branch, and renews it on projection refresh, so

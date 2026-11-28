@@ -3160,7 +3160,6 @@ fn attachment_filename(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::WorkCatalogAttentionV1;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3512,9 +3511,6 @@ mod tests {
                     "graph_item_count": 2,
                     "pending_decision_count": 0,
                     "event_head": 5,
-                    "seen_through_event_seq": 4,
-                    "unseen_event_count": 1,
-                    "attention": "updated",
                     "delivery_branch_activity": "working",
                     "created_at": "2026-08-02T00:00:00Z",
                     "last_activity_at": "2026-08-02T00:01:00Z"
@@ -3529,9 +3525,6 @@ mod tests {
                     "graph_item_count": 1,
                     "pending_decision_count": 1,
                     "event_head": 1,
-                    "seen_through_event_seq": 1,
-                    "unseen_event_count": 0,
-                    "attention": "needs_review",
                     "delivery_branch_activity": "idle",
                     "created_at": "2026-08-01T00:00:00Z",
                     "last_activity_at": "2026-08-01T00:02:00Z"
@@ -3548,10 +3541,7 @@ mod tests {
         let page = client.list_works("work-token", None, 2).await.unwrap();
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].work_id, "work-2");
-        assert_eq!(
-            page.entries[1].attention,
-            WorkCatalogAttentionV1::NeedsReview
-        );
+        assert_eq!(page.entries[1].pending_decision_count, 1);
         assert_eq!(page.next_cursor.as_ref().unwrap().work_id, "work-1");
     }
 
@@ -3696,6 +3686,7 @@ mod tests {
                 "branch_revision": 3,
                 "event_head": 7,
                 "activity": "working",
+                "pause_cursor": null,
                 "observed_at": "2026-09-15T00:00:00Z"
             })))
             .mount(&srv)

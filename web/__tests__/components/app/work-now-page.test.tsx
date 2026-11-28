@@ -23,9 +23,6 @@ const page: WorkCatalogPageV1 = {
       graph_item_count: 3,
       pending_decision_count: 1,
       event_head: 4,
-      seen_through_event_seq: 3,
-      unseen_event_count: 1,
-      attention: "needs_review",
       delivery_branch_activity: "waiting",
       created_at: "2026-08-01T02:00:00Z",
       last_activity_at: "2026-08-01T02:01:00Z",
@@ -40,9 +37,6 @@ const page: WorkCatalogPageV1 = {
       graph_item_count: 1,
       pending_decision_count: 0,
       event_head: 2,
-      seen_through_event_seq: null,
-      unseen_event_count: 2,
-      attention: "updated",
       delivery_branch_activity: "working",
       created_at: "2026-08-01T01:00:00Z",
       last_activity_at: "2026-08-01T01:01:00Z",
@@ -57,9 +51,6 @@ const page: WorkCatalogPageV1 = {
       graph_item_count: 2,
       pending_decision_count: 0,
       event_head: 3,
-      seen_through_event_seq: 3,
-      unseen_event_count: 0,
-      attention: "none",
       delivery_branch_activity: "idle",
       created_at: "2026-08-01T00:00:00Z",
       last_activity_at: "2026-08-01T00:01:00Z",
@@ -76,16 +67,16 @@ beforeEach(() => {
   refreshNow.mockResolvedValue({ ok: true, page });
 });
 
-test("groups Work by server-owned attention without exposing runtime identity", () => {
+test("groups Work by pending decisions without exposing runtime identity", () => {
   render(<WorkNowPage page={page} isLatest />);
 
   const needsDecision = screen.getByRole("region", { name: "Needs your review" });
   expect(within(needsDecision).getByText("Review the proposed completion contract")).toBeVisible();
   expect(within(needsDecision).getByText(/1 to review/)).toBeVisible();
-  expect(screen.getByRole("region", { name: "New activity" })).toHaveTextContent("2 new");
-  expect(screen.getByRole("region", { name: "New activity" })).toHaveTextContent("Working");
+  const recent = screen.getByRole("region", { name: "Recent work" });
+  expect(recent).toHaveTextContent("Working");
   expect(needsDecision).toHaveTextContent("Waiting");
-  expect(screen.getByRole("region", { name: "No action needed" })).toHaveTextContent("up to date");
+  expect(recent).toHaveTextContent("Idle");
   expect(screen.queryByText(/session-/i)).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: /older work/i })).toHaveAttribute(
     "href",
