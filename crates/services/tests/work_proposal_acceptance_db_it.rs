@@ -341,6 +341,7 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         .as_ref()
         .and_then(|resolution| resolution.result_graph_revision)
         .expect("replan graph revision");
+    let successor_revision = result_graph_revision.get();
 
     let revisions = sqlx::query(
         "SELECT item_id, revision, objective, declaration_state
@@ -360,9 +361,9 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         .iter()
         .find(|row| {
             row.try_get::<String, _>("item_id").unwrap() == task_a
-                && row.try_get::<i64, _>("revision").unwrap() == 2
+                && row.try_get::<i64, _>("revision").unwrap() == successor_revision
         })
-        .expect("task A revision 2");
+        .expect("task A successor at the accepted graph revision");
     assert_eq!(
         revised_a.try_get::<String, _>("objective").unwrap(),
         revised_a_objective
@@ -371,9 +372,9 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         .iter()
         .find(|row| {
             row.try_get::<String, _>("item_id").unwrap() == task_b
-                && row.try_get::<i64, _>("revision").unwrap() == 2
+                && row.try_get::<i64, _>("revision").unwrap() == successor_revision
         })
-        .expect("task B revision 2");
+        .expect("task B successor at the accepted graph revision");
     assert_eq!(
         cancelled_b
             .try_get::<String, _>("declaration_state")
@@ -388,7 +389,7 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
     )
     .bind(&owner_id)
     .bind(&work_id)
-    .bind(result_graph_revision.get())
+    .bind(successor_revision)
     .fetch_one(pool.get())
     .await
     .expect("replanned graph");
@@ -403,14 +404,14 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| { item["item_id"] == task_a && item["revision"] == 2 })
+            .any(|item| { item["item_id"] == task_a && item["revision"] == successor_revision })
     );
     assert!(
         manifest
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| { item["item_id"] == task_b && item["revision"] == 2 })
+            .any(|item| { item["item_id"] == task_b && item["revision"] == successor_revision })
     );
     assert_eq!(graph.try_get::<i64, _>("edge_count").unwrap(), 0);
     assert_eq!(

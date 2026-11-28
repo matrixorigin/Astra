@@ -1732,15 +1732,19 @@ mod tests {
         let accepted_replan: Value =
             serde_json::from_str(&accepted_replan.output).expect("accepted replan");
         assert_eq!(accepted_replan["status"], "accepted");
+        let result_graph_revision = accepted_replan["result_graph_revision"]
+            .as_i64()
+            .expect("accepted replan graph revision");
         let replanned = inspect(&executor, &json!({}), None).await;
         let replanned: Value = serde_json::from_str(&replanned.output).expect("replanned context");
+        assert_eq!(replanned["basis"]["graph_revision"], result_graph_revision);
         let obsolete = replanned["items"]["entries"]
             .as_array()
             .expect("replanned items")
             .iter()
             .find(|item| item["item_id"] == "task-needs-review")
             .expect("revised prerequisite");
-        assert_eq!(obsolete["revision"], 2);
+        assert_eq!(obsolete["revision"], result_graph_revision);
         assert_eq!(obsolete["declaration_state"], "cancelled");
         assert!(
             replanned["dependencies"]["entries"]
