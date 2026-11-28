@@ -31,6 +31,7 @@ import {
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import {
   classifyWorkActionError,
+  WORK_OBSERVATION_TIMEOUT_MS,
   type WorkActionError,
 } from "@/lib/work-action-error";
 import {
@@ -213,12 +214,9 @@ export async function respondWorkBranchInteractionAction(
   }
 }
 
-type RefreshWorkBranchInteractionsInput = { workId: string; branchId: string };
+type WorkBranchIdentityInput = { workId: string; branchId: string };
 
-function validRefreshWorkBranchInteractionsInput(
-  input: RefreshWorkBranchInteractionsInput,
-): boolean {
-  const value = input as unknown;
+function validWorkBranchIdentity(value: unknown): value is WorkBranchIdentityInput {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const object = value as Record<string, unknown>;
   return (
@@ -230,9 +228,9 @@ function validRefreshWorkBranchInteractionsInput(
 
 /** Read the current pending Work interaction without acquiring control. */
 export async function refreshWorkBranchInteractionsAction(
-  input: RefreshWorkBranchInteractionsInput,
+  input: WorkBranchIdentityInput,
 ): Promise<RefreshWorkBranchInteractionsResult> {
-  if (!validRefreshWorkBranchInteractionsInput(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return {
       ok: false,
       status: 400,
@@ -247,7 +245,9 @@ export async function refreshWorkBranchInteractionsAction(
     });
     return {
       ok: true,
-      page: await runtime.sdk.getWorkBranchInteractions(input.workId, input.branchId),
+      page: await runtime.sdk.getWorkBranchInteractions(input.workId, input.branchId, {
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
+      }),
     };
   } catch (error) {
     const known = classifyWorkActionError(error);
@@ -256,29 +256,11 @@ export async function refreshWorkBranchInteractionsAction(
   }
 }
 
-type RefreshWorkBranchActivityInput = {
-  workId: string;
-  branchId: string;
-};
-
-function validWorkBranchActivityInput(
-  input: RefreshWorkBranchActivityInput,
-): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    canonicalWorkIdentity(object.branchId)
-  );
-}
-
 /** Read the current branch's server-owned Run activity without acquiring control. */
 export async function refreshWorkBranchActivityAction(
-  input: RefreshWorkBranchActivityInput,
+  input: WorkBranchIdentityInput,
 ): Promise<RefreshWorkBranchActivityResult> {
-  if (!validWorkBranchActivityInput(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return {
       ok: false,
       status: 400,
@@ -293,7 +275,9 @@ export async function refreshWorkBranchActivityAction(
     });
     return {
       ok: true,
-      activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId),
+      activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId, {
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
+      }),
     };
   } catch (error) {
     const known = classifyWorkActionError(error);
@@ -302,24 +286,11 @@ export async function refreshWorkBranchActivityAction(
   }
 }
 
-type WorkExecutionIdentityInput = { workId: string; branchId: string };
-
-function validWorkExecutionIdentity(input: WorkExecutionIdentityInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    canonicalWorkIdentity(object.branchId)
-  );
-}
-
 /** Read the authoritative provider/generation without acquiring control. */
 export async function loadWorkExecutionAction(
-  input: WorkExecutionIdentityInput,
+  input: WorkBranchIdentityInput,
 ): Promise<LoadWorkExecutionResult> {
-  if (!validWorkExecutionIdentity(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return { ok: false, status: 400, code: "invalid_work_execution_query", retryable: false };
   }
   try {
@@ -340,9 +311,9 @@ export async function loadWorkExecutionAction(
 
 /** Read the bounded owner-scoped Edge target directory on demand. */
 export async function loadWorkExecutionTargetsAction(
-  input: WorkExecutionIdentityInput,
+  input: WorkBranchIdentityInput,
 ): Promise<LoadWorkExecutionTargetsResult> {
-  if (!validWorkExecutionIdentity(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return { ok: false, status: 400, code: "invalid_work_execution_query", retryable: false };
   }
   try {
@@ -361,7 +332,7 @@ export async function loadWorkExecutionTargetsAction(
   }
 }
 
-type SwitchWorkExecutionInput = WorkExecutionIdentityInput & {
+type SwitchWorkExecutionInput = WorkBranchIdentityInput & {
   requestId: string;
   attachmentId: string;
   expectedGeneration: number;
@@ -416,7 +387,7 @@ export async function switchWorkExecutionAction(
   }
 }
 
-type WorkExecutionSwitchIdentityInput = WorkExecutionIdentityInput & {
+type WorkExecutionSwitchIdentityInput = WorkBranchIdentityInput & {
   operationId: string;
 };
 
@@ -505,27 +476,11 @@ export async function retryWorkExecutionSwitchAction(
   }
 }
 
-type RefreshWorkTaskGraphInput = {
-  workId: string;
-  branchId: string;
-};
-
-function validTaskGraphIdentity(input: RefreshWorkTaskGraphInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    canonicalWorkIdentity(object.branchId)
-  );
-}
-
 /** Read only the bounded Task Graph head used for active-run visualization. */
 export async function refreshWorkTaskGraphAction(
-  input: RefreshWorkTaskGraphInput,
+  input: WorkBranchIdentityInput,
 ): Promise<RefreshWorkTaskGraphResult> {
-  if (!validTaskGraphIdentity(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return {
       ok: false,
       status: 400,
@@ -543,6 +498,7 @@ export async function refreshWorkTaskGraphAction(
       page: await runtime.sdk.getWorkTaskGraph(input.workId, input.branchId, {
         itemLimit: 8,
         dependencyLimit: 128,
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
       }),
     };
   } catch (error) {
@@ -610,6 +566,7 @@ export async function loadWorkTaskGraphPageAction(
         cursor: input.cursor,
         itemLimit: 8,
         dependencyLimit: 128,
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
       }),
     };
   } catch (error) {

@@ -280,7 +280,7 @@ export function WorkOverviewPage({
   const activityNeedsGraphRefresh =
     currentActivity === "working" || currentActivity === "waiting";
   const refreshWorkObservation = useCallback(async () => {
-    const generation = observationGeneration.current;
+    const generation = ++observationGeneration.current;
     const markDelayed = () => {
       setBranchActivityHealth("delayed");
       setWorkEventsHealth("delayed");
@@ -1017,9 +1017,11 @@ export function WorkOverviewPage({
         <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0 space-y-6">
             <WorkTaskGraph
+              key={JSON.stringify([overview.work_id, snapshot.taskGraph.basis.branch_id])}
               id="work-plan"
               initial={snapshot.taskGraph}
               live={turnActive || activityNeedsGraphRefresh}
+              paused={currentActivity === "paused"}
               pollWhileIdle={false}
             />
 

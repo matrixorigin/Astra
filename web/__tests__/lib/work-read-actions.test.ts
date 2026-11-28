@@ -66,6 +66,7 @@ test("loads one exact revision-pinned Task Graph continuation", async () => {
     cursor,
     itemLimit: 8,
     dependencyLimit: 128,
+    signal: expect.any(AbortSignal),
   });
 });
 
@@ -80,7 +81,28 @@ test("refreshes only the bounded current Task Graph head", async () => {
   expect(getWorkTaskGraph).toHaveBeenCalledWith("work-1", "branch-1", {
     itemLimit: 8,
     dependencyLimit: 128,
+    signal: expect.any(AbortSignal),
   });
+});
+
+test("reports an expired Work observation as a retryable read failure", async () => {
+  const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(
+    AbortSignal.abort(new DOMException("Deadline exceeded", "TimeoutError")),
+  );
+  const getWorkTaskGraph = vi.fn(async (_, __, { signal }: { signal: AbortSignal }) => {
+    signal.throwIfAborted();
+  });
+  requireClient.mockResolvedValue({ sdk: { getWorkTaskGraph } } as never);
+  try {
+    await expect(
+      refreshWorkTaskGraphAction({ workId: "work-1", branchId: "branch-1" }),
+    ).resolves.toEqual({
+      ok: false, status: 504, code: "work_observation_timeout", retryable: true,
+    });
+    expect(getWorkTaskGraph).toHaveBeenCalledTimes(1);
+  } finally {
+    timeout.mockRestore();
+  }
 });
 
 test("rejects an ambiguous live Task Graph identity before I/O", async () => {

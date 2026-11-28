@@ -2186,7 +2186,7 @@ async fn verify_work_canonical_schema(
         ),
         ("work_events", &["payload_hash"]),
         (
-            "work_event_sequences",
+            "works",
             &[
                 "seen_through_event_seq",
                 "receipt_revision",

@@ -207,6 +207,9 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     current_goal_revision BIGINT NOT NULL,
     current_criteria_set_revision BIGINT NOT NULL,
     delivery_branch_id VARCHAR(64) NOT NULL,
+    seen_through_event_seq BIGINT NOT NULL DEFAULT 0,
+    receipt_revision BIGINT NOT NULL DEFAULT 1,
+    seen_updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     archived_at DATETIME(6) NULL,
@@ -217,6 +220,8 @@ pub(crate) const WORKS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS works (
     CONSTRAINT chk_works_revision CHECK (work_revision > 0),
     CONSTRAINT chk_works_goal_revision CHECK (current_goal_revision > 0),
     CONSTRAINT chk_works_criteria_revision CHECK (current_criteria_set_revision > 0),
+    CONSTRAINT chk_work_attention_revision CHECK (receipt_revision > 0),
+    CONSTRAINT chk_work_attention_seen_cursor CHECK (seen_through_event_seq >= 0),
     CONSTRAINT chk_works_archive_order CHECK (archived_at IS NULL OR archived_at >= created_at)
 )";
 
@@ -882,16 +887,9 @@ pub(crate) const WORK_EVENT_SEQUENCES_CREATE_SQL: &str =
     work_id VARCHAR(64) NOT NULL,
     last_event_seq BIGINT NOT NULL,
     retained_from_event_seq BIGINT NOT NULL,
-    seen_through_event_seq BIGINT NOT NULL DEFAULT 0,
-    receipt_revision BIGINT NOT NULL DEFAULT 1,
-    seen_updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (owner_id, work_id),
     CONSTRAINT chk_work_event_sequence CHECK (last_event_seq > 0),
-    CONSTRAINT chk_work_attention_revision CHECK (receipt_revision > 0),
-    CONSTRAINT chk_work_attention_seen_cursor CHECK (
-        seen_through_event_seq >= 0 AND seen_through_event_seq <= last_event_seq
-    ),
     CONSTRAINT chk_work_event_retention CHECK (
         retained_from_event_seq > 0 AND retained_from_event_seq <= last_event_seq
     )

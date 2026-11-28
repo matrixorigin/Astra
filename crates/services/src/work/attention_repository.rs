@@ -2,10 +2,10 @@ use super::attention::{
     WorkAttentionCursorAdvance, WorkAttentionReceipt, WorkAttentionReceiptRevision,
 };
 use super::events::WorkEventSeq;
-use super::repository::{DatabaseWorkRepository, WorkRepositoryError, rollback_transaction};
+use super::repository::{DatabaseWorkRepository, WorkRepositoryError};
 use super::{WorkContentHash, WorkId, WorkOwnerId};
 use serde::Serialize;
-use sqlx::{MySql, query, query_as};
+use sqlx::{MySqlConnection, query, query_as};
 
 #[derive(Serialize)]
 struct ReceiptHashInput<'a> {
@@ -28,7 +28,10 @@ pub(super) async fn advance_cursor(
     repository: &DatabaseWorkRepository,
     advance: WorkAttentionCursorAdvance,
 ) -> Result<WorkAttentionReceipt, WorkRepositoryError> {
-    let cursor = load_cursor(repository.pool.get(), &advance).await?;
+    let mut connection = repository.pool.get().acquire().await.map_err(|source| {
+        WorkRepositoryError::persistence("acquire Work attention connection", source)
+    })?;
+    let cursor = load_cursor(&mut connection, &advance).await?;
     let through = advance.through_event_seq.get();
     if through > cursor.last_event_seq {
         return Err(WorkRepositoryError::EventCursorAhead {
@@ -36,67 +39,50 @@ pub(super) async fn advance_cursor(
             event_head: cursor.last_event_seq,
         });
     }
-    // Already observed cursors never need a transaction or a write lock.
     if cursor.seen_through_event_seq >= through {
         return receipt(&advance, cursor);
     }
 
-    let mut transaction = repository.pool.get().begin().await.map_err(|source| {
-        WorkRepositoryError::persistence("begin Work attention cursor transaction", source)
-    })?;
-    let result = async {
-        query(
-            "UPDATE work_event_sequences
-             SET seen_through_event_seq = ?, receipt_revision = receipt_revision + 1,
-                 seen_updated_at = NOW(6)
-             WHERE owner_id = ? AND work_id = ? AND seen_through_event_seq < ?
-               AND receipt_revision < ?",
-        )
-        .bind(through)
-        .bind(advance.owner_id.as_str())
-        .bind(advance.work_id.as_str())
-        .bind(through)
-        .bind(i64::MAX)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("advance Work attention cursor", source)
-        })?;
-        let cursor = load_cursor(&mut *transaction, &advance).await?;
-        if cursor.seen_through_event_seq < through {
-            return Err(WorkRepositoryError::corrupt(
-                "Work attention receipt",
-                std::io::Error::other("receipt revision is exhausted before the requested cursor"),
-            ));
-        }
-        receipt(&advance, cursor)
+    // The committed event head is monotonic. Compare and advance with one
+    // write, then read the current receipt without holding the Work row.
+    query(
+        "UPDATE works
+         SET seen_through_event_seq = ?, receipt_revision = receipt_revision + 1,
+             seen_updated_at = NOW(6)
+         WHERE owner_id = ? AND work_id = ? AND seen_through_event_seq < ?
+           AND receipt_revision < ?",
+    )
+    .bind(through)
+    .bind(advance.owner_id.as_str())
+    .bind(advance.work_id.as_str())
+    .bind(through)
+    .bind(i64::MAX)
+    .execute(&mut *connection)
+    .await
+    .map_err(|source| WorkRepositoryError::persistence("advance Work attention cursor", source))?;
+    let cursor = load_cursor(&mut connection, &advance).await?;
+    if cursor.seen_through_event_seq < through {
+        return Err(WorkRepositoryError::corrupt(
+            "Work attention receipt",
+            std::io::Error::other("receipt revision is exhausted before the requested cursor"),
+        ));
     }
-    .await;
-    let receipt = match result {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            return Err(
-                rollback_transaction(transaction, "rollback Work attention cursor", error).await,
-            );
-        }
-    };
-    transaction.commit().await.map_err(|source| {
-        WorkRepositoryError::persistence("commit Work attention cursor", source)
-    })?;
-    Ok(receipt)
+    receipt(&advance, cursor)
 }
 
-async fn load_cursor<'e>(
-    executor: impl sqlx::Executor<'e, Database = MySql>,
-    advance: &'e WorkAttentionCursorAdvance,
+async fn load_cursor(
+    connection: &mut MySqlConnection,
+    advance: &WorkAttentionCursorAdvance,
 ) -> Result<ReadCursor, WorkRepositoryError> {
     query_as(
-        "SELECT last_event_seq, seen_through_event_seq, receipt_revision, seen_updated_at
-         FROM work_event_sequences WHERE owner_id = ? AND work_id = ? LIMIT 1",
+        "SELECT s.last_event_seq, w.seen_through_event_seq, w.receipt_revision, w.seen_updated_at
+         FROM works w JOIN work_event_sequences s
+           ON s.owner_id = w.owner_id AND s.work_id = w.work_id
+         WHERE w.owner_id = ? AND w.work_id = ? LIMIT 1",
     )
     .bind(advance.owner_id.as_str())
     .bind(advance.work_id.as_str())
-    .fetch_optional(executor)
+    .fetch_optional(connection)
     .await
     .map_err(|source| WorkRepositoryError::persistence("load Work read cursor", source))?
     .ok_or(WorkRepositoryError::NotFound)

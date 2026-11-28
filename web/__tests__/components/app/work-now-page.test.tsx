@@ -139,7 +139,7 @@ test("latest Now discovers a Work created on another surface", async () => {
   }
 });
 
-test("ignores a pending latest refresh after navigating to an older page", async () => {
+test("resumes latest refresh while an obsolete request is still pending", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0.5);
   let finishLatest!: (result: { ok: true; page: WorkCatalogPageV1 }) => void;
@@ -160,12 +160,17 @@ test("ignores a pending latest refresh after navigating to an older page", async
     ),
     next_cursor: null,
   };
-  refreshNow.mockImplementation(
+  refreshNow.mockImplementationOnce(
     () =>
       new Promise((resolve) => {
         finishLatest = resolve;
       }),
   );
+  const refreshedPage = {
+    ...page,
+    entries: [{ ...page.entries[0]!, goal: "Fresh latest response" }],
+  };
+  refreshNow.mockResolvedValue({ ok: true, page: refreshedPage });
   try {
     const rendered = render(<WorkNowPage page={page} isLatest />);
     await act(async () => {
@@ -175,12 +180,17 @@ test("ignores a pending latest refresh after navigating to an older page", async
 
     rendered.rerender(<WorkNowPage page={historicalPage} isLatest={false} />);
     expect(screen.getByText("Selected historical page")).toBeVisible();
+    rendered.rerender(<WorkNowPage page={page} isLatest />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(refreshNow).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Fresh latest response")).toBeVisible();
+
     await act(async () => {
       finishLatest({ ok: true, page: latestUpdate });
       await Promise.resolve();
     });
 
-    expect(screen.getByText("Selected historical page")).toBeVisible();
+    expect(screen.getByText("Fresh latest response")).toBeVisible();
     expect(screen.queryByText("Stale latest response")).not.toBeInTheDocument();
   } finally {
     vi.useRealTimers();

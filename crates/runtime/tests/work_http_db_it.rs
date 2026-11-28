@@ -5962,7 +5962,7 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
     assert_eq!(zero["code"], "invalid_work_event_cursor");
 
     let stored_revision = sqlx::query(
-        "SELECT receipt_revision FROM work_event_sequences
+        "SELECT receipt_revision FROM works
          WHERE owner_id = ? AND work_id = ?",
     )
     .bind(&owner_id)

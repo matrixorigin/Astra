@@ -457,10 +457,27 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
         work_id: WorkId::parse(&work_id).expect("work"),
         through_event_seq: WorkEventSeq::new(through_event_seq).expect("event sequence"),
     };
-    let seen = repository
-        .advance_attention_cursor(advance(1))
+    let mut appending = pool.get().begin().await.expect("event append transaction");
+    sqlx::query(
+        "SELECT last_event_seq FROM work_event_sequences
+         WHERE owner_id = ? AND work_id = ? FOR UPDATE",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .fetch_one(&mut *appending)
+    .await
+    .expect("hold the row used by event append");
+    let seen = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        repository.advance_attention_cursor(advance(1)),
+    )
+    .await
+    .expect("seen writes must proceed while an event append holds its sequence row")
+    .expect("mark genesis event seen");
+    appending
+        .rollback()
         .await
-        .expect("mark genesis event seen");
+        .expect("release event sequence row");
     assert_eq!(seen.revision.get(), 2);
     assert_eq!(seen.through_event_seq.get(), 1);
     assert_eq!(
@@ -480,7 +497,7 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
         })
     ));
     let revision_after_rejection = sqlx::query(
-        "SELECT receipt_revision FROM work_event_sequences
+        "SELECT receipt_revision FROM works
          WHERE owner_id = ? AND work_id = ?",
     )
     .bind(&owner_id)
@@ -608,6 +625,14 @@ async fn event_pages_are_bounded_contiguous_owner_scoped_and_retention_explicit(
         astra_services::work::WorkEventKind::PlanProposed
     );
     assert_eq!(second.next_after_event_seq.map(WorkEventSeq::get), Some(2));
+    let at_head = repository
+        .list_events(event_query(&owner_id, second.next_after_event_seq, 1))
+        .await
+        .expect("event page already at the observed head");
+    assert!(at_head.events.is_empty());
+    assert!(!at_head.has_more);
+    assert_eq!(at_head.next_after_event_seq, second.next_after_event_seq);
+    assert_eq!(at_head.coverage, WorkEventCoverage::Complete);
 
     assert!(matches!(
         repository

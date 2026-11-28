@@ -43,6 +43,7 @@ type WorkTaskGraphProps = {
   id?: string;
   initial: WorkTaskGraphPageV2;
   live?: boolean;
+  paused?: boolean;
   pollWhileIdle?: boolean;
 };
 
@@ -53,6 +54,7 @@ export function WorkTaskGraph({
   id,
   initial,
   live = false,
+  paused = false,
   pollWhileIdle = true,
 }: WorkTaskGraphProps) {
   const [head, setHead] = useState(initial);
@@ -205,11 +207,19 @@ export function WorkTaskGraph({
     }
   }, [revealTaskChanges]);
 
+  // The Run can become inactive before the displayed attempt transitions.
+  const hasActiveAttempt = head.items.entries.some(({ execution }) =>
+    execution.status === "running" || execution.status === "waiting",
+  );
+  const keepPolling = live || pollWhileIdle || hasActiveAttempt;
+  const readAfterPause = paused && !keepPolling &&
+    !head.items.entries.some(({ execution }) => execution.status === "paused");
   useVisiblePoll({
-    enabled: live || pollWhileIdle,
-    intervalMs: live ? LIVE_REFRESH_INTERVAL_MS : QUIET_REFRESH_INTERVAL_MS,
+    enabled: keepPolling || readAfterPause,
+    intervalMs: live || readAfterPause ? LIVE_REFRESH_INTERVAL_MS : QUIET_REFRESH_INTERVAL_MS,
     maximumIntervalMs: 120_000,
-    immediate: live,
+    immediate: live || readAfterPause,
+    once: readAfterPause,
     refresh: refreshHead,
   });
 

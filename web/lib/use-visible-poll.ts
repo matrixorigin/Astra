@@ -7,19 +7,20 @@ type UseVisiblePollOptions = {
   intervalMs: number;
   maximumIntervalMs: number;
   immediate?: boolean;
+  once?: boolean;
   refresh: () => Promise<boolean>;
 };
 
-/** Run one sequential, jittered poll loop while the document is visible. */
+/** Run a sequential, jittered poll loop while visible, optionally stopping after success. */
 export function useVisiblePoll({
   enabled,
   intervalMs,
   maximumIntervalMs,
   immediate = false,
+  once = false,
   refresh,
 }: UseVisiblePollOptions) {
   const refreshRef = useRef(refresh);
-  const inFlight = useRef(false);
 
   useEffect(() => {
     refreshRef.current = refresh;
@@ -29,6 +30,7 @@ export function useVisiblePoll({
     if (!enabled) return;
 
     let cancelled = false;
+    let inFlight = false;
     let failures = 0;
     let timer: number | null = null;
 
@@ -52,22 +54,23 @@ export function useVisiblePoll({
     };
 
     async function run() {
-      if (cancelled || document.visibilityState !== "visible") return;
-      if (inFlight.current) {
-        schedule(intervalMs);
-        return;
-      }
-      inFlight.current = true;
+      if (cancelled || inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
       let succeeded = false;
       try {
         succeeded = await refreshRef.current();
       } catch {
         succeeded = false;
       } finally {
-        inFlight.current = false;
+        inFlight = false;
       }
       if (cancelled) return;
       if (succeeded) {
+        if (once) {
+          cancelled = true;
+          document.removeEventListener("visibilitychange", onVisibilityChange);
+          return;
+        }
         failures = 0;
         schedule(intervalMs);
       } else {
@@ -93,5 +96,5 @@ export function useVisiblePoll({
       clearTimer();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [enabled, immediate, intervalMs, maximumIntervalMs]);
+  }, [enabled, immediate, intervalMs, maximumIntervalMs, once]);
 }

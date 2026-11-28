@@ -18,7 +18,7 @@ pub(super) async fn list_catalog(
                 b.branch_revision, b.current_graph_revision,
                 b.session_id AS branch_session_id,
                 gr.item_count AS graph_item_count,
-                es.last_event_seq, es.seen_through_event_seq,
+                es.last_event_seq, w.seen_through_event_seq,
                 active.run_id AS active_run_id, active.status AS active_run_status,
                 active.waiting_for AS active_run_waiting_for,
                 active.session_id AS active_run_session_id,

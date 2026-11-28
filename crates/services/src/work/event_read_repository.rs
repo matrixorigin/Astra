@@ -13,9 +13,9 @@ pub(super) async fn list_events(
     query_value: WorkEventQuery,
 ) -> Result<WorkEventPage, WorkRepositoryError> {
     let metadata = query(
-        "SELECT s.last_event_seq, s.retained_from_event_seq,
-                s.seen_through_event_seq
+        "SELECT s.last_event_seq, s.retained_from_event_seq, w.seen_through_event_seq
          FROM work_event_sequences s
+         JOIN works w ON w.owner_id = s.owner_id AND w.work_id = s.work_id
          WHERE s.owner_id = ? AND s.work_id = ? LIMIT 1",
     )
     .bind(query_value.owner_id.as_str())
@@ -58,22 +58,26 @@ pub(super) async fn list_events(
         WorkEventCoverage::Complete
     };
     let effective_after = requested_after.max(retained_after);
-    let fetch_limit = i64::from(query_value.limit.get()) + 1;
-    let rows = query(
-        "SELECT event_seq, branch_id, event_kind, work_revision, goal_revision,
-                criterion_set_revision, branch_revision, graph_revision, source_ref,
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at
-         FROM work_events
-         WHERE owner_id = ? AND work_id = ? AND event_seq > ?
-         ORDER BY event_seq LIMIT ?",
-    )
-    .bind(query_value.owner_id.as_str())
-    .bind(query_value.work_id.as_str())
-    .bind(effective_after)
-    .bind(fetch_limit)
-    .fetch_all(repository.pool.get())
-    .await
-    .map_err(|source| WorkRepositoryError::persistence("load bounded Work events", source))?;
+    let rows = if effective_after == event_head.get() {
+        Vec::new()
+    } else {
+        query(
+            "SELECT event_seq, branch_id, event_kind, work_revision, goal_revision,
+                    criterion_set_revision, branch_revision, graph_revision, source_ref,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at
+             FROM work_events
+             WHERE owner_id = ? AND work_id = ? AND event_seq > ? AND event_seq <= ?
+             ORDER BY event_seq LIMIT ?",
+        )
+        .bind(query_value.owner_id.as_str())
+        .bind(query_value.work_id.as_str())
+        .bind(effective_after)
+        .bind(event_head.get())
+        .bind(i64::from(query_value.limit.get()) + 1)
+        .fetch_all(repository.pool.get())
+        .await
+        .map_err(|source| WorkRepositoryError::persistence("load bounded Work events", source))?
+    };
     let mut events = Vec::with_capacity(rows.len());
     for (index, row) in rows.into_iter().enumerate() {
         let event = decode_event(row)?;

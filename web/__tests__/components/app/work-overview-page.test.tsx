@@ -606,6 +606,83 @@ test("discovers activity started on another surface and refreshes this branch's 
   }
 });
 
+test.each(["working", "idle"] as const)("reconciles a paused task after observing the Run as %s", async (priorActivity) => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    const initial = snapshot();
+    const paused = structuredClone(initial.taskGraph);
+    paused.items.entries[0]!.execution = {
+      status: "paused",
+      terminal: false,
+      run: {
+        run_id: "run-1",
+        attempt_id: "attempt-1",
+        graph_revision: 1,
+        run_generation: 1,
+        last_event_idx: 0,
+        updated_at: idleActivity.observed_at,
+      },
+    };
+    if (priorActivity === "working") {
+      initial.taskGraph.items.entries[0]!.execution = {
+        ...paused.items.entries[0]!.execution,
+        status: "running",
+      };
+    }
+    refreshTaskGraph.mockResolvedValue({ ok: true, page: initial.taskGraph });
+    refreshActivity.mockResolvedValue({
+      ok: true,
+      activity: { ...idleActivity, activity: "paused" },
+    });
+
+    render(
+      <TestWorkOverviewPage
+        initial={initial}
+        initialActivity={{ ...idleActivity, activity: priorActivity }}
+      />,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_100); });
+    if (priorActivity === "working") {
+      expect(screen.getByRole("status")).toHaveTextContent("Run paused");
+      expect(screen.getByText("Working", { exact: true })).toBeVisible();
+    }
+
+    // The attempt can commit after the root pause without changing event_head.
+    const previousGraphReads = refreshTaskGraph.mock.calls.length;
+    refreshTaskGraph.mockResolvedValue({ ok: true, page: paused });
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(screen.getByRole("status")).toHaveTextContent("Run paused");
+    expect(screen.getByText("Paused", { exact: true })).toBeVisible();
+    expect(refreshTaskGraph).toHaveBeenCalledTimes(previousGraphReads + 1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(refreshTaskGraph).toHaveBeenCalledTimes(previousGraphReads + 1);
+    expect(refresh).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("does not keep polling a paused branch with no task attempt", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    const paused = { ...idleActivity, activity: "paused" } as const;
+    refreshActivity.mockResolvedValue({ ok: true, activity: paused });
+    render(<TestWorkOverviewPage initial={snapshot()} initialActivity={paused} />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(refreshTaskGraph).toHaveBeenCalledTimes(1);
+    await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+    expect(refreshTaskGraph).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
 test("uses only the combined Work observation while the detail page is idle", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0.5);
@@ -616,6 +693,39 @@ test("uses only the combined Work observation while the detail page is idle", as
     });
     expect(refreshActivity).toHaveBeenCalledTimes(3);
     expect(refreshTaskGraph).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("keeps the latest Work observation when the polling cadence changes", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  let finishOld!: (result: { ok: true; activity: WorkBranchActivityResponseV1 }) => void;
+  try {
+    refreshActivity.mockImplementationOnce(
+      () => new Promise((resolve) => { finishOld = resolve; }),
+    );
+    const initial = snapshot();
+    const rendered = render(
+      <TestWorkOverviewPage
+        initial={initial}
+        initialActivity={{ ...idleActivity, activity: "working" }}
+      />,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(refreshActivity).toHaveBeenCalledTimes(1);
+
+    rendered.rerender(<TestWorkOverviewPage initial={initial} initialActivity={idleActivity} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(refreshActivity).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      finishOld({ ok: true, activity: { ...idleActivity, activity: "working", event_head: 4 } });
+    });
+
+    expect(screen.getByRole("status")).toHaveTextContent("Ready to continue");
     expect(refresh).not.toHaveBeenCalled();
   } finally {
     vi.useRealTimers();
