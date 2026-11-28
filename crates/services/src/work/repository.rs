@@ -28,7 +28,6 @@ pub enum WorkConflictResource {
     WorkIdentity,
     InternalSessionIdentity,
     BranchSessionBinding,
-    GoalRevision,
     CriterionSetRevision,
     GraphRevision,
     CriterionIdentity,
@@ -907,14 +906,15 @@ async fn insert_genesis_rows(
 
     query(
         "INSERT INTO works
-         (owner_id, work_id, work_revision, project_id, original_intent_ref,
+         (owner_id, work_id, work_revision, project_id, original_intent_ref, goal_text,
           current_goal_revision, current_criteria_set_revision, delivery_branch_id)
-         VALUES (?, ?, 1, ?, ?, 1, 1, ?)",
+         VALUES (?, ?, 1, ?, ?, ?, 1, 1, ?)",
     )
     .bind(owner_id)
     .bind(work_id)
     .bind(project_id)
     .bind(genesis.original_intent_ref.as_str())
+    .bind(genesis.goal.as_str())
     .bind(branch_id)
     .execute(&mut **transaction)
     .await
@@ -952,27 +952,6 @@ async fn insert_genesis_rows(
             )
         })?;
     }
-
-    query(
-        "INSERT INTO work_goal_revisions
-         (owner_id, work_id, revision, goal_text, source_kind, source_ref,
-          accepted_by_kind, accepted_by_id, reason)
-         VALUES (?, ?, 1, ?, 'user_intent', ?, 'user', ?, NULL)",
-    )
-    .bind(owner_id)
-    .bind(work_id)
-    .bind(genesis.goal.as_str())
-    .bind(genesis.original_intent_ref.as_str())
-    .bind(owner_id)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::insert(
-            "insert initial Goal revision",
-            WorkConflictResource::GoalRevision,
-            source,
-        )
-    })?;
 
     query(
         "INSERT INTO work_criterion_sets
@@ -1094,12 +1073,6 @@ async fn insert_genesis_rows(
             graph_revision: Some(GraphRevision::INITIAL),
             source_ref: genesis_source,
         },
-    )
-    .await?;
-    super::runtime_event_outbox::insert_genesis_slot(
-        transaction,
-        &genesis.owner_id,
-        &genesis.work_id,
     )
     .await?;
 

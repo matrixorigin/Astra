@@ -2,7 +2,7 @@ mod test_support;
 
 use astra_core::{AppSettings, SharedPool};
 use astra_runtime::build_server_state;
-use astra_services::{ensure_core_schema, storage::load_core_schema_table_contracts};
+use astra_services::ensure_core_schema;
 use futures_util::FutureExt;
 use sqlx::Row;
 
@@ -30,7 +30,12 @@ async fn old_schema_rejects_server_startup_without_touching_pinned_artifacts() {
     let outcome = std::panic::AssertUnwindSafe(async {
     ensure_core_schema(&db, &catalog).await.unwrap();
     let pool = SharedPool::new(&db).await.unwrap();
-    let contracts = load_core_schema_table_contracts(pool.get()).await.unwrap();
+    let marker_query = "SELECT contract_version, table_manifest_json
+        FROM astra_schema_contracts WHERE component = 'astra-core'";
+    let (_, manifest): (String, String) = sqlx::query_as(marker_query)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
     // A v126 database can contain the retired fork facts. Reject it without
     // removing or rewriting the data; schema cutover is never a migration.
     sqlx::query("CREATE TABLE session_fork_events (fork_id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL)")
@@ -44,7 +49,7 @@ async fn old_schema_rejects_server_startup_without_touching_pinned_artifacts() {
     let payload: String = sqlx::query_scalar("SELECT payload FROM session_fork_events WHERE fork_id = 'existing-fork'")
         .fetch_one(pool.get()).await.unwrap();
     assert_eq!(payload, "original reason");
-    // Simulated v116 marker/pin on a fresh v117 fixture, never a migration.
+    // Simulate a v116 marker and pin on the fresh fixture.
     sqlx::query(
         "ALTER TABLE session_artifacts ADD referenced_by_state_items_count INT NOT NULL DEFAULT 0",
     )
@@ -86,16 +91,14 @@ async fn old_schema_rejects_server_startup_without_touching_pinned_artifacts() {
             .unwrap(),
         1
     );
-    let version: String = sqlx::query_scalar(
-        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
+    let (version, retained_manifest): (String, String) = sqlx::query_as(marker_query)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
     assert_eq!(version, "2026-10-29-v116");
     assert_eq!(
-        load_core_schema_table_contracts(pool.get()).await.unwrap(),
-        contracts
+        retained_manifest, manifest,
+        "rejected startup must preserve the persisted table manifest"
     );
     let sweeper_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sweeper_leases")
         .fetch_one(pool.get())

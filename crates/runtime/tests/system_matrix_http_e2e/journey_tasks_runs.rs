@@ -11,10 +11,7 @@ use super::harness::{
     post_json, seeded_model_selection,
 };
 
-async fn seed_orphan_cancel_race_run(
-    ctx: &harness::MatrixE2eCtx,
-    case: &str,
-) -> (String, String, String) {
+async fn seed_orphan_cancel_race_run(ctx: &harness::MatrixE2eCtx, case: &str) -> (String, String) {
     let run_id = format!("orphan-http-{case}-{}", ctx.suffix);
     let work_id = format!("ow-{case}-{}", ctx.suffix);
     let branch_id = format!("ob-{case}-{}", ctx.suffix);
@@ -124,16 +121,6 @@ async fn seed_orphan_cancel_race_run(
     .await
     .expect("seed pending Work carrier");
     sqlx::query(
-        "INSERT INTO work_runtime_event_outbox_slots
-         (owner_id, work_id, last_enqueued_event_seq, last_projected_event_seq, has_pending)
-         VALUES (?, ?, 0, 0, 0)",
-    )
-    .bind(&ctx.user_id)
-    .bind(&work_id)
-    .execute(&ctx.pool)
-    .await
-    .expect("seed Work runtime outbox slot");
-    sqlx::query(
         "UPDATE agent_runs
          SET status = 'waiting', waiting_for = 'tool_approval',
              owner_pod_id = NULL, owner_lease_expires_at = NULL,
@@ -145,30 +132,16 @@ async fn seed_orphan_cancel_race_run(
     .execute(&ctx.pool)
     .await
     .expect("orphan exact run generation");
-    (run_id, work_id, request_id)
+    (run_id, request_id)
 }
 
-async fn cleanup_orphan_cancel_work_fixture(
-    ctx: &harness::MatrixE2eCtx,
-    run_id: &str,
-    work_id: &str,
-) {
-    for statement in [
-        "DELETE FROM work_runtime_event_outbox WHERE owner_id = ? AND work_id = ?",
-        "DELETE FROM work_runtime_event_outbox_slots WHERE owner_id = ? AND work_id = ?",
-        "DELETE FROM work_item_attempts WHERE owner_id = ? AND executor_run_id = ?",
-    ] {
-        let mut query = sqlx::query(statement).bind(&ctx.user_id);
-        query = if statement.contains("executor_run_id") {
-            query.bind(run_id)
-        } else {
-            query.bind(work_id)
-        };
-        query
-            .execute(&ctx.pool)
-            .await
-            .expect("cleanup Work fixture");
-    }
+async fn cleanup_orphan_cancel_work_fixture(ctx: &harness::MatrixE2eCtx, run_id: &str) {
+    sqlx::query("DELETE FROM work_item_attempts WHERE owner_id = ? AND executor_run_id = ?")
+        .bind(&ctx.user_id)
+        .bind(run_id)
+        .execute(&ctx.pool)
+        .await
+        .expect("cleanup Work fixture");
 }
 
 pub async fn run_orphan_cancel_claim_race_http() {
@@ -176,8 +149,7 @@ pub async fn run_orphan_cancel_claim_race_http() {
     let ctx = &b.ctx;
     let auth = &b.auth_header;
 
-    let (cancel_run_id, cancel_work_id, cancel_request_id) =
-        seed_orphan_cancel_race_run(ctx, "cancel-win").await;
+    let (cancel_run_id, cancel_request_id) = seed_orphan_cancel_race_run(ctx, "cancel-win").await;
     let (cancel_status, cancel_body) =
         delete_json(&ctx.app, &format!("/chat/runs/{cancel_run_id}"), Some(auth)).await;
     assert_eq!(
@@ -251,18 +223,8 @@ pub async fn run_orphan_cancel_claim_race_http() {
     .await
     .expect("load cancelled Work carrier");
     assert_eq!(carrier, "cancelled");
-    let outbox_kind: String = sqlx::query_scalar(
-        "SELECT event_kind FROM work_runtime_event_outbox WHERE owner_id = ? AND work_id = ?",
-    )
-    .bind(&ctx.user_id)
-    .bind(&cancel_work_id)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("load cancellation outbox");
-    assert_eq!(outbox_kind, "run_cancelled");
 
-    let (claim_run_id, claim_work_id, claim_request_id) =
-        seed_orphan_cancel_race_run(ctx, "claim-win").await;
+    let (claim_run_id, claim_request_id) = seed_orphan_cancel_race_run(ctx, "claim-win").await;
     let claimed = store
         .claim_recoverable_active_runs(1)
         .await
@@ -320,8 +282,8 @@ pub async fn run_orphan_cancel_claim_race_http() {
     .expect("load claimed Work carrier");
     assert_eq!(claim_carrier, "waiting");
 
-    cleanup_orphan_cancel_work_fixture(ctx, &cancel_run_id, &cancel_work_id).await;
-    cleanup_orphan_cancel_work_fixture(ctx, &claim_run_id, &claim_work_id).await;
+    cleanup_orphan_cancel_work_fixture(ctx, &cancel_run_id).await;
+    cleanup_orphan_cancel_work_fixture(ctx, &claim_run_id).await;
     ctx.close().await;
 }
 

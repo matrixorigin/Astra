@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-28-v131";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-28-v132";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -163,25 +163,11 @@ const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_mo
         )";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
-    contract_version VARCHAR(64) NOT NULL,
-    completed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-)";
-const CORE_SCHEMA_LEASE_TABLE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS astra_schema_bootstrap_leases (
-    component VARCHAR(64) NOT NULL PRIMARY KEY,
-    holder_id VARCHAR(64) NOT NULL,
-    lease_expires_at DATETIME(6) NOT NULL,
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-)";
-const CORE_SCHEMA_TABLE_CONTRACT_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS astra_schema_table_contracts (
-    table_name VARCHAR(128) NOT NULL PRIMARY KEY,
-    component VARCHAR(64) NOT NULL,
-    owner VARCHAR(128) NOT NULL,
-    contract_version VARCHAR(64) NOT NULL,
-    ddl_sha256 CHAR(64) NOT NULL,
-    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    INDEX idx_schema_table_contract_component (component, contract_version, table_name)
+    contract_version VARCHAR(64) NULL,
+    table_manifest_json LONGTEXT NULL,
+    completed_at DATETIME(6) NULL,
+    bootstrap_holder_id VARCHAR(64) NULL,
+    bootstrap_expires_at DATETIME(6) NULL
 )";
 const AGENT_RUNS_TABLE: &str = "agent_runs";
 const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
@@ -323,47 +309,11 @@ const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CoreSchemaTableSpec {
     pub name: String,
     pub owner: String,
     pub ddl_sha256: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PersistedCoreSchemaTableClaim {
-    name: String,
-    component: String,
-    owner: String,
-    contract_version: String,
-    ddl_sha256: String,
-}
-
-const INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL: &str =
-    "INSERT IGNORE INTO astra_schema_table_contracts
-     (table_name, component, owner, contract_version, ddl_sha256)
-     VALUES (?, ?, ?, ?, ?)";
-
-fn validate_core_schema_table_claim(
-    claim: &PersistedCoreSchemaTableClaim,
-    declaration: &CoreSchemaTableSpec,
-) -> Result<(), sqlx::Error> {
-    if claim.component != CORE_SCHEMA_CONTRACT_COMPONENT {
-        return Err(sqlx::Error::Protocol(format!(
-            "schema table {} is already claimed by lifecycle component {} (owner={})",
-            claim.name, claim.component, claim.owner
-        )));
-    }
-    if claim.owner != declaration.owner
-        || claim.contract_version != CORE_SCHEMA_CONTRACT_VERSION
-        || claim.ddl_sha256 != declaration.ddl_sha256
-    {
-        return Err(sqlx::Error::Protocol(format!(
-            "schema table {} lifecycle contract differs from the current schema; recreate the database",
-            declaration.name
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -571,29 +521,31 @@ struct CoreSchemaDatabaseLease {
 
 impl CoreSchemaDatabaseLease {
     async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        query(CORE_SCHEMA_LEASE_TABLE_SQL).execute(pool).await?;
+        query(CORE_SCHEMA_CONTRACT_TABLE_SQL).execute(pool).await?;
         let holder_id = Uuid::new_v4().to_string();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             query(
-                "INSERT INTO astra_schema_bootstrap_leases \
-                 (component, holder_id, lease_expires_at, updated_at) \
-                 VALUES (?, ?, DATE_ADD(NOW(6), INTERVAL 30 SECOND), NOW(6)) \
-                 ON DUPLICATE KEY UPDATE \
-                   updated_at = IF(lease_expires_at <= NOW(6), VALUES(updated_at), updated_at), \
-                   holder_id = IF(lease_expires_at <= NOW(6), VALUES(holder_id), holder_id), \
-                   lease_expires_at = IF(lease_expires_at <= NOW(6), VALUES(lease_expires_at), lease_expires_at)",
+                "INSERT INTO astra_schema_contracts
+                    (component, bootstrap_holder_id, bootstrap_expires_at)
+                 VALUES (?, ?, DATE_ADD(NOW(6), INTERVAL 30 SECOND))
+                 ON DUPLICATE KEY UPDATE
+                   bootstrap_holder_id = IF(bootstrap_expires_at IS NULL OR bootstrap_expires_at <= NOW(6),
+                                            VALUES(bootstrap_holder_id), bootstrap_holder_id),
+                   bootstrap_expires_at = IF(bootstrap_expires_at IS NULL OR bootstrap_expires_at <= NOW(6),
+                                             VALUES(bootstrap_expires_at), bootstrap_expires_at)",
             )
             .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
             .bind(&holder_id)
             .execute(pool)
             .await?;
-            let current_holder: Option<String> = sqlx::query_scalar(
-                "SELECT holder_id FROM astra_schema_bootstrap_leases WHERE component = ?",
+            let current_holder: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT bootstrap_holder_id FROM astra_schema_contracts WHERE component = ?",
             )
             .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
             .fetch_optional(pool)
-            .await?;
+            .await?
+            .flatten();
             if current_holder.as_deref() == Some(holder_id.as_str()) {
                 break;
             }
@@ -614,11 +566,10 @@ impl CoreSchemaDatabaseLease {
                     _ = &mut stop_rx => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                         let renewal = query(
-                            "UPDATE astra_schema_bootstrap_leases \
-                             SET lease_expires_at = DATE_ADD(NOW(6), INTERVAL 30 SECOND), \
-                                 updated_at = NOW(6) \
-                             WHERE component = ? AND holder_id = ? \
-                               AND lease_expires_at > NOW(6)",
+                            "UPDATE astra_schema_contracts
+                             SET bootstrap_expires_at = DATE_ADD(NOW(6), INTERVAL 30 SECOND)
+                             WHERE component = ? AND bootstrap_holder_id = ?
+                               AND bootstrap_expires_at > NOW(6)",
                         )
                         .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
                         .bind(&heartbeat_holder)
@@ -627,9 +578,9 @@ impl CoreSchemaDatabaseLease {
                         match renewal {
                             Ok(_) => {
                                 let still_owned: Result<i64, sqlx::Error> = sqlx::query_scalar(
-                                    "SELECT COUNT(*) FROM astra_schema_bootstrap_leases \
-                                     WHERE component = ? AND holder_id = ? \
-                                       AND lease_expires_at > NOW(6)",
+                                    "SELECT COUNT(*) FROM astra_schema_contracts
+                                     WHERE component = ? AND bootstrap_holder_id = ?
+                                       AND bootstrap_expires_at > NOW(6)",
                                 )
                                 .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
                                 .bind(&heartbeat_holder)
@@ -685,11 +636,15 @@ impl CoreSchemaDatabaseLease {
                 ))
             })?;
         }
-        query("DELETE FROM astra_schema_bootstrap_leases WHERE component = ? AND holder_id = ?")
-            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-            .bind(&self.holder_id)
-            .execute(&self.pool)
-            .await?;
+        query(
+            "UPDATE astra_schema_contracts
+             SET bootstrap_holder_id = NULL, bootstrap_expires_at = NULL
+             WHERE component = ? AND bootstrap_holder_id = ?",
+        )
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .bind(&self.holder_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -706,14 +661,13 @@ impl Drop for CoreSchemaDatabaseLease {
 }
 
 async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<bool, sqlx::Error> {
-    query(CORE_SCHEMA_CONTRACT_TABLE_SQL).execute(pool).await?;
-    query(CORE_SCHEMA_TABLE_CONTRACT_SQL).execute(pool).await?;
-    let persisted: Option<String> = sqlx::query_scalar(
+    let persisted = sqlx::query_scalar::<_, Option<String>>(
         "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
     )
     .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
     .fetch_optional(pool)
-    .await?;
+    .await?
+    .flatten();
     match persisted {
         None => Ok(false),
         Some(version) if version == CORE_SCHEMA_CONTRACT_VERSION => Ok(true),
@@ -726,25 +680,23 @@ async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<boo
 pub async fn load_core_schema_table_contracts(
     pool: &sqlx::Pool<MySql>,
 ) -> Result<Vec<CoreSchemaTableSpec>, sqlx::Error> {
-    query(
-        "SELECT table_name, owner, ddl_sha256
-         FROM astra_schema_table_contracts
-         WHERE component = ? AND contract_version = ?
-         ORDER BY table_name",
+    let manifest = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT table_manifest_json FROM astra_schema_contracts
+         WHERE component = ? AND contract_version = ?",
     )
     .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
     .bind(CORE_SCHEMA_CONTRACT_VERSION)
-    .fetch_all(pool)
+    .fetch_optional(pool)
     .await?
-    .into_iter()
-    .map(|row| {
-        Ok(CoreSchemaTableSpec {
-            name: row.try_get("table_name")?,
-            owner: row.try_get("owner")?,
-            ddl_sha256: row.try_get("ddl_sha256")?,
-        })
-    })
-    .collect()
+    .flatten();
+    manifest.map_or_else(
+        || Ok(Vec::new()),
+        |json| {
+            serde_json::from_str(&json).map_err(|error| {
+                sqlx::Error::Protocol(format!("invalid core schema table manifest: {error}"))
+            })
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -757,6 +709,7 @@ enum CoreSchemaCatalogState {
 async fn inspect_core_schema_catalog(
     pool: &sqlx::Pool<MySql>,
     database: &str,
+    contracts: &[CoreSchemaTableSpec],
 ) -> Result<CoreSchemaCatalogState, sqlx::Error> {
     let rows = query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?")
         .bind(database)
@@ -766,7 +719,6 @@ async fn inspect_core_schema_catalog(
         .into_iter()
         .map(|row| row.try_get::<String, _>("TABLE_NAME"))
         .collect::<Result<BTreeSet<_>, _>>()?;
-    let contracts = load_core_schema_table_contracts(pool).await?;
     if contracts.is_empty() {
         return Ok(CoreSchemaCatalogState::Invalid(
             "core schema table authority is empty for the current contract".to_string(),
@@ -785,12 +737,14 @@ async fn inspect_core_schema_catalog(
             "invalid user_llm_models schema declaration; recreate the database".into(),
         ));
     }
+    let mut table_names = BTreeSet::new();
     let malformed = contracts
         .iter()
         .filter(|table| {
             table.name.trim().is_empty()
                 || table.owner.trim().is_empty()
                 || table.ddl_sha256.len() != 64
+                || !table_names.insert(&table.name)
         })
         .map(|table| table.name.clone())
         .collect::<Vec<_>>();
@@ -815,8 +769,9 @@ async fn inspect_core_schema_catalog(
 async fn verify_core_schema_catalog(
     pool: &sqlx::Pool<MySql>,
     database: &str,
+    contracts: &[CoreSchemaTableSpec],
 ) -> Result<(), sqlx::Error> {
-    match inspect_core_schema_catalog(pool, database).await? {
+    match inspect_core_schema_catalog(pool, database, contracts).await? {
         CoreSchemaCatalogState::Ready => Ok(()),
         CoreSchemaCatalogState::Missing(missing) => Err(sqlx::Error::Protocol(format!(
             "core schema catalog is incomplete after bootstrap: missing {}",
@@ -826,105 +781,23 @@ async fn verify_core_schema_catalog(
     }
 }
 
-async fn publish_core_schema_table_contracts(
-    pool: &sqlx::Pool<MySql>,
-    declarations: &[CoreSchemaTableSpec],
-) -> Result<(), sqlx::Error> {
-    if declarations.is_empty() {
-        return Err(sqlx::Error::Protocol(
-            "core schema bootstrap produced no table declarations".to_string(),
-        ));
-    }
-    let mut transaction = pool.begin().await?;
-    let existing = query(
-        "SELECT table_name, component, owner, contract_version, ddl_sha256
-         FROM astra_schema_table_contracts",
-    )
-    .fetch_all(&mut *transaction)
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok(PersistedCoreSchemaTableClaim {
-            name: row.try_get("table_name")?,
-            component: row.try_get("component")?,
-            owner: row.try_get("owner")?,
-            contract_version: row.try_get("contract_version")?,
-            ddl_sha256: row.try_get("ddl_sha256")?,
-        })
-    })
-    .collect::<Result<Vec<_>, sqlx::Error>>()?;
-    for claim in &existing {
-        if let Some(declaration) = declarations
-            .iter()
-            .find(|declaration| declaration.name == claim.name)
-        {
-            validate_core_schema_table_claim(claim, declaration)?;
-        } else if claim.component == CORE_SCHEMA_CONTRACT_COMPONENT {
-            return Err(sqlx::Error::Protocol(format!(
-                "unsupported core schema table claim {}; recreate the database",
-                claim.name
-            )));
-        }
-    }
-
-    for declaration in declarations {
-        // Insert without taking over an existing identity. A concurrent foreign
-        // component may claim the table after the pre-read above, so a duplicate
-        // must be a true no-op. Do not express that no-op as an update of the
-        // primary key: some MySQL-protocol engines reject every primary-key
-        // update, even assignment to its current value. The exact post-write
-        // read below validates convergence and surfaces any suppressed insert
-        // error as a contract mismatch rather than granting ownership.
-        query(INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL)
-            .bind(&declaration.name)
-            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-            .bind(&declaration.owner)
-            .bind(CORE_SCHEMA_CONTRACT_VERSION)
-            .bind(&declaration.ddl_sha256)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| {
-                sqlx::Error::Protocol(format!(
-                    "failed to insert schema table {} lifecycle contract: {error}",
-                    declaration.name
-                ))
-            })?;
-
-        let row = query(
-            "SELECT table_name, component, owner, contract_version, ddl_sha256
-             FROM astra_schema_table_contracts
-             WHERE table_name = ?",
-        )
-        .bind(&declaration.name)
-        .fetch_one(&mut *transaction)
-        .await?;
-        let persisted = PersistedCoreSchemaTableClaim {
-            name: row.try_get("table_name")?,
-            component: row.try_get("component")?,
-            owner: row.try_get("owner")?,
-            contract_version: row.try_get("contract_version")?,
-            ddl_sha256: row.try_get("ddl_sha256")?,
-        };
-        validate_core_schema_table_claim(&persisted, declaration)?;
-    }
-    transaction.commit().await
-}
-
-async fn mark_core_schema_contract_current(
+async fn publish_core_schema_contract(
     pool: &sqlx::Pool<MySql>,
     holder_id: &str,
+    declarations: &[CoreSchemaTableSpec],
 ) -> Result<(), sqlx::Error> {
-    query("DELETE FROM astra_schema_contracts WHERE component = ?")
-        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
-        .execute(pool)
-        .await?;
+    let manifest = serde_json::to_string(declarations).map_err(|error| {
+        sqlx::Error::Protocol(format!(
+            "failed to encode core schema table manifest: {error}"
+        ))
+    })?;
     let result = query(
-        "INSERT INTO astra_schema_contracts (component, contract_version) \
-         SELECT ?, ? FROM astra_schema_bootstrap_leases \
-         WHERE component = ? AND holder_id = ? AND lease_expires_at > NOW(6)",
+        "UPDATE astra_schema_contracts
+         SET contract_version = ?, table_manifest_json = ?, completed_at = NOW(6)
+         WHERE component = ? AND bootstrap_holder_id = ? AND bootstrap_expires_at > NOW(6)",
     )
-    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
     .bind(CORE_SCHEMA_CONTRACT_VERSION)
+    .bind(manifest)
     .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
     .bind(holder_id)
     .execute(pool)
@@ -947,12 +820,13 @@ async fn verify_core_schema_visible(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<CoreSchemaVisibility, sqlx::Error> {
-    let persisted: Option<String> = sqlx::query_scalar(
+    let persisted = sqlx::query_scalar::<_, Option<String>>(
         "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
     )
     .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
     .fetch_optional(pool)
-    .await?;
+    .await?
+    .flatten();
     if persisted.as_deref() != Some(CORE_SCHEMA_CONTRACT_VERSION) {
         return Ok(CoreSchemaVisibility::Lag(
             "core schema completion marker is not visible on a fresh connection".to_string(),
@@ -961,7 +835,8 @@ async fn verify_core_schema_visible(
     // The published table authority is the readiness boundary. A fixed probe
     // list inevitably drifts whenever a new runtime table is added and can
     // report ready while a fresh connection still cannot see that table.
-    match inspect_core_schema_catalog(pool, database).await? {
+    let manifest = load_core_schema_table_contracts(pool).await?;
+    match inspect_core_schema_catalog(pool, database, &manifest).await? {
         CoreSchemaCatalogState::Ready => Ok(CoreSchemaVisibility::Visible),
         CoreSchemaCatalogState::Missing(missing) => Ok(CoreSchemaVisibility::Lag(format!(
             "canonical tables are not visible: {}",
@@ -2156,7 +2031,7 @@ async fn verify_work_canonical_schema(
             "work_check_runs",
             &["work_item_id", "work_item_revision", "work_item_attempt_id"],
         ),
-        ("works", &["last_graph_revision"]),
+        ("works", &["goal_text", "last_graph_revision"]),
         ("work_item_revisions", &["parent_revision"]),
         (
             "work_proposals",
@@ -2168,17 +2043,10 @@ async fn verify_work_canonical_schema(
                 "result_criteria_set_revision",
             ],
         ),
+        ("work_establishment_operations", &["mutation_triggers_json"]),
         (
-            "work_proposal_trigger_attempts",
-            &[
-                "owner_id",
-                "work_id",
-                "branch_id",
-                "proposal_id",
-                "trigger_attempt_id",
-                "trigger_item_id",
-                "trigger_item_revision",
-            ],
+            "work_item_attempts",
+            &["terminal_graph_revision", "terminal_control_epoch"],
         ),
         (
             "work_branches",
@@ -2283,14 +2151,13 @@ async fn verify_work_canonical_schema(
             &["owner_id", "work_id", "patch_ref", "revision"],
         ),
         (
-            "work_proposal_trigger_attempts",
-            "idx_work_proposal_trigger_attempt",
+            "work_item_attempts",
+            "uq_work_attempt_terminal_graph",
             &[
                 "owner_id",
                 "work_id",
                 "branch_id",
-                "trigger_attempt_id",
-                "proposal_id",
+                "terminal_graph_revision",
             ],
         ),
     ];
@@ -3054,7 +2921,8 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
-        verify_core_schema_catalog(&pool, &settings.database).await?;
+        let manifest = load_core_schema_table_contracts(&pool).await?;
+        verify_core_schema_catalog(&pool, &settings.database, &manifest).await?;
         return verify_core_schema_shape(&pool, &settings.database).await;
     }
 
@@ -3062,16 +2930,11 @@ async fn ensure_core_schema_while_leased(
     // executes. This makes DDL the declaration and the ownership catalog its
     // generated contract, rather than maintaining a second list of names.
     let pool = CoreSchemaExecutor::new(pool);
-    for (table_name, ddl) in [
-        ("astra_schema_contracts", CORE_SCHEMA_CONTRACT_TABLE_SQL),
-        ("astra_schema_bootstrap_leases", CORE_SCHEMA_LEASE_TABLE_SQL),
-        (
-            "astra_schema_table_contracts",
-            CORE_SCHEMA_TABLE_CONTRACT_SQL,
-        ),
-    ] {
-        pool.authority.declare("storage", table_name, ddl);
-    }
+    pool.authority.declare(
+        "storage",
+        "astra_schema_contracts",
+        CORE_SCHEMA_CONTRACT_TABLE_SQL,
+    );
 
     // Auth
     core_schema_create!(
@@ -3084,39 +2947,15 @@ async fn ensure_core_schema_while_leased(
             password_hash VARCHAR(255) NOT NULL,
             display_name VARCHAR(100) NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
+            is_admin SMALLINT NOT NULL DEFAULT 0,
+            has_user_role SMALLINT NOT NULL DEFAULT 0,
+            INDEX idx_auth_users_admin (is_admin),
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             last_login_at DATETIME(6) NULL
         )",
     )
     .execute(&pool)
     .await?;
-    core_schema_create!(
-        pool,
-        "auth_roles",
-        "CREATE TABLE IF NOT EXISTS auth_roles (
-            role_id VARCHAR(64) PRIMARY KEY,
-            role_name VARCHAR(50) NOT NULL UNIQUE,
-            description VARCHAR(255) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "auth_user_roles",
-        "CREATE TABLE IF NOT EXISTS auth_user_roles (
-            user_id VARCHAR(128) NOT NULL,
-            role_id VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, role_id),
-            INDEX idx_auth_user_roles_role_id (role_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(
         pool,
         "auth_refresh_tokens",
@@ -3916,25 +3755,11 @@ async fn ensure_core_schema_while_leased(
             owner_pod_id VARCHAR(256) NOT NULL,
             expires_at DATETIME(6) NOT NULL,
             version INT UNSIGNED NOT NULL DEFAULT 0,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Durable keyset cursors keep bounded maintenance jobs fair across pod
-    // changes and process restarts. The cursor is progress, never authority:
-    // every mutation performed by a sweeper remains independently idempotent.
-    core_schema_create!(
-        pool,
-        "maintenance_sweep_cursors",
-        "CREATE TABLE IF NOT EXISTS maintenance_sweep_cursors (
-            sweep_name VARCHAR(128) PRIMARY KEY,
-            cursor_updated_at DATETIME(6) NOT NULL,
-            cursor_user_id VARCHAR(128) NOT NULL,
-            cursor_run_id VARCHAR(64) NOT NULL,
+            cursor_updated_at DATETIME(6) NOT NULL DEFAULT '1970-01-01 00:00:00.000000',
+            cursor_user_id VARCHAR(128) NOT NULL DEFAULT '',
+            cursor_run_id VARCHAR(64) NOT NULL DEFAULT '',
             scan_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            compaction_updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         )",
@@ -4696,9 +4521,8 @@ async fn ensure_core_schema_while_leased(
 
     verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
-    publish_core_schema_table_contracts(&pool, &declarations).await?;
-    verify_core_schema_catalog(&pool, &settings.database).await?;
-    mark_core_schema_contract_current(&pool, holder_id).await?;
+    verify_core_schema_catalog(&pool, &settings.database, &declarations).await?;
+    publish_core_schema_contract(&pool, holder_id, &declarations).await?;
     Ok(())
 }
 
@@ -5016,26 +4840,18 @@ async fn verify_core_schema_shape(
         ));
     }
 
-    fail_if_obsolete_shape(
+    fail_if_required_columns_missing_or_nullable(
         pool,
         database,
-        "auth_user_roles",
-        &["user_id", "role_id"],
-        &["id"],
-        &["uq_auth_user_roles_user_role"],
+        "auth_users",
+        &["is_admin", "has_user_role"],
     )
     .await?;
     ensure_index_shape(
         &indexes,
-        "auth_user_roles",
-        "PRIMARY",
-        &["user_id", "role_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "auth_user_roles",
-        "idx_auth_user_roles_role_id",
-        &["role_id"],
+        "auth_users",
+        "idx_auth_users_admin",
+        &["is_admin"],
     )?;
     ensure_index_shape(
         &indexes,
@@ -6876,87 +6692,6 @@ mod tests {
 
         let error = authority.declarations().unwrap_err().to_string();
         assert!(error.contains("duplicate_owner (claims=2)"), "{error}");
-    }
-
-    fn persisted_claim(
-        name: &str,
-        component: &str,
-        owner: &str,
-        version: &str,
-    ) -> PersistedCoreSchemaTableClaim {
-        PersistedCoreSchemaTableClaim {
-            name: name.to_string(),
-            component: component.to_string(),
-            owner: owner.to_string(),
-            contract_version: version.to_string(),
-            ddl_sha256: "a".repeat(64),
-        }
-    }
-
-    fn desired_table(name: &str, owner: &str) -> CoreSchemaTableSpec {
-        CoreSchemaTableSpec {
-            name: name.to_string(),
-            owner: owner.to_string(),
-            ddl_sha256: "b".repeat(64),
-        }
-    }
-
-    #[test]
-    fn core_schema_contract_write_never_takes_over_a_concurrent_foreign_claim() {
-        let declaration = desired_table("shared_table", "storage");
-        let raced_claim = persisted_claim("shared_table", "extension", "plugin", "v1");
-
-        let error = validate_core_schema_table_claim(&raced_claim, &declaration)
-            .expect_err("a foreign claim that appears after the pre-read must still fail")
-            .to_string();
-
-        assert!(error.contains("shared_table"), "{error}");
-        assert!(error.contains("extension"), "{error}");
-        assert!(error.contains("plugin"), "{error}");
-        assert!(
-            INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL.starts_with("INSERT IGNORE INTO"),
-            "claims must use an identity-preserving insert-if-absent operation"
-        );
-        assert!(
-            !INSERT_CORE_SCHEMA_TABLE_CLAIM_WITHOUT_TAKEOVER_SQL
-                .contains("ON DUPLICATE KEY UPDATE"),
-            "a duplicate claim must never be implemented by updating its identity"
-        );
-    }
-
-    #[test]
-    fn core_schema_contract_retry_requires_the_exact_current_claim() {
-        let declaration = desired_table("shared_table", "storage");
-        let converged = PersistedCoreSchemaTableClaim {
-            name: declaration.name.clone(),
-            component: CORE_SCHEMA_CONTRACT_COMPONENT.to_string(),
-            owner: declaration.owner.clone(),
-            contract_version: CORE_SCHEMA_CONTRACT_VERSION.to_string(),
-            ddl_sha256: declaration.ddl_sha256.clone(),
-        };
-
-        validate_core_schema_table_claim(&converged, &declaration)
-            .expect("the exact owner-scoped contract should validate");
-
-        for divergent in [
-            PersistedCoreSchemaTableClaim {
-                owner: "other-owner".to_string(),
-                ..converged.clone()
-            },
-            PersistedCoreSchemaTableClaim {
-                contract_version: "stale-version".to_string(),
-                ..converged.clone()
-            },
-            PersistedCoreSchemaTableClaim {
-                ddl_sha256: "c".repeat(64),
-                ..converged
-            },
-        ] {
-            assert!(
-                validate_core_schema_table_claim(&divergent, &declaration).is_err(),
-                "retry must reject claims that differ from the current contract"
-            );
-        }
     }
 
     #[test]

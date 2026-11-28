@@ -260,7 +260,6 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
     for table in [
         "auth_tokens",
         "auth_refresh_tokens",
-        "auth_user_roles",
         "auth_external_identities",
         "auth_users",
     ] {

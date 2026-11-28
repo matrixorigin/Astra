@@ -301,9 +301,6 @@ impl DatabaseAuthService {
         }
         let identity = provider.verify(token).await?;
         let pool = self.get_pool().await.map_err(internal_error)?;
-        self.ensure_default_roles(&pool)
-            .await
-            .map_err(internal_error)?;
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let provider_id = format!("uc:{}", provider.settings.issuer);
         let user = self

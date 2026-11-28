@@ -140,7 +140,6 @@ class SchemaInventoryTest(unittest.TestCase):
         expected = {
             "works",
             "work_establishment_operations",
-            "work_goal_revisions",
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_graph_revisions",
@@ -151,23 +150,19 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_branch_deletion_operations",
             "work_proposal_sequences",
             "work_proposals",
-            "work_proposal_trigger_attempts",
             "work_check_runs",
             "work_acceptance_decisions",
             "work_current_gap_acceptances",
             "work_event_sequences",
             "work_item_attempts",
-            "work_terminal_cuts",
             "work_events",
-            "work_runtime_event_outbox",
-            "work_runtime_event_outbox_slots",
             "work_recovery_points",
         }
         actual = {
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(24, len(actual))
+        self.assertEqual(19, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
@@ -181,16 +176,16 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_work_metadata_locks_authority_boundaries(self) -> None:
         self.assertIn("current pointers", self.tables["works"]["merge_guidance"])
-        self.assertIn("immutable", self.tables["work_goal_revisions"]["state_class"])
+        self.assertIn("immutable initial goal", self.tables["works"]["merge_guidance"])
         self.assertIn("ordering authority", self.tables["works"]["rebuildability"])
         self.assertIn("idempotency/recovery", self.tables["work_branch_control_operations"]["merge_guidance"])
         self.assertIn("evidence", self.tables["work_check_runs"]["merge_guidance"])
         self.assertIn("canonical history", self.tables["work_events"]["state_class"])
-        self.assertIn("runtime event projection", self.tables["work_runtime_event_outbox"]["merge_guidance"])
+        self.assertIn("Run journal", self.tables["work_events"]["merge_guidance"])
         self.assertIn("canonical verification", self.tables["work_recovery_points"]["merge_guidance"])
-        self.assertIn("terminal", self.tables["work_terminal_cuts"]["state_class"])
+        self.assertIn("terminal graph", self.tables["work_item_attempts"]["state_class"])
 
-    def test_work_retention_and_runtime_coverage_metadata_is_explicit(self) -> None:
+    def test_work_retention_and_coverage_metadata_is_explicit(self) -> None:
         events = self.tables["work_events"]
         self.assertIn("fixed retained window", events["state_class"])
         self.assertIn("10,000", events["retention_policy"])
@@ -218,17 +213,6 @@ class SchemaInventoryTest(unittest.TestCase):
         attempts = self.tables["work_item_attempts"]
         self.assertIn("mutable durable", attempts["state_class"])
         self.assertIn("settlement authority", attempts["state_class"])
-
-        outbox = self.tables["work_runtime_event_outbox"]
-        self.assertIn("Run transaction", outbox["state_class"])
-        self.assertIn("1024-row ring", outbox["retention_policy"])
-        self.assertIn("unprojected", outbox["retention_policy"])
-        self.assertIn("runtime_events_expired", outbox["retention_policy"])
-        self.assertIn("not rebuildable from work_events", outbox["rebuildability"])
-        slots = self.tables["work_runtime_event_outbox_slots"]
-        self.assertIn("enqueued/projected sequence", slots["state_class"])
-        self.assertIn("coverage", slots["state_class"])
-        self.assertIn("not generally rebuildable", slots["rebuildability"])
 
     def test_context_head_and_branch_subject_authority_metadata(self) -> None:
         heads = self.tables["session_context_heads"]
@@ -516,7 +500,6 @@ fn char_literal() { let slash = '/'; }
         config_security_tables = {
             "admin_config",
             "auth_users",
-            "auth_roles",
             "auth_refresh_tokens",
             "auth_tokens",
             "auth_audit_logs",
@@ -556,12 +539,8 @@ fn char_literal() { let slash = '/'; }
             self.tables["auth_users"]["retention_policy"],
         )
         self.assertIn(
-            "identity, grants, and sessions",
+            "two fixed role grants",
             self.tables["auth_users"]["merge_guidance"],
-        )
-        self.assertIn(
-            "delete only after dependent auth_user_roles",
-            self.tables["auth_roles"]["retention_policy"],
         )
         self.assertIn(
             "bounded keyed batches",
@@ -829,7 +808,7 @@ fn char_literal() { let slash = '/'; }
                 "user_preferences",
             ],
             "crates/services/src/storage.rs": [
-                "validate_core_schema_table_claim",
+                "publish_core_schema_contract",
                 "verify_core_schema_shape",
             ],
         }
@@ -942,11 +921,11 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("one row per Run", row["retention_policy"])
 
     def test_auth_grants_use_product_identity(self) -> None:
-        role_row = self.tables["auth_user_roles"]
-        self.assertEqual(role_row["primary_key"], ["user_id", "role_id"])
+        role_row = self.tables["auth_users"]
+        self.assertEqual(role_row["primary_key"], ["user_id"])
         self.assertEqual(role_row["auto_increment_columns"], [])
         self.assertEqual(role_row["auto_increment_hotspot_risk"], "not_applicable")
-        self.assertIn("many-to-many grant fact", role_row["merge_guidance"])
+        self.assertIn("two fixed role grants", role_row["merge_guidance"])
 
     def test_mcp_registry_uses_owner_bound_string_identity(self) -> None:
         server_row = self.tables["mcp_servers"]

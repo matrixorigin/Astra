@@ -907,31 +907,6 @@ impl DatabaseAuthService {
         }
     }
 
-    async fn ensure_default_roles(&self, pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
-        for (role_id, role_name, description) in [
-            (
-                "role-admin",
-                "astra_admin",
-                "Administrator with full system access",
-            ),
-            (
-                "role-user",
-                "astra_user",
-                "Regular user with limited access",
-            ),
-        ] {
-            query(
-                "INSERT IGNORE INTO auth_roles (role_id, role_name, description) VALUES (?, ?, ?)",
-            )
-            .bind(role_id)
-            .bind(role_name)
-            .bind(description)
-            .execute(pool)
-            .await?;
-        }
-        Ok(())
-    }
-
     async fn fetch_user_by_username(
         &self,
         executor: impl sqlx::Executor<'_, Database = MySql>,
@@ -1599,9 +1574,6 @@ impl AuthService for DatabaseAuthService {
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        self.ensure_default_roles(&pool)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "register.ensure_default_roles", Some(&pool)))?;
         if self
             .fetch_user_by_username(&pool, &request.username)
             .await
@@ -1630,24 +1602,19 @@ impl AuthService for DatabaseAuthService {
         let user_id = Uuid::new_v4().to_string();
         let display_name = request.display_name.clone();
 
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "register.begin_tx", Some(&pool)))?;
         let insert_result = query(
-            "INSERT INTO auth_users (user_id, username, email, password_hash, display_name, is_active) \
-             VALUES (?, ?, ?, ?, ?, 1)",
+            "INSERT INTO auth_users (user_id, username, email, password_hash, display_name, is_active, has_user_role) \
+             VALUES (?, ?, ?, ?, ?, 1, 1)",
         )
         .bind(&user_id)
         .bind(&request.username)
         .bind(&request.email)
         .bind(&password_hash)
         .bind(&display_name)
-        .execute(&mut *tx)
+        .execute(&pool)
         .await;
 
         if let Err(error) = insert_result {
-            tx.rollback().await.ok();
             if is_duplicate_key_error(&error) {
                 if self
                     .fetch_user_by_username(&pool, &request.username)
@@ -1680,20 +1647,6 @@ impl AuthService for DatabaseAuthService {
                 Some(&pool),
             ));
         }
-
-        query(
-            "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
-             SELECT ?, r.role_id FROM auth_roles r \
-             WHERE r.role_name = 'astra_user'",
-        )
-        .bind(&user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "register.assign_user_role", Some(&pool)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "register.commit_tx", Some(&pool)))?;
 
         Ok(AuthUserRecord {
             user_id,

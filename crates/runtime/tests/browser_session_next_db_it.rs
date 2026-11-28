@@ -587,7 +587,7 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
     server.abort();
     other_server.abort();
     failure_server.abort();
-    for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
+    for table in ["auth_refresh_tokens", "auth_users"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ?"
         )))
@@ -596,7 +596,7 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         .await
         .unwrap();
     }
-    for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
+    for table in ["auth_refresh_tokens", "auth_users"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ?"
         )))

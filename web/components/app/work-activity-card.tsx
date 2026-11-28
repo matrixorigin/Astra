@@ -16,13 +16,7 @@ const EVENT_LABELS: Record<WorkEventKind, string> = {
   proposal_rejected: "Suggestion rejected",
   check_recorded: "Verification evidence recorded",
   gaps_accepted: "Known gaps accepted for review",
-  run_completed: "Astra finished the latest run",
-  run_delegated: "Astra delegated the next workstream",
-  run_failed: "The latest run stopped with an error",
-  run_cancelled: "The latest run was cancelled",
   recovery_point_captured: "Progress saved",
-  runtime_events_expired:
-    "Some older runtime updates expired before projection",
 };
 
 export function WorkActivityCard({

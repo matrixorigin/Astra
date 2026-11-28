@@ -301,7 +301,6 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
 
     for table in [
         "works",
-        "work_goal_revisions",
         "work_criterion_sets",
         "work_item_revisions",
         "work_graph_revisions",

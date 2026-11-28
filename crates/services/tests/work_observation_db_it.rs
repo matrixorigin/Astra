@@ -470,7 +470,7 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn missing_current_source_fails_closed_instead_of_fabricating_partial_facts() {
+async fn invalid_goal_fails_closed_instead_of_fabricating_partial_facts() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let owner_id = common::id("owner");
@@ -480,14 +480,12 @@ async fn missing_current_source_fails_closed_instead_of_fabricating_partial_fact
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
-    sqlx::query(
-        "DELETE FROM work_goal_revisions WHERE owner_id = ? AND work_id = ? AND revision = 1",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .execute(pool.get())
-    .await
-    .expect("remove current Goal source");
+    sqlx::query("UPDATE works SET goal_text = '' WHERE owner_id = ? AND work_id = ?")
+        .bind(&owner_id)
+        .bind(&work_id)
+        .execute(pool.get())
+        .await
+        .expect("corrupt the Work goal");
 
     assert!(matches!(
         repository

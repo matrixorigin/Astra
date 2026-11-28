@@ -145,8 +145,8 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         } if attempt_id == &second_attempt_id && item_id.as_str() == task_b
     ));
     let nonterminal_cuts: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM work_terminal_cuts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+        "SELECT COUNT(*) FROM work_item_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND terminal_graph_revision IS NOT NULL",
     )
     .bind(&owner_id)
     .bind(&work_id)
@@ -198,8 +198,8 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         .expect("settle second primary attempt");
     assert_eq!(terminal.advance, PrimaryWorkAttemptAdvance::Complete);
     let terminal_cut: (i64, String, i64) = sqlx::query_as(
-        "SELECT graph_revision, attempt_id, control_epoch FROM work_terminal_cuts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND graph_revision = ?",
+        "SELECT terminal_graph_revision, attempt_id, terminal_control_epoch FROM work_item_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND terminal_graph_revision = ?",
     )
     .bind(&owner_id)
     .bind(&work_id)
@@ -240,8 +240,8 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         "a replay with different trusted intent epoch must conflict"
     );
     let replayed_cut: (String, i64) = sqlx::query_as(
-        "SELECT attempt_id, control_epoch FROM work_terminal_cuts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND graph_revision = ?",
+        "SELECT attempt_id, terminal_control_epoch FROM work_item_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND terminal_graph_revision = ?",
     )
     .bind(&owner_id)
     .bind(&work_id)
@@ -257,40 +257,21 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
     );
 
     let duplicate_graph_cut = sqlx::query(
-        "INSERT INTO work_terminal_cuts
-         (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch)
-         VALUES (?, ?, ?, 2, ?, 88)",
+        "UPDATE work_item_attempts SET terminal_graph_revision = 2, terminal_control_epoch = 88
+         WHERE owner_id = ? AND attempt_id = ?",
     )
     .bind(&owner_id)
-    .bind(&work_id)
-    .bind(&branch_id)
-    .bind(common::id("duplicate-terminal-cut"))
+    .bind(&first_attempt_id)
     .execute(pool.get())
     .await;
     assert!(
         duplicate_graph_cut.is_err(),
         "the same terminal graph cut with a different epoch must violate uniqueness"
     );
-    let duplicate_attempt_cut = sqlx::query(
-        "INSERT INTO work_terminal_cuts
-         (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch)
-         VALUES (?, ?, ?, 3, ?, 7)",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .bind(&branch_id)
-    .bind(second_attempt_id.as_str())
-    .execute(pool.get())
-    .await;
-    assert!(
-        duplicate_attempt_cut.is_err(),
-        "one immutable attempt must not publish a second graph cut"
-    );
-
     // A replay reads the existing settlement and must never manufacture a
     // missing terminal cut without a durable deferred-mutation transition.
     // This ordinary graph has no such recovery authority.
-    sqlx::query("DELETE FROM work_terminal_cuts WHERE owner_id = ? AND attempt_id = ?")
+    sqlx::query("UPDATE work_item_attempts SET terminal_graph_revision = NULL, terminal_control_epoch = NULL WHERE owner_id = ? AND attempt_id = ?")
         .bind(&owner_id)
         .bind(second_attempt_id.as_str())
         .execute(pool.get())
@@ -321,8 +302,8 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         "a fresh executor must not backfill an ordinary deleted cut either"
     );
     let replay_cut: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM work_terminal_cuts
-         WHERE owner_id = ? AND attempt_id = ?",
+        "SELECT COUNT(*) FROM work_item_attempts
+         WHERE owner_id = ? AND attempt_id = ? AND terminal_graph_revision IS NOT NULL",
     )
     .bind(&owner_id)
     .bind(second_attempt_id.as_str())
@@ -335,13 +316,10 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
     );
 
     sqlx::query(
-        "INSERT INTO work_terminal_cuts
-         (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch)
-         VALUES (?, ?, ?, 2, ?, -2)",
+        "UPDATE work_item_attempts SET terminal_graph_revision = 2, terminal_control_epoch = -2
+         WHERE owner_id = ? AND attempt_id = ?",
     )
     .bind(&owner_id)
-    .bind(&work_id)
-    .bind(&branch_id)
     .bind(second_attempt_id.as_str())
     .execute(pool.get())
     .await
@@ -448,14 +426,18 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
         .expect("begin primary attempt");
     let competing_attempt_id = common::id("competing-attempt");
     sqlx::query(
-        "INSERT INTO work_terminal_cuts
-         (owner_id, work_id, branch_id, graph_revision, attempt_id, control_epoch)
-         VALUES (?, ?, ?, 2, ?, 41)",
+        "INSERT INTO work_item_attempts
+         (owner_id, work_id, branch_id, work_item_id, work_item_revision, attempt_id,
+          executor_run_id, execution_mode, status, graph_revision, unavailable_capabilities_json,
+          outcome, summary_text, settled_at, terminal_graph_revision, terminal_control_epoch)
+         VALUES (?, ?, ?, 'competing-item', 1, ?, ?, 'primary', 'completed', 2, '[]',
+                 'delivered', 'competing result', NOW(6), 2, 41)",
     )
     .bind(&owner_id)
     .bind(&work_id)
     .bind(&branch_id)
     .bind(&competing_attempt_id)
+    .bind(&run_id)
     .execute(pool.get())
     .await
     .expect("publish competing terminal cut fixture");
@@ -494,8 +476,8 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
         "terminal-cut conflict must roll back the settlement update"
     );
     let retained_cut: (String, i64) = sqlx::query_as(
-        "SELECT attempt_id, control_epoch FROM work_terminal_cuts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND graph_revision = 2",
+        "SELECT attempt_id, terminal_control_epoch FROM work_item_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND terminal_graph_revision = 2",
     )
     .bind(&owner_id)
     .bind(&work_id)

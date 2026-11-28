@@ -455,9 +455,9 @@ impl DatabaseToolInvocationLedger {
             .await?
         };
         let cursor: Option<(u64, String)> = sqlx::query_as(
-            "SELECT scan_generation, CAST(updated_at AS CHAR)
-             FROM maintenance_sweep_cursors
-             WHERE sweep_name = 'tool_invocation_compaction_v1'",
+            "SELECT scan_generation, CAST(compaction_updated_at AS CHAR)
+             FROM sweeper_leases
+             WHERE sweeper_name = 'runtime_sweepers'",
         )
         .fetch_optional(self.pool.get())
         .await?;

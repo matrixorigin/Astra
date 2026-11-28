@@ -153,8 +153,8 @@ async fn terminal_cut_count(
     branch_id: &astra_services::work::WorkBranchId,
 ) -> i64 {
     sqlx::query_scalar(
-        "SELECT COUNT(*) FROM work_terminal_cuts \
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+        "SELECT COUNT(*) FROM work_item_attempts \
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND terminal_graph_revision IS NOT NULL",
     )
     .bind(owner.as_str())
     .bind(work_id.as_str())
@@ -560,20 +560,17 @@ async fn delayed_cancel_and_add_apply_only_after_delivered_and_recover_once() {
     assert!(pruned.pending_graph_mutations().is_empty());
     assert_eq!(pruned.applied_graph_mutations().len(), 1);
 
-    // A pre-association accepted revision is still applied, but its historic
-    // trigger cannot be reconstructed. Never infer that it belongs to the
-    // current attempt.
+    // An accepted revision without trigger provenance must never be attributed to the current attempt.
     sqlx::query(
-        "DELETE FROM work_proposal_trigger_attempts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+        "UPDATE work_establishment_operations SET mutation_triggers_json = NULL
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
     )
     .bind(owner.as_str())
     .bind(applied.basis().work_id.as_str())
     .bind(applied.basis().branch_id.as_str())
-    .bind(proposal_id.as_str())
     .execute(pool.get())
     .await
-    .expect("remove trigger association for legacy recovery");
+    .expect("remove trigger provenance");
     let legacy = repository
         .load_task_execution_snapshot_for_session(&owner, &session)
         .await
@@ -746,16 +743,19 @@ async fn trigger_marker_conflict_rolls_back_settlement_and_delivery() {
         .expect("mutation proposal identity");
     let conflicting_attempt = format!("conflicting-attempt-{}", Uuid::new_v4());
     sqlx::query(
-        "INSERT INTO work_proposal_trigger_attempts
-         (owner_id, work_id, branch_id, proposal_id, trigger_attempt_id,
-          trigger_item_id, trigger_item_revision)
-         VALUES (?, ?, ?, ?, ?, 'task-1', 1)",
+        "UPDATE work_establishment_operations SET mutation_triggers_json = ?
+         WHERE owner_id = ? AND operation_id = ?",
+    )
+    .bind(
+        serde_json::json!({
+            (proposal_id.as_str()): {
+                "attempt_id": conflicting_attempt, "item_id": "task-1", "item_revision": 1
+            }
+        })
+        .to_string(),
     )
     .bind(owner.as_str())
-    .bind(request.work_id.as_str())
-    .bind(request.branch_id.as_str())
-    .bind(proposal_id.as_str())
-    .bind(&conflicting_attempt)
+    .bind(&request.operation_id)
     .execute(pool.get())
     .await
     .expect("seed conflicting trigger marker");
@@ -789,13 +789,12 @@ async fn trigger_marker_conflict_rolls_back_settlement_and_delivery() {
         "delivery must roll back with the conflicting marker"
     );
     let marker_attempt: String = sqlx::query_scalar(
-        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(mutation_triggers_json, ?))
+         FROM work_establishment_operations WHERE owner_id = ? AND operation_id = ?",
     )
+    .bind(format!(r#"$."{}".attempt_id"#, proposal_id.as_str()))
     .bind(owner.as_str())
-    .bind(request.work_id.as_str())
-    .bind(request.branch_id.as_str())
-    .bind(proposal_id.as_str())
+    .bind(&request.operation_id)
     .fetch_one(pool.get())
     .await
     .expect("conflicting marker remains authoritative");
@@ -903,18 +902,17 @@ async fn multi_trigger_mutation_records_only_the_final_settlement() {
             request.branch_id.as_str(),
         )
         .expect("multi-trigger proposal identity");
-    let marker_attempt: Option<String> = sqlx::query_scalar(
-        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    let marker_attempt: String = sqlx::query_scalar(
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(mutation_triggers_json, ?))
+         FROM work_establishment_operations WHERE owner_id = ? AND operation_id = ?",
     )
+    .bind(format!(r#"$."{}".attempt_id"#, proposal_id.as_str()))
     .bind(owner.as_str())
-    .bind(request.work_id.as_str())
-    .bind(request.branch_id.as_str())
-    .bind(proposal_id.as_str())
-    .fetch_optional(pool.get())
+    .bind(&request.operation_id)
+    .fetch_one(pool.get())
     .await
     .expect("load final trigger marker");
-    assert_eq!(marker_attempt.as_deref(), Some(second_attempt.as_str()));
+    assert_eq!(marker_attempt, second_attempt.as_str());
 
     // Replaying the first trigger while the group is still pending must not
     // overwrite the final trigger association.
@@ -934,13 +932,12 @@ async fn multi_trigger_mutation_records_only_the_final_settlement() {
         PrimaryWorkAttemptAdvance::GraphMutationPending
     );
     let marker_after_first_replay: String = sqlx::query_scalar(
-        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(mutation_triggers_json, ?))
+         FROM work_establishment_operations WHERE owner_id = ? AND operation_id = ?",
     )
+    .bind(format!(r#"$."{}".attempt_id"#, proposal_id.as_str()))
     .bind(owner.as_str())
-    .bind(request.work_id.as_str())
-    .bind(request.branch_id.as_str())
-    .bind(proposal_id.as_str())
+    .bind(&request.operation_id)
     .fetch_one(pool.get())
     .await
     .expect("marker after first replay");
@@ -967,13 +964,12 @@ async fn multi_trigger_mutation_records_only_the_final_settlement() {
         "the final trigger replay may finish the canonical graph"
     );
     let marker_after_second_replay: String = sqlx::query_scalar(
-        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
-         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(mutation_triggers_json, ?))
+         FROM work_establishment_operations WHERE owner_id = ? AND operation_id = ?",
     )
+    .bind(format!(r#"$."{}".attempt_id"#, proposal_id.as_str()))
     .bind(owner.as_str())
-    .bind(request.work_id.as_str())
-    .bind(request.branch_id.as_str())
-    .bind(proposal_id.as_str())
+    .bind(&request.operation_id)
     .fetch_one(pool.get())
     .await
     .expect("marker after final replay");

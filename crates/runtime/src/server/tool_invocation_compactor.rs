@@ -4,8 +4,8 @@ use astra_core::SharedPool;
 use chrono::NaiveDateTime;
 
 const COMPACTION_INTERVAL_SECS: u64 = 300;
-const COMPACTION_CURSOR_NAME: &str = "tool_invocation_compaction_v1";
-const COMPACTION_CURSOR_EPOCH: &str = "1970-01-01 00:00:00.000000";
+const COMPACTION_CURSOR_NAME: &str = "runtime_sweepers";
+const COMPACTION_CURSOR_EPOCH: NaiveDateTime = chrono::DateTime::UNIX_EPOCH.naive_utc();
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ToolInvocationCompactionSweepOutcome {
@@ -117,30 +117,33 @@ async fn claim_compaction_candidates(
     cursor_name: &str,
     limit: i64,
 ) -> Result<(Vec<(String, String, String)>, bool), sqlx::Error> {
-    let mut tx = pool.get().begin().await?;
+    let mut connection = pool.get().acquire().await?;
     sqlx::query(
-        "INSERT IGNORE INTO maintenance_sweep_cursors
-         (sweep_name, cursor_updated_at, cursor_user_id, cursor_run_id)
-         VALUES (?, ?, '', '')",
+        "INSERT IGNORE INTO sweeper_leases (sweeper_name, owner_pod_id, expires_at)
+         VALUES (?, '', ?)",
     )
     .bind(cursor_name)
     .bind(COMPACTION_CURSOR_EPOCH)
-    .execute(&mut *tx)
+    .execute(&mut *connection)
     .await?;
-    let (mut cursor_updated_at, mut cursor_user_id, mut cursor_run_id): (
+    let (cursor_updated_at, cursor_user_id, cursor_run_id, scan_generation, lease_owner): (
         NaiveDateTime,
         String,
         String,
+        u64,
+        String,
     ) = sqlx::query_as(
-        "SELECT cursor_updated_at, cursor_user_id, cursor_run_id
-         FROM maintenance_sweep_cursors WHERE sweep_name = ? FOR UPDATE",
+        "SELECT cursor_updated_at, cursor_user_id, cursor_run_id, scan_generation, owner_pod_id
+         FROM sweeper_leases WHERE sweeper_name = ?",
     )
     .bind(cursor_name)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *connection)
     .await?;
 
+    // The scan can examine many ineligible Runs. Keep the shared lease row
+    // available to other sweepers and claim the page with a short CAS below.
     let mut candidates = load_compaction_candidates_after(
-        &mut tx,
+        &mut connection,
         cursor_updated_at,
         &cursor_user_id,
         &cursor_run_id,
@@ -150,44 +153,46 @@ async fn claim_compaction_candidates(
     let cursor_wrapped = candidates.is_empty()
         && (!cursor_user_id.is_empty()
             || !cursor_run_id.is_empty()
-            || cursor_updated_at
-                != NaiveDateTime::parse_from_str(COMPACTION_CURSOR_EPOCH, "%Y-%m-%d %H:%M:%S%.f")
-                    .expect("static compaction cursor epoch is valid"));
+            || cursor_updated_at != COMPACTION_CURSOR_EPOCH);
     if cursor_wrapped {
-        cursor_updated_at =
-            NaiveDateTime::parse_from_str(COMPACTION_CURSOR_EPOCH, "%Y-%m-%d %H:%M:%S%.f")
-                .expect("static compaction cursor epoch is valid");
-        cursor_user_id.clear();
-        cursor_run_id.clear();
         candidates = load_compaction_candidates_after(
-            &mut tx,
-            cursor_updated_at,
-            &cursor_user_id,
-            &cursor_run_id,
+            &mut connection,
+            COMPACTION_CURSOR_EPOCH,
+            "",
+            "",
             limit,
         )
         .await?;
     }
-
-    if let Some((user_id, _session_id, run_id, updated_at)) = candidates.last() {
-        cursor_updated_at = *updated_at;
-        cursor_user_id.clone_from(user_id);
-        cursor_run_id.clone_from(run_id);
+    if candidates.is_empty() && !cursor_wrapped {
+        return Ok((Vec::new(), false));
     }
-    sqlx::query(
-        "UPDATE maintenance_sweep_cursors
+    let (next_updated_at, next_user_id, next_run_id) = candidates.last().map_or(
+        (COMPACTION_CURSOR_EPOCH, "", ""),
+        |(user_id, _, run_id, updated_at)| (*updated_at, user_id.as_str(), run_id.as_str()),
+    );
+    let advanced = sqlx::query(
+        "UPDATE sweeper_leases
          SET cursor_updated_at = ?, cursor_user_id = ?, cursor_run_id = ?,
-             scan_generation = scan_generation + ?, updated_at = CURRENT_TIMESTAMP(6)
-         WHERE sweep_name = ?",
+             scan_generation = scan_generation + ?, compaction_updated_at = CURRENT_TIMESTAMP(6)
+         WHERE sweeper_name = ? AND owner_pod_id = ? AND scan_generation = ?
+           AND cursor_updated_at = ? AND cursor_user_id = ? AND cursor_run_id = ?",
     )
-    .bind(cursor_updated_at)
-    .bind(&cursor_user_id)
-    .bind(&cursor_run_id)
+    .bind(next_updated_at)
+    .bind(next_user_id)
+    .bind(next_run_id)
     .bind(u8::from(cursor_wrapped))
     .bind(cursor_name)
-    .execute(&mut *tx)
+    .bind(lease_owner)
+    .bind(scan_generation)
+    .bind(cursor_updated_at)
+    .bind(cursor_user_id)
+    .bind(cursor_run_id)
+    .execute(&mut *connection)
     .await?;
-    tx.commit().await?;
+    if advanced.rows_affected() != 1 {
+        return Ok((Vec::new(), false));
+    }
     Ok((
         candidates
             .into_iter()
@@ -198,7 +203,7 @@ async fn claim_compaction_candidates(
 }
 
 async fn load_compaction_candidates_after(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    connection: &mut sqlx::MySqlConnection,
     cursor_updated_at: NaiveDateTime,
     cursor_user_id: &str,
     cursor_run_id: &str,
@@ -230,7 +235,7 @@ async fn load_compaction_candidates_after(
     .bind(cursor_user_id)
     .bind(cursor_run_id)
     .bind(limit)
-    .fetch_all(&mut **tx)
+    .fetch_all(connection)
     .await
 }
 
@@ -699,15 +704,15 @@ mod tests {
             .await
             .unwrap();
         }
-        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+        sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(&cursor_name)
             .execute(pool.get())
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO maintenance_sweep_cursors
-             (sweep_name, cursor_updated_at, cursor_user_id, cursor_run_id)
-             VALUES (?, '2089-12-31 23:59:59.000000', '', '')",
+            "INSERT INTO sweeper_leases
+             (sweeper_name, owner_pod_id, expires_at, cursor_updated_at)
+             VALUES (?, '', '1970-01-01 00:00:00', '2089-12-31 23:59:59.000000')",
         )
         .bind(&cursor_name)
         .execute(pool.get())
@@ -725,6 +730,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![run_ids[0].as_str(), run_ids[1].as_str()]
         );
+        sqlx::query(
+            "UPDATE sweeper_leases
+             SET owner_pod_id = 'cursor-test-takeover', expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
+             WHERE sweeper_name = ?",
+        )
+        .bind(&cursor_name)
+        .execute(pool.get())
+        .await
+        .expect("take over the lease between cursor pages");
         let (second, second_wrapped) = claim_compaction_candidates(&pool, &cursor_name, 2)
             .await
             .unwrap();
@@ -745,7 +759,7 @@ mod tests {
             "the durable cursor must wrap after reaching the end of the keyset"
         );
 
-        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+        sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ?")
             .bind(&cursor_name)
             .execute(pool.get())
             .await

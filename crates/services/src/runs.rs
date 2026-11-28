@@ -8342,23 +8342,6 @@ fn orphaned_run_cancellation_terminal_event(
     })
 }
 
-async fn enqueue_work_terminal_event_for_run(
-    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    run: &DurableRunRecord,
-    next_status: &str,
-) -> Result<(), String> {
-    crate::work::enqueue_root_run_terminal_event(
-        transaction,
-        &run.run_id,
-        &run.user_id,
-        run.parent_run_id.as_deref(),
-        run.work_binding.as_ref(),
-        &run.status,
-        next_status,
-    )
-    .await
-}
-
 fn new_idempotent_events(
     existing: &[serde_json::Value],
     incoming: &[serde_json::Value],
@@ -12888,7 +12871,6 @@ impl DatabaseRunStateStore {
             connection.release();
             return Ok(StatusTransitionCommit::default());
         }
-        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
 
         if !event_rows.is_empty() {
             let insert_result = Self::insert_run_event_rows_tx(
@@ -17213,7 +17195,6 @@ impl DatabaseRunStateStore {
                     },
                 ));
             }
-            enqueue_work_terminal_event_for_run(&mut tx, &run, STATUS_CANCELLED).await?;
             Self::insert_run_event_rows_tx(
                 &mut tx,
                 request.run_id,
@@ -18715,7 +18696,6 @@ impl RunStateStore for DatabaseRunStateStore {
                 })?;
                 return Ok::<(bool, Option<String>), String>((false, None));
             }
-            enqueue_work_terminal_event_for_run(&mut tx, &run, STATUS_CANCELLED).await?;
             Self::insert_run_event_rows_tx(
                 &mut tx,
                 request.run_id,
@@ -21224,7 +21204,6 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(GuardedRunStatusTransition::SessionBlocked);
         }
-        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
 
         Self::insert_run_event_rows_tx(
             &mut tx,
@@ -50062,7 +50041,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_orphan_cancellation_is_atomic_and_enqueues_work_cancelled() {
+    async fn database_orphan_cancellation_is_atomic_for_work_bound_runs() {
         use crate::work::{GraphRevision, WorkBranchId, WorkId};
 
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -50079,19 +50058,6 @@ mod tests {
             let branch_id = format!("orphan-branch-{nonce}");
             cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
             insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-            if bind_work {
-                sqlx::query(
-                    "INSERT INTO work_runtime_event_outbox_slots
-                     (owner_id, work_id, last_enqueued_event_seq,
-                      last_projected_event_seq, has_pending)
-                     VALUES (?, ?, 0, 0, 0)",
-                )
-                .bind(&user_id)
-                .bind(&work_id)
-                .execute(pool.get())
-                .await
-                .expect("seed Work runtime event slot");
-            }
 
             let mut run = durable_run_record(&run_id);
             run.user_id = user_id.clone();
@@ -50233,36 +50199,6 @@ mod tests {
             .await
             .expect("read released session slot");
             assert_eq!(slot_count, 0, "{suffix}");
-            if bind_work {
-                let event_kind: String = sqlx::query_scalar(
-                    "SELECT event_kind FROM work_runtime_event_outbox
-                     WHERE owner_id = ? AND work_id = ?",
-                )
-                .bind(&user_id)
-                .bind(&work_id)
-                .fetch_one(pool.get())
-                .await
-                .expect("read Work cancellation outbox");
-                assert_eq!(event_kind, "run_cancelled");
-                sqlx::query(
-                    "DELETE FROM work_runtime_event_outbox
-                     WHERE owner_id = ? AND work_id = ?",
-                )
-                .bind(&user_id)
-                .bind(&work_id)
-                .execute(pool.get())
-                .await
-                .expect("clean Work cancellation outbox");
-                sqlx::query(
-                    "DELETE FROM work_runtime_event_outbox_slots
-                     WHERE owner_id = ? AND work_id = ?",
-                )
-                .bind(&user_id)
-                .bind(&work_id)
-                .execute(pool.get())
-                .await
-                .expect("clean Work runtime slot");
-            }
             cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
             sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
                 .bind(&user_id)

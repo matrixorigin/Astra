@@ -18,12 +18,7 @@ async fn database_admin_paths_reject_corrupt_required_fields() {
 
     let username = format!("admin_corrupt_{}", Uuid::new_v4().simple());
     let email = format!("{username}@example.test");
-    let role_id = Uuid::new_v4().to_string();
-    let role_name = format!("role_{}", Uuid::new_v4().simple());
 
-    let _ = sqlx::query("DELETE FROM auth_user_roles WHERE user_id = ''")
-        .execute(&pool)
-        .await;
     let _ = sqlx::query("DELETE FROM auth_users WHERE user_id = ''")
         .execute(&pool)
         .await;
@@ -37,17 +32,11 @@ async fn database_admin_paths_reject_corrupt_required_fields() {
     .execute(&pool)
     .await
     .expect("insert corrupt auth user");
-    sqlx::query("INSERT INTO auth_roles (role_id, role_name) VALUES (?, ?)")
-        .bind(&role_id)
-        .bind(&role_name)
-        .execute(&pool)
-        .await
-        .expect("insert auth role");
 
     let err = role_manager
         .grant_role(AdminUserRoleRequestData {
             username: username.clone(),
-            role_name: role_name.clone(),
+            role_name: "astra_admin".to_owned(),
         })
         .await
         .expect_err("empty persisted auth_users.user_id must fail loudly");
@@ -58,14 +47,6 @@ async fn database_admin_paths_reject_corrupt_required_fields() {
         err.1.detail
     );
 
-    let _ = sqlx::query("DELETE FROM auth_user_roles WHERE role_id = ?")
-        .bind(&role_id)
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM auth_roles WHERE role_id = ?")
-        .bind(&role_id)
-        .execute(&pool)
-        .await;
     let _ = sqlx::query("DELETE FROM auth_users WHERE username = ?")
         .bind(&username)
         .execute(&pool)

@@ -54,72 +54,23 @@ impl DatabaseAdminAuthorizer {
         }
     }
 
-    async fn query_user_exists(
+    async fn admin_role_for_user(
         &self,
         user_id: &str,
         username: Option<&str>,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<i16>, sqlx::Error> {
         let pool = self.get_pool().await?;
-        let exists = if let Some(username) = username {
-            query("SELECT 1 FROM auth_users WHERE user_id = ? OR username = ? LIMIT 1")
-                .bind(user_id)
-                .bind(username)
-                .fetch_optional(&pool)
-                .await?
-                .is_some()
-        } else {
-            query("SELECT 1 FROM auth_users WHERE user_id = ? LIMIT 1")
-                .bind(user_id)
-                .fetch_optional(&pool)
-                .await?
-                .is_some()
-        };
-        Ok(exists)
+        sqlx::query_scalar(
+            "SELECT is_admin FROM auth_users
+             WHERE user_id = ? OR username = ?
+             ORDER BY is_admin DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(username)
+        .fetch_optional(&pool)
+        .await
     }
 
-    async fn query_has_role(
-        &self,
-        user_id: &str,
-        username: Option<&str>,
-        role_name: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let pool = self.get_pool().await?;
-        let has_role = if let Some(username) = username {
-            query(
-                r#"
-                SELECT 1
-                FROM auth_user_roles ur
-                JOIN auth_roles r ON ur.role_id = r.role_id
-                JOIN auth_users u ON ur.user_id = u.user_id
-                WHERE r.role_name = ? AND (u.user_id = ? OR u.username = ?)
-                LIMIT 1
-                "#,
-            )
-            .bind(role_name)
-            .bind(user_id)
-            .bind(username)
-            .fetch_optional(&pool)
-            .await?
-            .is_some()
-        } else {
-            query(
-                r#"
-                SELECT 1
-                FROM auth_user_roles ur
-                JOIN auth_roles r ON ur.role_id = r.role_id
-                JOIN auth_users u ON ur.user_id = u.user_id
-                WHERE r.role_name = ? AND u.user_id = ?
-                LIMIT 1
-                "#,
-            )
-            .bind(role_name)
-            .bind(user_id)
-            .fetch_optional(&pool)
-            .await?
-            .is_some()
-        };
-        Ok(has_role)
-    }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
@@ -156,20 +107,12 @@ impl AdminAuthorizer for DatabaseAdminAuthorizer {
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
         let username = claims.username.clone();
 
-        if !self
-            .query_user_exists(&user_id, username.as_deref())
+        let is_admin = self
+            .admin_role_for_user(&user_id, username.as_deref())
             .await
             .map_err(internal_error)?
-        {
-            return Err(error_response(StatusCode::UNAUTHORIZED, "User not found"));
-        }
-
-        let has_admin = self
-            .query_has_role(&user_id, username.as_deref(), "astra_admin")
-            .await
-            .map_err(internal_error)?;
-
-        if !has_admin {
+            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+        if is_admin != 1 {
             return Err(error_response(StatusCode::FORBIDDEN, "Admin role required"));
         }
 
@@ -316,20 +259,42 @@ impl DatabaseAdminUserRoleManager {
             })
     }
 
-    async fn lookup_role_id(
+    async fn set_role(
         &self,
-        pool: &sqlx::Pool<MySql>,
-        role_name: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
-        query("SELECT role_id FROM auth_roles WHERE role_name = ? LIMIT 1")
-            .bind(role_name)
-            .fetch_optional(pool)
+        request: AdminUserRoleRequestData,
+        grant: bool,
+    ) -> Result<AdminUserRoleRecord, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let user_id = self
+            .lookup_user_id(&pool, &request.username)
             .await
-            .and_then(|row| {
-                row.map(|row| required_admin_string(&row, "auth_roles", "role_id"))
-                    .transpose()
-            })
+            .map_err(internal_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
+        let column = role_column(&request.role_name)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Role not found"))?;
+        let sql = format!("UPDATE auth_users SET {column} = ? WHERE user_id = ? AND {column} <> ?");
+        let changed = query(sqlx::AssertSqlSafe(sql))
+            .bind(i16::from(grant))
+            .bind(user_id)
+            .bind(i16::from(grant))
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?
+            .rows_affected()
+            == 1;
+        let message = match (grant, changed) {
+            (true, true) => "Role granted successfully",
+            (true, false) => "User already has this role",
+            (false, true) => "Role revoked successfully",
+            (false, false) => "User does not have this role",
+        };
+        Ok(AdminUserRoleRecord {
+            username: request.username,
+            role_name: request.role_name,
+            message: message.to_string(),
+        })
     }
+
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
@@ -563,33 +528,18 @@ impl AdminInitializer for DatabaseAdminInitializer {
             .await
             .map_err(internal_error)?;
 
-        for (role_id, role_name, description) in [
-            (
-                "role-admin",
-                "astra_admin",
-                "Administrator with full system access",
-            ),
-            (
-                "role-user",
-                "astra_user",
-                "Regular user with limited access",
-            ),
-        ] {
-            query(
-                "INSERT IGNORE INTO auth_roles (role_id, role_name, description) VALUES (?, ?, ?)",
-            )
-            .bind(role_id)
-            .bind(role_name)
-            .bind(description)
-            .execute(&pool)
-            .await
-            .map_err(internal_error)?;
-        }
-
         Ok(AdminInitRecord {
             message: "Database initialized successfully".to_string(),
             tables_created: 0,
         })
+    }
+}
+
+fn role_column(role_name: &str) -> Option<&'static str> {
+    match role_name {
+        "astra_admin" => Some("is_admin"),
+        "astra_user" => Some("has_user_role"),
+        _ => None,
     }
 }
 
@@ -599,103 +549,30 @@ impl AdminUserRoleManager for DatabaseAdminUserRoleManager {
         &self,
         role_name: &str,
     ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let Some(column) = role_column(role_name) else {
+            return Ok(false);
+        };
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let has_members = query(
-            "SELECT 1 \
-             FROM auth_user_roles ur \
-             JOIN auth_roles r ON ur.role_id = r.role_id \
-             WHERE r.role_name = ? \
-             LIMIT 1",
-        )
-        .bind(role_name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?
-        .is_some();
-        Ok(has_members)
+        let sql = format!("SELECT 1 FROM auth_users WHERE {column} = 1 LIMIT 1");
+        Ok(query(sqlx::AssertSqlSafe(sql))
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?
+            .is_some())
     }
 
     async fn grant_role(
         &self,
         request: AdminUserRoleRequestData,
     ) -> Result<AdminUserRoleRecord, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let user_id = self
-            .lookup_user_id(&pool, &request.username)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
-        let role_id = self
-            .lookup_role_id(&pool, &request.role_name)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Role not found"))?;
-
-        let existing =
-            query("SELECT 1 FROM auth_user_roles WHERE user_id = ? AND role_id = ? LIMIT 1")
-                .bind(&user_id)
-                .bind(&role_id)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?
-                .is_some();
-
-        if existing {
-            return Ok(AdminUserRoleRecord {
-                username: request.username,
-                role_name: request.role_name,
-                message: "User already has this role".to_string(),
-            });
-        }
-
-        query("INSERT INTO auth_user_roles (user_id, role_id) VALUES (?, ?)")
-            .bind(&user_id)
-            .bind(&role_id)
-            .execute(&pool)
-            .await
-            .map_err(internal_error)?;
-
-        Ok(AdminUserRoleRecord {
-            username: request.username,
-            role_name: request.role_name,
-            message: "Role granted successfully".to_string(),
-        })
+        self.set_role(request, true).await
     }
 
     async fn revoke_role(
         &self,
         request: AdminUserRoleRequestData,
     ) -> Result<AdminUserRoleRecord, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let user_id = self
-            .lookup_user_id(&pool, &request.username)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
-        let role_id = self
-            .lookup_role_id(&pool, &request.role_name)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Role not found"))?;
-
-        let result = query("DELETE FROM auth_user_roles WHERE user_id = ? AND role_id = ?")
-            .bind(&user_id)
-            .bind(&role_id)
-            .execute(&pool)
-            .await
-            .map_err(internal_error)?;
-
-        Ok(AdminUserRoleRecord {
-            username: request.username,
-            role_name: request.role_name,
-            message: if result.rows_affected() > 0 {
-                "Role revoked successfully".to_string()
-            } else {
-                "User does not have this role".to_string()
-            },
-        })
+        self.set_role(request, false).await
     }
 }
 

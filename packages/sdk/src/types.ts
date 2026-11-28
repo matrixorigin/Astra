@@ -3041,12 +3041,7 @@ export type WorkEventKind =
   | "proposal_rejected"
   | "check_recorded"
   | "gaps_accepted"
-  | "run_completed"
-  | "run_delegated"
-  | "run_failed"
-  | "run_cancelled"
-  | "recovery_point_captured"
-  | "runtime_events_expired";
+  | "recovery_point_captured";
 
 export type WorkEventRecordV1 = {
   event_seq: number;

@@ -46,12 +46,7 @@ pub enum WorkEventKind {
     ProposalRejected,
     CheckRecorded,
     GapsAccepted,
-    RunCompleted,
-    RunDelegated,
-    RunFailed,
-    RunCancelled,
     RecoveryPointCaptured,
-    RuntimeEventsExpired,
 }
 
 impl WorkEventKind {
@@ -70,12 +65,7 @@ impl WorkEventKind {
             Self::ProposalRejected => "proposal_rejected",
             Self::CheckRecorded => "check_recorded",
             Self::GapsAccepted => "gaps_accepted",
-            Self::RunCompleted => "run_completed",
-            Self::RunDelegated => "run_delegated",
-            Self::RunFailed => "run_failed",
-            Self::RunCancelled => "run_cancelled",
             Self::RecoveryPointCaptured => "recovery_point_captured",
-            Self::RuntimeEventsExpired => "runtime_events_expired",
         }
     }
 
@@ -94,12 +84,7 @@ impl WorkEventKind {
             "proposal_rejected" => Some(Self::ProposalRejected),
             "check_recorded" => Some(Self::CheckRecorded),
             "gaps_accepted" => Some(Self::GapsAccepted),
-            "run_completed" => Some(Self::RunCompleted),
-            "run_delegated" => Some(Self::RunDelegated),
-            "run_failed" => Some(Self::RunFailed),
-            "run_cancelled" => Some(Self::RunCancelled),
             "recovery_point_captured" => Some(Self::RecoveryPointCaptured),
-            "runtime_events_expired" => Some(Self::RuntimeEventsExpired),
             _ => None,
         }
     }

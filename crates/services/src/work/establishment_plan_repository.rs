@@ -10,6 +10,20 @@ use super::{
 use sqlx::{MySql, QueryBuilder, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkMutationTrigger {
+    pub(super) attempt_id: String,
+    pub(super) item_id: String,
+    pub(super) item_revision: i64,
+}
+
+pub(super) fn decode_mutation_triggers(
+    json: Option<&str>,
+) -> Result<BTreeMap<String, WorkMutationTrigger>, serde_json::Error> {
+    json.map_or_else(|| Ok(BTreeMap::new()), serde_json::from_str)
+}
+
 pub(super) async fn load_graph_mutation_barrier(
     tx: &mut Transaction<'_, MySql>,
     owner: &WorkOwnerId,
@@ -26,7 +40,7 @@ pub(super) async fn load_graph_mutation_barrier(
     // The existing owner/session recovery index selects this one genesis.
     // Completed establishment is still the immutable owner of future changes.
     let rows = sqlx::query(
-        "SELECT operation_id, payload_json FROM work_establishment_operations
+        "SELECT operation_id, payload_json, mutation_triggers_json FROM work_establishment_operations
          WHERE owner_id = ? AND session_id = ? AND work_id = ? AND branch_id = ?
            AND operation_state IN ('pending', 'complete')
          ORDER BY operation_id LIMIT 2",
@@ -63,6 +77,11 @@ pub(super) async fn load_graph_mutation_barrier(
         if decision.deferred_graph_mutations().is_empty() {
             continue;
         }
+        let triggers: Option<String> = row
+            .try_get("mutation_triggers_json")
+            .map_err(|e| WorkRepositoryError::corrupt("Work mutation trigger manifest", e))?;
+        let triggers = decode_mutation_triggers(triggers.as_deref())
+            .map_err(|e| WorkRepositoryError::corrupt("Work mutation trigger manifest", e))?;
         let (_, tasks) = decision
             .initial_work_plan()
             .ok_or_else(|| corrupt("scheduled mutations require an initial Work graph".into()))?;
@@ -99,24 +118,14 @@ pub(super) async fn load_graph_mutation_barrier(
         // may later be pruned. `patch_ref` is the server-derived proposal ID,
         // so this bounded lookup remains branch-safe without scanning history.
         let mut query = QueryBuilder::<MySql>::new(
-            "SELECT g.patch_ref AS proposal_id, g.revision AS result_graph_revision,
-                    t.trigger_attempt_id, t.trigger_item_id, t.trigger_item_revision
-               FROM work_graph_revisions g
-               LEFT JOIN work_proposal_trigger_attempts t
-                 ON t.owner_id = g.owner_id
-                AND t.work_id = g.work_id
-                AND t.branch_id = ",
+            "SELECT patch_ref AS proposal_id, revision AS result_graph_revision
+             FROM work_graph_revisions WHERE owner_id = ",
         );
         query
-            .push_bind(snapshot.basis().branch_id.as_str())
-            .push(
-                " AND t.proposal_id = g.patch_ref
-              WHERE g.owner_id = ",
-            )
             .push_bind(owner.as_str())
-            .push(" AND g.work_id = ")
+            .push(" AND work_id = ")
             .push_bind(snapshot.basis().work_id.as_str())
-            .push(" AND g.patch_ref IN (");
+            .push(" AND patch_ref IN (");
         let mut ids = query.separated(", ");
         for id in &proposal_ids {
             ids.push_bind(id.as_str());
@@ -134,34 +143,24 @@ pub(super) async fn load_graph_mutation_barrier(
                 .map_err(|e| WorkRepositoryError::corrupt("Work mutation graph revision", e))?;
             let result_graph_revision = GraphRevision::new(result_graph_revision)
                 .map_err(|e| corrupt(format!("invalid accepted graph revision: {e}")))?;
-            let trigger_attempt_id = row
-                .try_get::<Option<String>, _>("trigger_attempt_id")
-                .map_err(|e| WorkRepositoryError::corrupt("Work mutation trigger attempt", e))?;
-            let trigger_item_id = row
-                .try_get::<Option<String>, _>("trigger_item_id")
-                .map_err(|e| WorkRepositoryError::corrupt("Work mutation trigger item", e))?;
-            let trigger_item_revision = row
-                .try_get::<Option<i64>, _>("trigger_item_revision")
-                .map_err(|e| WorkRepositoryError::corrupt("Work mutation trigger revision", e))?;
-            let trigger = match (trigger_attempt_id, trigger_item_id, trigger_item_revision) {
-                (None, None, None) => None,
-                (Some(attempt_id), Some(item_id), Some(revision)) => Some((
-                    WorkItemAttemptId::parse(attempt_id)
-                        .map_err(|e| corrupt(format!("invalid mutation trigger attempt: {e}")))?,
-                    WorkItemRevisionRef {
-                        item_id: WorkItemId::parse(item_id)
-                            .map_err(|e| corrupt(format!("invalid mutation trigger item: {e}")))?,
-                        revision: WorkItemRevision::new(revision).map_err(|e| {
-                            corrupt(format!("invalid mutation trigger revision: {e}"))
-                        })?,
-                    },
-                )),
-                _ => {
-                    return Err(corrupt(
-                        "mutation trigger association has a partial identity".into(),
-                    ));
-                }
-            };
+            let trigger = triggers
+                .get(&proposal_id)
+                .map(|trigger| {
+                    let attempt = WorkItemAttemptId::parse(trigger.attempt_id.as_str())
+                        .map_err(|e| corrupt(format!("invalid mutation trigger attempt: {e}")))?;
+                    let item = WorkItemId::parse(trigger.item_id.as_str())
+                        .map_err(|e| corrupt(format!("invalid mutation trigger item: {e}")))?;
+                    let revision = WorkItemRevision::new(trigger.item_revision)
+                        .map_err(|e| corrupt(format!("invalid mutation trigger revision: {e}")))?;
+                    Ok::<_, WorkRepositoryError>((
+                        attempt,
+                        WorkItemRevisionRef {
+                            item_id: item,
+                            revision,
+                        },
+                    ))
+                })
+                .transpose()?;
             if accepted
                 .insert(proposal_id, (result_graph_revision, trigger))
                 .is_some()
@@ -295,42 +294,71 @@ pub(super) async fn record_graph_mutation_trigger_attempts(
             std::io::Error::other("settlement item is outside a due mutation trigger set"),
         ));
     }
-    let rows = groups
-        .iter()
-        .map(|group| {
-            let proposal_id = group
-                .proposal_id(
-                    owner.as_str(),
-                    session.as_str(),
-                    snapshot.basis().work_id.as_str(),
-                    snapshot.basis().branch_id.as_str(),
+    let operation_id = &groups[0].operation_id;
+    let trigger = WorkMutationTrigger {
+        attempt_id: trigger_attempt_id.as_str().to_owned(),
+        item_id: trigger_item.item_id.as_str().to_owned(),
+        item_revision: trigger_item.revision.get(),
+    };
+    let mut patch = BTreeMap::new();
+    for group in groups {
+        let proposal_id = group
+            .proposal_id(
+                owner.as_str(),
+                session.as_str(),
+                snapshot.basis().work_id.as_str(),
+                snapshot.basis().branch_id.as_str(),
+            )
+            .map_err(|error| {
+                WorkRepositoryError::corrupt(
+                    "Work mutation trigger identity",
+                    std::io::Error::other(error),
                 )
-                .map_err(|error| {
-                    WorkRepositoryError::corrupt(
-                        "Work mutation trigger identity",
-                        std::io::Error::other(error),
-                    )
-                })?;
-            Ok::<_, WorkRepositoryError>(proposal_id)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut query = QueryBuilder::<MySql>::new(
-        "INSERT INTO work_proposal_trigger_attempts
-         (owner_id, work_id, branch_id, proposal_id, trigger_attempt_id,
-          trigger_item_id, trigger_item_revision) ",
+            })?;
+        if group.operation_id != *operation_id
+            || patch
+                .insert(proposal_id.as_str().to_owned(), &trigger)
+                .is_some()
+        {
+            return Err(WorkRepositoryError::corrupt(
+                "Work mutation triggers",
+                std::io::Error::other("incoherent establishment mutation groups"),
+            ));
+        }
+    }
+    let json = serde_json::to_string(&patch)
+        .map_err(|error| WorkRepositoryError::corrupt("Work mutation triggers", error))?;
+    let mut update = QueryBuilder::<MySql>::new(
+        "UPDATE work_establishment_operations SET mutation_triggers_json =
+         JSON_MERGE_PATCH(COALESCE(mutation_triggers_json, '{}'), CAST(",
     );
-    query.push_values(rows, |mut values, proposal_id| {
-        values
-            .push_bind(owner.as_str().to_string())
-            .push_bind(snapshot.basis().work_id.as_str().to_string())
-            .push_bind(snapshot.basis().branch_id.as_str().to_string())
-            .push_bind(proposal_id.as_str().to_string())
-            .push_bind(trigger_attempt_id.as_str().to_string())
-            .push_bind(trigger_item.item_id.as_str().to_string())
-            .push_bind(trigger_item.revision.get());
-    });
-    query.build().execute(&mut **tx).await.map_err(|error| {
+    update
+        .push_bind(json)
+        .push(" AS JSON)) WHERE owner_id = ")
+        .push_bind(owner.as_str())
+        .push(" AND operation_id = ")
+        .push_bind(operation_id.as_str())
+        .push(" AND work_id = ")
+        .push_bind(snapshot.basis().work_id.as_str())
+        .push(" AND branch_id = ")
+        .push_bind(snapshot.basis().branch_id.as_str())
+        .push(" AND session_id = ")
+        .push_bind(session.as_str())
+        .push(" AND operation_state IN ('pending', 'complete')");
+    for proposal_id in patch.keys() {
+        update
+            .push(" AND JSON_EXTRACT(mutation_triggers_json, ")
+            .push_bind(format!(r#"$."{proposal_id}""#))
+            .push(") IS NULL");
+    }
+    let result = update.build().execute(&mut **tx).await.map_err(|error| {
         WorkRepositoryError::persistence("record Work mutation trigger attempts", error)
     })?;
+    if result.rows_affected() != 1 {
+        return Err(WorkRepositoryError::corrupt(
+            "Work mutation triggers",
+            std::io::Error::other("establishment operation missing or trigger already recorded"),
+        ));
+    }
     Ok(())
 }

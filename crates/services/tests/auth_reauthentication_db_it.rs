@@ -160,11 +160,6 @@ async fn reauthentication_proofs_are_owner_purpose_expiry_and_one_time_bound() {
         .execute(shared_pool.get())
         .await
         .expect("cleanup proofs");
-    sqlx::query("DELETE FROM auth_user_roles WHERE user_id = ?")
-        .bind(&user.user_id)
-        .execute(shared_pool.get())
-        .await
-        .expect("cleanup roles");
     sqlx::query("DELETE FROM auth_users WHERE user_id = ?")
         .bind(&user.user_id)
         .execute(shared_pool.get())

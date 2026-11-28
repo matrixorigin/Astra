@@ -19,7 +19,7 @@ impl DatabaseAuthService {
             .unwrap_or_else(|| format!("ext_{}", sha256_hex(&format!("{provider}\0{subject}"))));
         let username = format!("ext_{}", &sha256_hex(&user)[..24]);
         if new_account {
-            sqlx::query("INSERT IGNORE INTO auth_users (user_id,username,email,password_hash,display_name,is_active) VALUES (?, ?, ?, '', 'Astra user', 1)")
+            sqlx::query("INSERT IGNORE INTO auth_users (user_id,username,email,password_hash,display_name,is_active,has_user_role) VALUES (?, ?, ?, '', 'Astra user', 1, 1)")
                 .bind(&user).bind(&username).bind(format!("{username}@external.astra.invalid"))
                 .execute(&mut **tx).await.map_err(internal_error)?;
         }
@@ -31,10 +31,6 @@ impl DatabaseAuthService {
         }
         sqlx::query("INSERT IGNORE INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?, ?, ?)")
             .bind(provider).bind(subject).bind(&user).execute(&mut **tx).await.map_err(internal_error)?;
-        if new_account {
-            sqlx::query("INSERT IGNORE INTO auth_user_roles (user_id,role_id) SELECT ?, role_id FROM auth_roles WHERE role_name = 'astra_user'")
-                .bind(&user).execute(&mut **tx).await.map_err(internal_error)?;
-        }
         Ok(super::DatabaseUserRecord {
             user_id: user,
             username: row.try_get("username").map_err(internal_error)?,

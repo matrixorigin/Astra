@@ -1628,21 +1628,15 @@ async fn login_user(
 }
 
 async fn grant_admin(pool: &MySqlPool, user_id: &str) -> AnyResult<()> {
-    sqlx::query(
-        "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
-         SELECT ?, role_id FROM auth_roles WHERE role_name = 'astra_admin' LIMIT 1",
-    )
-    .bind(user_id)
-    .execute(pool)
-    .await?;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM auth_user_roles ur \
-         INNER JOIN auth_roles r ON r.role_id = ur.role_id \
-         WHERE ur.user_id = ? AND r.role_name = 'astra_admin'",
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await?;
+    sqlx::query("UPDATE auth_users SET is_admin = 1 WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_users WHERE user_id = ? AND is_admin = 1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
     if count != 1 {
         return Err(invalid(format!(
             "expected exactly one astra_admin binding, found {count}"
