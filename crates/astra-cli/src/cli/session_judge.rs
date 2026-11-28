@@ -44,6 +44,63 @@ fn client_failure_kind(error: &ThinClientError) -> ErrorKind {
     }
 }
 
+fn judgment_session_request(client_session_ref: Option<String>) -> SessionCreateRequest {
+    SessionCreateRequest {
+        client_session_ref,
+        title: Some("Evidence judgment".into()),
+        metadata: Some(serde_json::Map::from_iter([
+            ("purpose".into(), json!("verification_judge")),
+            ("source".into(), json!("cli_session_judge")),
+        ])),
+        ..Default::default()
+    }
+}
+
+/// The Server alone knows whether the caller is an ordinary Astra principal or
+/// a provider-authorized request. Ordinary principals must keep the ordinary
+/// creation path (a `client_session_ref` routes to provider-only creation and is
+/// rejected with 403), so the first attempt never carries one. Only the Server's
+/// explicit `client_session_ref_invalid` answer for a provider-authorized
+/// request selects the provider path, with a fresh namespaced reference.
+async fn create_judgment_session(api: &ThinClient, token: &str) -> Result<Value, ThinClientError> {
+    match api
+        .create_session(Some(token), &judgment_session_request(None))
+        .await
+    {
+        Err(error) if requires_client_session_ref(&error) => {
+            let client_session_ref = format!("session-judge-{}", uuid::Uuid::new_v4());
+            api.create_session(
+                Some(token),
+                &judgment_session_request(Some(client_session_ref)),
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+fn requires_client_session_ref(error: &ThinClientError) -> bool {
+    let ThinClientError::Api { status, body } = error else {
+        return false;
+    };
+    status.as_u16() == 400
+        && serde_json::from_str::<ErrorResponse>(body)
+            .ok()
+            .and_then(|response| response.error_code)
+            .as_deref()
+            == Some("client_session_ref_invalid")
+}
+
+/// Persisted Session IDs are UUIDs for ordinary creation and the lowercase
+/// 64-character SHA-256 hex identity for provider creation.
+fn is_persisted_session_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok()
+        || (id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
 /// The command's model selector uses the same catalog resolver as chat, with
 /// the typed judgment purpose retained on every catalog page.
 pub(crate) async fn execute_for_model(
@@ -88,22 +145,7 @@ pub(crate) async fn execute(
     };
     // A distinct real session keeps evaluation usage out of the measured agent
     // session. There is no agent run, local workspace, tool set, or chat turn.
-    let client_session_ref = format!("session-judge-{}", uuid::Uuid::new_v4());
-    let session = match api
-        .create_session(
-            Some(token),
-            &SessionCreateRequest {
-                client_session_ref: Some(client_session_ref),
-                title: Some("Evidence judgment".into()),
-                metadata: Some(serde_json::Map::from_iter([
-                    ("purpose".into(), json!("verification_judge")),
-                    ("source".into(), json!("cli_session_judge")),
-                ])),
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let session = match create_judgment_session(api, token).await {
         Ok(session) => session,
         Err(error) => {
             return json!({"ok": false, "stage": "create_session", "error_kind": client_failure_kind(&error), "error": error.to_string()});
@@ -112,7 +154,7 @@ pub(crate) async fn execute(
     let Some(session_id) = session
         .get("session_id")
         .and_then(Value::as_str)
-        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .filter(|id| is_persisted_session_id(id))
     else {
         return json!({"ok": false, "stage": "create_session", "error_kind": ErrorKind::ContractViolation, "error": "Server omitted a valid session_id"});
     };
@@ -390,14 +432,121 @@ mod tests {
         assert_eq!(body["timeout_ms"], 37_000);
         assert!(body.get("tools").is_none());
         let session_create: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let client_ref = session_create["client_session_ref"]
-            .as_str()
-            .expect("judgment session must carry provider idempotency identity");
-        let uuid = client_ref
-            .strip_prefix("session-judge-")
-            .expect("judgment identity must use the session-judge namespace");
-        uuid::Uuid::parse_str(uuid).expect("judgment identity suffix must be a UUID");
+        assert!(
+            session_create.get("client_session_ref").is_none(),
+            "an ordinary Astra principal must keep the ordinary Session creation path"
+        );
         assert!(!session_create.to_string().contains("quoted evidence"));
+    }
+
+    /// Provider-created Session IDs are SHA-256 hex, as produced by
+    /// `ProviderSessionCreationIdentity` on the Server.
+    const PROVIDER_SESSION: &str =
+        "4f8b0a3c9d2e7f1a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a";
+
+    async fn provider_session_server() -> MockServer {
+        let server = MockServer::start().await;
+        // Same contract as `create_session_handler`: a provider-authorized
+        // request without a reference is rejected before creation.
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"title":"Evidence judgment"}),
+            ))
+            .and(|request: &wiremock::Request| {
+                serde_json::from_slice::<Value>(&request.body)
+                    .map(|body| body.get("client_session_ref").is_none())
+                    .unwrap_or(false)
+            })
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "detail": "Provider session creation requires client_session_ref",
+                "error_code": "client_session_ref_invalid"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .and(|request: &wiremock::Request| {
+                serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body["client_session_ref"].as_str().map(str::to_owned))
+                    .is_some_and(|reference| reference.starts_with("session-judge-"))
+            })
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "session_id": PROVIDER_SESSION, "title": "Evidence judgment", "status": "active"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"session_id": PROVIDER_SESSION}),
+            ))
+            .respond_with(completion())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{PROVIDER_SESSION}/close")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn provider_principal_judgment_uses_provider_session_id_for_inference_and_cleanup() {
+        let server = provider_session_server().await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["session_id"], PROVIDER_SESSION);
+        let requests = server.received_requests().await.unwrap();
+        let creates: Vec<Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/sessions")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(creates.len(), 2);
+        assert!(creates[0].get("client_session_ref").is_none());
+        let reference = creates[1]["client_session_ref"].as_str().unwrap();
+        uuid::Uuid::parse_str(reference.strip_prefix("session-judge-").unwrap())
+            .expect("judgment identity suffix must be a UUID");
+        assert!(!creates[1].to_string().contains("quoted evidence"));
+        // `MockServer` drop verifies the completion and close reached the
+        // provider-created ID exactly once.
+    }
+
+    #[tokio::test]
+    async fn ordinary_principal_forbidden_reference_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "detail": "client_session_ref requires provider request authorization",
+                "error_code": "provider_session_creation_forbidden"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["stage"], "create_session");
+    }
+
+    #[test]
+    fn persisted_session_id_contract_accepts_uuid_and_provider_hash_only() {
+        assert!(is_persisted_session_id(SESSION));
+        assert!(is_persisted_session_id(PROVIDER_SESSION));
+        assert!(!is_persisted_session_id(&PROVIDER_SESSION.to_uppercase()));
+        assert!(!is_persisted_session_id(&PROVIDER_SESSION[..63]));
+        assert!(!is_persisted_session_id(&format!("{PROVIDER_SESSION}0")));
+        assert!(!is_persisted_session_id("../sessions"));
+        assert!(!is_persisted_session_id(""));
     }
 
     #[tokio::test]
