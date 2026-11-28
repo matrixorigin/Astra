@@ -570,7 +570,7 @@ async fn delayed_cancel_and_add_apply_only_after_delivered_and_recover_once() {
     .bind(applied.basis().branch_id.as_str())
     .execute(pool.get())
     .await
-    .expect("remove trigger association for legacy recovery");
+    .expect("remove trigger provenance");
     let legacy = repository
         .load_task_execution_snapshot_for_session(&owner, &session)
         .await
@@ -902,17 +902,17 @@ async fn multi_trigger_mutation_records_only_the_final_settlement() {
             request.branch_id.as_str(),
         )
         .expect("multi-trigger proposal identity");
-    let marker_attempt: Option<String> = sqlx::query_scalar(
+    let marker_attempt: String = sqlx::query_scalar(
         "SELECT JSON_UNQUOTE(JSON_EXTRACT(mutation_triggers_json, ?))
          FROM work_establishment_operations WHERE owner_id = ? AND operation_id = ?",
     )
     .bind(format!(r#"$."{}".attempt_id"#, proposal_id.as_str()))
     .bind(owner.as_str())
     .bind(&request.operation_id)
-    .fetch_optional(pool.get())
+    .fetch_one(pool.get())
     .await
     .expect("load final trigger marker");
-    assert_eq!(marker_attempt.as_deref(), Some(second_attempt.as_str()));
+    assert_eq!(marker_attempt, second_attempt.as_str());
 
     // Replaying the first trigger while the group is still pending must not
     // overwrite the final trigger association.
