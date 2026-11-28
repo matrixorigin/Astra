@@ -4,6 +4,7 @@ import type { WorkCatalogPageV1 } from "@astra/sdk";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import {
   classifyWorkActionError,
+  WORK_OBSERVATION_TIMEOUT_MS,
   type WorkActionError,
 } from "@/lib/work-action-error";
 
@@ -18,7 +19,11 @@ export async function refreshNowWorkAction(): Promise<RefreshNowWorkResult> {
       auth: "required",
       operation: "refresh Now",
     });
-    return { ok: true, page: await runtime.sdk.listWorks({ limit: 20 }) };
+    const page = await runtime.sdk.listWorks({
+      limit: 20,
+      signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
+    });
+    return { ok: true, page };
   } catch (error) {
     const known = classifyWorkActionError(error);
     if (known) return known;

@@ -36,6 +36,7 @@ test("opens a durable read attachment after resolving the public delivery branch
     branch_revision: 1,
     activity: "idle",
     observed_at: "2026-08-01T00:00:00Z",
+    event_head: 3,
   } as never;
   const execution = {
     schema_version: 1,

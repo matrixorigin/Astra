@@ -223,6 +223,15 @@ delivery and usage records. Event identity collisions use the original
 event's hash and emit structured diagnostics. Fresh bootstrap declares
 106 tables.
 
+Fresh schema contract v130 retires Work read receipts and attachment
+quarantines. Event pages read the current head, retention boundary, and
+bounded event slice together. Browsing Work uses read-only activity and
+event queries. The Work event sequence owns event allocation.
+An attachment with a divergent manifest returns
+`fork_required` directly from the manifest read. An explicit fork or a
+compatible attachment can then proceed through its normal authority checks.
+Fresh bootstrap declares 104 tables.
+
 ## Session-memory recovery journal
 
 Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed

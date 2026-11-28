@@ -21,9 +21,7 @@ import {
   type WorkCriteriaProposalDecisionInput,
   type WorkCriteriaProposalDetailV1,
   type WorkCriteriaProposalSummaryV1,
-  type WorkReadCursorReceiptV1,
   type WorkTranscriptPageV1,
-  type WorkEventPageV1,
   type WorkTaskGraphCursorV1,
   type WorkTaskGraphPageV2,
   decodeWorkBranchComparisonReportV2,
@@ -32,6 +30,7 @@ import {
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import {
   classifyWorkActionError,
+  WORK_OBSERVATION_TIMEOUT_MS,
   type WorkActionError,
 } from "@/lib/work-action-error";
 import {
@@ -49,10 +48,6 @@ export type ResolveCriteriaProposalResult =
       detail: WorkCriteriaProposalDetailV1;
       snapshot: WorkOverviewSnapshot;
     }
-  | WorkActionError;
-
-export type MarkWorkSeenResult =
-  | { ok: true; receipt: WorkReadCursorReceiptV1 }
   | WorkActionError;
 
 export type LoadWorkTranscriptResult =
@@ -109,17 +104,6 @@ export type RefreshWorkTaskGraphResult = LoadWorkTaskGraphPageResult;
 
 export type RefreshWorkBranchActivityResult =
   | { ok: true; activity: WorkBranchActivityResponseV1 }
-  | WorkActionError;
-
-/**
- * The lightweight live cursor used by the Work detail page.  A Work event
- * head is the shared cross-surface clock: polling it lets Web notice a turn
- * started in TUI (or on another Edge) without loading the whole transcript on
- * every tick.  The event page is read-only and never advances the user's
- * seen cursor.
- */
-export type RefreshWorkEventsResult =
-  | { ok: true; page: Pick<WorkEventPageV1, "work_id" | "event_head" | "events"> }
   | WorkActionError;
 
 export type LoadWorkExecutionResult =
@@ -225,12 +209,9 @@ export async function respondWorkBranchInteractionAction(
   }
 }
 
-type RefreshWorkBranchInteractionsInput = { workId: string; branchId: string };
+type WorkBranchIdentityInput = { workId: string; branchId: string };
 
-function validRefreshWorkBranchInteractionsInput(
-  input: RefreshWorkBranchInteractionsInput,
-): boolean {
-  const value = input as unknown;
+function validWorkBranchIdentity(value: unknown): value is WorkBranchIdentityInput {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const object = value as Record<string, unknown>;
   return (
@@ -242,9 +223,9 @@ function validRefreshWorkBranchInteractionsInput(
 
 /** Read the current pending Work interaction without acquiring control. */
 export async function refreshWorkBranchInteractionsAction(
-  input: RefreshWorkBranchInteractionsInput,
+  input: WorkBranchIdentityInput,
 ): Promise<RefreshWorkBranchInteractionsResult> {
-  if (!validRefreshWorkBranchInteractionsInput(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return {
       ok: false,
       status: 400,
@@ -259,7 +240,9 @@ export async function refreshWorkBranchInteractionsAction(
     });
     return {
       ok: true,
-      page: await runtime.sdk.getWorkBranchInteractions(input.workId, input.branchId),
+      page: await runtime.sdk.getWorkBranchInteractions(input.workId, input.branchId, {
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
+      }),
     };
   } catch (error) {
     const known = classifyWorkActionError(error);
@@ -268,29 +251,11 @@ export async function refreshWorkBranchInteractionsAction(
   }
 }
 
-type RefreshWorkBranchActivityInput = {
-  workId: string;
-  branchId: string;
-};
-
-function validWorkBranchActivityInput(
-  input: RefreshWorkBranchActivityInput,
-): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    canonicalWorkIdentity(object.branchId)
-  );
-}
-
 /** Read the current branch's server-owned Run activity without acquiring control. */
 export async function refreshWorkBranchActivityAction(
-  input: RefreshWorkBranchActivityInput,
+  input: WorkBranchIdentityInput,
 ): Promise<RefreshWorkBranchActivityResult> {
-  if (!validWorkBranchActivityInput(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return {
       ok: false,
       status: 400,
@@ -305,86 +270,22 @@ export async function refreshWorkBranchActivityAction(
     });
     return {
       ok: true,
-      activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId),
+      activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId, {
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
+      }),
     };
   } catch (error) {
     const known = classifyWorkActionError(error);
     if (known) return known;
     throw error;
   }
-}
-
-type RefreshWorkEventsInput = {
-  workId: string;
-  afterEventSeq: number;
-};
-
-function validWorkEventsInput(input: RefreshWorkEventsInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "afterEventSeq\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    Number.isSafeInteger(object.afterEventSeq) &&
-    Number(object.afterEventSeq) >= 1
-  );
-}
-
-/** Read only the Work event head so every surface can converge on live state. */
-export async function refreshWorkEventsAction(
-  input: RefreshWorkEventsInput,
-): Promise<RefreshWorkEventsResult> {
-  if (!validWorkEventsInput(input)) {
-    return {
-      ok: false,
-      status: 400,
-      code: "invalid_work_events_query",
-      retryable: false,
-    };
-  }
-  try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "refresh Work events",
-    });
-    const page = await runtime.sdk.listWorkEvents(input.workId, {
-      afterEventSeq: input.afterEventSeq,
-      limit: 1,
-    });
-    return {
-      ok: true,
-      page: {
-        work_id: page.work_id,
-        event_head: page.event_head,
-        events: page.events,
-      },
-    };
-  } catch (error) {
-    const known = classifyWorkActionError(error);
-    if (known) return known;
-    throw error;
-  }
-}
-
-type WorkExecutionIdentityInput = { workId: string; branchId: string };
-
-function validWorkExecutionIdentity(input: WorkExecutionIdentityInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    canonicalWorkIdentity(object.branchId)
-  );
 }
 
 /** Read the authoritative provider/generation without acquiring control. */
 export async function loadWorkExecutionAction(
-  input: WorkExecutionIdentityInput,
+  input: WorkBranchIdentityInput,
 ): Promise<LoadWorkExecutionResult> {
-  if (!validWorkExecutionIdentity(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return { ok: false, status: 400, code: "invalid_work_execution_query", retryable: false };
   }
   try {
@@ -405,9 +306,9 @@ export async function loadWorkExecutionAction(
 
 /** Read the bounded owner-scoped Edge target directory on demand. */
 export async function loadWorkExecutionTargetsAction(
-  input: WorkExecutionIdentityInput,
+  input: WorkBranchIdentityInput,
 ): Promise<LoadWorkExecutionTargetsResult> {
-  if (!validWorkExecutionIdentity(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return { ok: false, status: 400, code: "invalid_work_execution_query", retryable: false };
   }
   try {
@@ -426,7 +327,7 @@ export async function loadWorkExecutionTargetsAction(
   }
 }
 
-type SwitchWorkExecutionInput = WorkExecutionIdentityInput & {
+type SwitchWorkExecutionInput = WorkBranchIdentityInput & {
   requestId: string;
   attachmentId: string;
   expectedGeneration: number;
@@ -481,7 +382,7 @@ export async function switchWorkExecutionAction(
   }
 }
 
-type WorkExecutionSwitchIdentityInput = WorkExecutionIdentityInput & {
+type WorkExecutionSwitchIdentityInput = WorkBranchIdentityInput & {
   operationId: string;
 };
 
@@ -570,27 +471,11 @@ export async function retryWorkExecutionSwitchAction(
   }
 }
 
-type RefreshWorkTaskGraphInput = {
-  workId: string;
-  branchId: string;
-};
-
-function validTaskGraphIdentity(input: RefreshWorkTaskGraphInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  return (
-    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    canonicalWorkIdentity(object.branchId)
-  );
-}
-
 /** Read only the bounded Task Graph head used for active-run visualization. */
 export async function refreshWorkTaskGraphAction(
-  input: RefreshWorkTaskGraphInput,
+  input: WorkBranchIdentityInput,
 ): Promise<RefreshWorkTaskGraphResult> {
-  if (!validTaskGraphIdentity(input)) {
+  if (!validWorkBranchIdentity(input)) {
     return {
       ok: false,
       status: 400,
@@ -608,6 +493,7 @@ export async function refreshWorkTaskGraphAction(
       page: await runtime.sdk.getWorkTaskGraph(input.workId, input.branchId, {
         itemLimit: 8,
         dependencyLimit: 128,
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
       }),
     };
   } catch (error) {
@@ -675,6 +561,7 @@ export async function loadWorkTaskGraphPageAction(
         cursor: input.cursor,
         itemLimit: 8,
         dependencyLimit: 128,
+        signal: AbortSignal.timeout(WORK_OBSERVATION_TIMEOUT_MS),
       }),
     };
   } catch (error) {
@@ -724,11 +611,6 @@ type ResolveCriteriaProposalInput = {
   proposal: WorkCriteriaProposalSummaryV1;
   decision: WorkCriteriaProposalDecisionInput["decision"];
   requestId: string;
-};
-
-type MarkWorkSeenInput = {
-  workId: string;
-  throughEventSeq: number;
 };
 
 type LoadWorkTranscriptInput = {
@@ -1517,52 +1399,6 @@ export async function loadWorkTranscriptPageAction(
         beforeItemSeq: input.beforeItemSeq,
         limit: 50,
       }),
-    };
-  } catch (error) {
-    const known = classifyWorkActionError(error);
-    if (known) return known;
-    throw error;
-  }
-}
-
-function validMarkWorkSeenInput(input: MarkWorkSeenInput): boolean {
-  const value = input as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const object = value as Record<string, unknown>;
-  const fields = Object.keys(object).sort();
-  return (
-    fields.length === 2 &&
-    fields[0] === "throughEventSeq" &&
-    fields[1] === "workId" &&
-    canonicalWorkIdentity(object.workId) &&
-    typeof object.throughEventSeq === "number" &&
-    Number.isSafeInteger(object.throughEventSeq) &&
-    object.throughEventSeq >= 1
-  );
-}
-
-export async function markWorkSeenAction(
-  input: MarkWorkSeenInput,
-): Promise<MarkWorkSeenResult> {
-  if (!validMarkWorkSeenInput(input)) {
-    return {
-      ok: false,
-      status: 400,
-      code: "invalid_work_read_cursor_request",
-      retryable: false,
-    };
-  }
-  try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "mark Work updates seen",
-    });
-    return {
-      ok: true,
-      receipt: await runtime.sdk.advanceWorkReadCursor(
-        input.workId,
-        input.throughEventSeq,
-      ),
     };
   } catch (error) {
     const known = classifyWorkActionError(error);

@@ -211,7 +211,7 @@ fn mark_provider_attempt_context_expired_query(
     query
 }
 
-/// Keep a request-diagnostic scope bounded after appending an event.
+/// Prune a request-diagnostic scope after a guarded terminal append found it full.
 ///
 /// The event rows are diagnostic observability, not user-visible conversation
 /// history. Complete attempts are pruned as accepted/terminal pairs. If the
@@ -222,27 +222,6 @@ pub(crate) async fn compact_model_request_context_scope(
     user_id: &str,
     session_id: &str,
 ) -> ServiceResult<u64> {
-    let over_limit = sqlx::query_scalar::<_, String>(
-        "SELECT event_id FROM model_request_context_events
-         WHERE user_id = ? AND session_id = ? LIMIT 1 OFFSET ?",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "probe model request context scope retention",
-            error,
-        )
-    })?;
-
-    if over_limit.is_none() {
-        return Ok(0);
-    }
-
     let mut query = QueryBuilder::<MySql>::new(
         "SELECT context.attempt_id FROM model_request_context_events context",
     );

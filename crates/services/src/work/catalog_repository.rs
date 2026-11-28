@@ -1,6 +1,6 @@
 use super::catalog::{
-    WorkBranchActivity, WorkCatalogAttention, WorkCatalogCursor, WorkCatalogEntry, WorkCatalogPage,
-    WorkCatalogQuery, activity_from_durable_run_status,
+    WorkBranchActivity, WorkCatalogCursor, WorkCatalogEntry, WorkCatalogPage, WorkCatalogQuery,
+    activity_from_durable_run_status,
 };
 use super::proposal::WORK_PROPOSAL_MAX_PENDING_PER_BRANCH;
 use super::repository::{DatabaseWorkRepository, WorkRepositoryError};
@@ -18,7 +18,7 @@ pub(super) async fn list_catalog(
                 b.branch_revision, b.current_graph_revision,
                 b.session_id AS branch_session_id,
                 gr.item_count AS graph_item_count,
-                es.last_event_seq, r.seen_through_event_seq,
+                es.last_event_seq,
                 active.run_id AS active_run_id, active.status AS active_run_status,
                 active.waiting_for AS active_run_waiting_for,
                 active.session_id AS active_run_session_id,
@@ -48,8 +48,6 @@ pub(super) async fn list_catalog(
           AND gr.revision = b.current_graph_revision
          LEFT JOIN work_event_sequences es
            ON es.owner_id = w.owner_id AND es.work_id = w.work_id
-         LEFT JOIN work_attention_receipts r
-           ON r.owner_id = w.owner_id AND r.work_id = w.work_id
          LEFT JOIN agent_runs active
            ON active.user_id = w.owner_id AND active.session_id = b.session_id
           AND active.parent_run_id IS NULL AND active.retry_of IS NULL
@@ -111,21 +109,6 @@ fn decode_entry(row: sqlx::mysql::MySqlRow) -> Result<WorkCatalogEntry, WorkRepo
         .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?;
     let event_head = WorkEventSeq::new(integer("last_event_seq")?)
         .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?;
-    let seen_value = integer("seen_through_event_seq")?;
-    let seen_through_event_seq = if seen_value == 0 {
-        None
-    } else {
-        Some(
-            WorkEventSeq::new(seen_value)
-                .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?,
-        )
-    };
-    if seen_value > event_head.get() {
-        return Err(WorkRepositoryError::corrupt(
-            "Work catalog entry",
-            std::io::Error::other("seen cursor is ahead of the Work event head"),
-        ));
-    }
     let pending_value = integer("pending_decision_count")?;
     let pending_decision_count = u16::try_from(pending_value)
         .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?;
@@ -135,15 +118,6 @@ fn decode_entry(row: sqlx::mysql::MySqlRow) -> Result<WorkCatalogEntry, WorkRepo
             std::io::Error::other("pending decision count exceeds proposal admission capacity"),
         ));
     }
-    let unseen_event_count = u64::try_from(event_head.get() - seen_value)
-        .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?;
-    let attention = if pending_decision_count > 0 {
-        WorkCatalogAttention::NeedsReview
-    } else if unseen_event_count > 0 {
-        WorkCatalogAttention::Updated
-    } else {
-        WorkCatalogAttention::None
-    };
     let active_run_id = row
         .try_get::<Option<String>, _>("active_run_id")
         .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?;
@@ -167,9 +141,6 @@ fn decode_entry(row: sqlx::mysql::MySqlRow) -> Result<WorkCatalogEntry, WorkRepo
             .map_err(|source| WorkRepositoryError::corrupt("Work catalog entry", source))?,
         pending_decision_count,
         event_head,
-        seen_through_event_seq,
-        unseen_event_count,
-        attention,
         delivery_branch_activity,
         created_at: super::repository::decode_timestamp(
             "Work catalog entry",

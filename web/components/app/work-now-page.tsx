@@ -1,7 +1,6 @@
 "use client";
 
 import type {
-  WorkCatalogAttentionV1,
   WorkCatalogEntryV1,
   WorkCatalogPageV1,
 } from "@astra/sdk";
@@ -21,26 +20,9 @@ import { useVisiblePoll } from "@/lib/use-visible-poll";
 
 const NOW_REFRESH_INTERVAL_MS = 10_000;
 
-const GROUPS: Array<{
-  attention: WorkCatalogAttentionV1;
-  title: string;
-  description: string;
-}> = [
-  {
-    attention: "needs_review",
-    title: "Needs your review",
-    description: "Astra suggested a completion check; the Work can keep moving while you review it.",
-  },
-  {
-    attention: "updated",
-    title: "New activity",
-    description: "This Work changed since you last opened it.",
-  },
-  {
-    attention: "none",
-    title: "No action needed",
-    description: "These Works are saved and ready to continue when you are.",
-  },
+const GROUPS = [
+  { id: "review", title: "Needs your review", needsReview: true },
+  { id: "recent", title: "Recent work", needsReview: false },
 ];
 
 export function WorkNowPage({
@@ -163,22 +145,19 @@ export function WorkNowPage({
           <div className="mt-8 space-y-10">
             {GROUPS.map((group) => {
               const entries = currentPage.entries.filter(
-                (entry) => entry.attention === group.attention,
+                (entry) => (entry.pending_decision_count > 0) === group.needsReview,
               );
               if (entries.length === 0) return null;
               return (
-                <section key={group.attention} aria-labelledby={`now-${group.attention}`}>
+                <section key={group.id} aria-labelledby={`now-${group.id}`}>
                   <div className="flex items-end justify-between gap-4">
                     <div>
                       <h2
-                        id={`now-${group.attention}`}
+                        id={`now-${group.id}`}
                         className="text-sm font-semibold text-text"
                       >
                         {group.title}
                       </h2>
-                      <p className="mt-1 text-xs leading-5 text-text-muted">
-                        {group.description}
-                      </p>
                     </div>
                     <span className="text-xs tabular-nums text-text-muted">
                       {entries.length}
@@ -248,11 +227,7 @@ function WorkRow({
       <span
         className={cn(
           "size-2 shrink-0 rounded-full",
-          entry.attention === "needs_review"
-            ? "bg-warning"
-            : entry.attention === "updated"
-              ? "bg-accent"
-              : "bg-border-strong",
+          entry.pending_decision_count > 0 ? "bg-warning" : "bg-border-strong",
         )}
       />
       <div className="min-w-0 flex-1">
@@ -262,9 +237,7 @@ function WorkRow({
           {entry.graph_item_count === 1 ? "item" : "items"}
           {entry.pending_decision_count > 0
             ? ` · ${entry.pending_decision_count} to review`
-            : entry.unseen_event_count > 0
-              ? ` · ${entry.unseen_event_count} new`
-              : " · up to date"}
+            : null}
         </p>
         <p className="mt-1 text-xs font-medium text-accent opacity-0 transition group-hover:opacity-100 group-focus-visible:opacity-100">
           Open Work

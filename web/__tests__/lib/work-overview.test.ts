@@ -122,23 +122,15 @@ const taskGraph: WorkTaskGraphPageV2 = {
   dependencies: { offset: 0, limit: 16, total: 0, entries: [] },
 };
 
-const activityMetadata: WorkEventPageV1 = {
+const activityPage: WorkEventPageV1 = {
   schema_version: 1,
   work_id: "work-1",
-  requested_after_event_seq: 3,
+  requested_after_event_seq: null,
   next_after_event_seq: 3,
   event_head: 3,
-  retained_from_event_seq: 1,
-  seen_through_event_seq: 1,
-  coverage: "complete",
+  retained_from_event_seq: 2,
+  coverage: "expired",
   has_more: false,
-  events: [],
-};
-
-const activityPage: WorkEventPageV1 = {
-  ...activityMetadata,
-  requested_after_event_seq: 1,
-  next_after_event_seq: 3,
   events: [
     {
       event_seq: 2,
@@ -216,10 +208,7 @@ test("first Work paint loads bounded summaries without proposal payloads", async
   const getWorkCriteria = vi.fn().mockResolvedValue(criteria);
   const listWorkCriteriaProposals = vi.fn().mockResolvedValue(proposals);
   const getWorkTaskGraph = vi.fn().mockResolvedValue(taskGraph);
-  const listWorkEvents = vi
-    .fn()
-    .mockResolvedValueOnce(activityMetadata)
-    .mockResolvedValueOnce(activityPage);
+  const listWorkEvents = vi.fn().mockResolvedValue(activityPage);
 
   const result = await getWorkOverviewSnapshot(
     {
@@ -237,14 +226,7 @@ test("first Work paint loads bounded summaries without proposal payloads", async
     criteria,
     proposals,
     taskGraph,
-    activity: {
-      eventHead: 3,
-      seenThroughEventSeq: 1,
-      retainedFromEventSeq: 1,
-      unseenCount: 2,
-      truncated: false,
-      events: activityPage.events,
-    },
+    activity: activityPage.events,
   });
   expect(getWorkOverview).toHaveBeenCalledWith("work-1");
   expect(getWorkCriteria).toHaveBeenCalledWith("work-1", {
@@ -260,14 +242,7 @@ test("first Work paint loads bounded summaries without proposal payloads", async
     itemLimit: 8,
     dependencyLimit: 16,
   });
-  expect(listWorkEvents).toHaveBeenNthCalledWith(1, "work-1", {
-    afterEventSeq: 3,
-    limit: 1,
-  });
-  expect(listWorkEvents).toHaveBeenNthCalledWith(2, "work-1", {
-    afterEventSeq: 1,
-    limit: 12,
-  });
+  expect(listWorkEvents).toHaveBeenCalledExactlyOnceWith("work-1", { limit: 12 });
 });
 
 test("retries one causally mixed first paint and never returns the mixed projections", async () => {
@@ -280,11 +255,7 @@ test("retries one causally mixed first paint and never returns the mixed project
     .mockResolvedValueOnce(criteria);
   const listWorkCriteriaProposals = vi.fn().mockResolvedValue(proposals);
   const getWorkTaskGraph = vi.fn().mockResolvedValue(taskGraph);
-  const listWorkEvents = vi
-    .fn()
-    .mockResolvedValueOnce(activityMetadata)
-    .mockResolvedValueOnce(activityMetadata)
-    .mockResolvedValueOnce(activityPage);
+  const listWorkEvents = vi.fn().mockResolvedValue(activityPage);
 
   const result = await getWorkOverviewSnapshot(
     {
@@ -299,7 +270,7 @@ test("retries one causally mixed first paint and never returns the mixed project
 
   expect(getWorkOverview).toHaveBeenCalledTimes(2);
   expect(result.criteria.basis.work_revision).toBe(2);
-  expect(result.activity.events).toEqual(activityPage.events);
+  expect(result.activity).toEqual(activityPage.events);
 });
 
 test("loads an alternative by exact catalog identity and revision-pinned projections", async () => {
@@ -316,10 +287,7 @@ test("loads an alternative by exact catalog identity and revision-pinned project
   const getWorkTaskGraph = vi.fn((_: string, branchId: string) =>
     Promise.resolve(branchId === "alternative-branch" ? alternativeGraph : taskGraph),
   );
-  const listWorkEvents = vi
-    .fn()
-    .mockResolvedValueOnce(activityMetadata)
-    .mockResolvedValueOnce(activityPage);
+  const listWorkEvents = vi.fn().mockResolvedValue(activityPage);
   const listWorkBranches = vi.fn().mockResolvedValue(branchCatalog);
 
   const result = await getWorkBranchPresentation(
@@ -356,10 +324,7 @@ test("loads an alternative by exact catalog identity and revision-pinned project
 });
 
 test("rejects an unknown branch instead of guessing from branch text", async () => {
-  const listWorkEvents = vi
-    .fn()
-    .mockResolvedValueOnce(activityMetadata)
-    .mockResolvedValueOnce(activityPage);
+  const listWorkEvents = vi.fn().mockResolvedValue(activityPage);
   const reader = {
     getWorkOverview: vi.fn().mockResolvedValue(report),
     getWorkCriteria: vi.fn().mockResolvedValue(criteria),

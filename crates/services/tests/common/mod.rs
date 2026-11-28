@@ -146,7 +146,6 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("work_acceptance_decisions", "owner_id"),
         ("work_check_runs", "owner_id"),
         ("work_recovery_points", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
         ("work_event_sequences", "owner_id"),
         ("work_events", "owner_id"),
         ("work_proposals", "owner_id"),

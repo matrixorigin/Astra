@@ -7,9 +7,10 @@ use sqlx::{Acquire, Row};
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
 use crate::model_request_context::{
-    MODEL_REQUEST_CONTEXT_SCHEMA, MODEL_REQUEST_TERMINAL_SCHEMA, ModelRequestContextEvent,
-    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestRoute,
-    ModelRequestTerminalFact, ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
+    MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE, MODEL_REQUEST_CONTEXT_SCHEMA,
+    MODEL_REQUEST_TERMINAL_SCHEMA, ModelRequestContextEvent, ModelRequestContextSeed,
+    ModelRequestEventStage, ModelRequestIdentity, ModelRequestRoute, ModelRequestTerminalFact,
+    ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
     clear_model_request_measured_usage, compact_model_request_context_scope,
 };
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
@@ -773,45 +774,66 @@ async fn insert_model_request_context_event(
         (id, json)
     };
     let terminal_status = fact.as_ref().map(|fact| fact.terminal_status.as_str());
-    let session_id = attempt.invocation_input.scope.session_id();
-    let run_id = attempt.invocation_input.scope.run_id();
-    let insert_sql = matrixone_statement_with_null_shape(
-        "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
-          event_stage, terminal_status, event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        [
-            session_id.is_some(),
-            run_id.is_some(),
-            terminal_status.is_some(),
-        ],
-    );
-    sqlx::query(insert_sql)
-        .bind(event_id)
-        .bind(&attempt.user_id)
-        .bind(&attempt.attempt_id)
-        .bind(&attempt.invocation_id)
-        .bind(session_id)
-        .bind(run_id)
-        .bind(stage.as_str())
-        .bind(terminal_status)
-        .bind(event_json)
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert model request context event",
-                error,
-            )
-        })?;
     let session_id = match &attempt.invocation_input.scope {
         InferenceInvocationScope::Run { session_id, .. }
         | InferenceInvocationScope::Session { session_id, .. } => session_id,
     };
-    // A normal request appends an accepted/terminal pair. Compact once at
-    // the terminal boundary; orphaned accepted rows remain covered by the
-    // existing expiry sweeper.
+    let run_id = attempt.invocation_input.scope.run_id();
+    let insert = |statement: &'static str| {
+        let sql = matrixone_statement_with_null_shape(
+            statement,
+            [true, run_id.is_some(), terminal_status.is_some()],
+        );
+        sqlx::query(sql)
+            .bind(event_id.as_str())
+            .bind(&attempt.user_id)
+            .bind(&attempt.attempt_id)
+            .bind(&attempt.invocation_id)
+            .bind(session_id)
+            .bind(run_id)
+            .bind(stage.as_str())
+            .bind(terminal_status)
+            .bind(event_json.as_str())
+    };
+    let insert_error = |error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "insert model request context event",
+            error,
+        )
+    };
+    if stage == ModelRequestEventStage::Terminal {
+        // The next row fits unless there are already as many as the limit.
+        // A full scope falls through to the original append-and-prune path.
+        let inserted = insert(
+            "INSERT INTO model_request_context_events
+             (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
+              event_stage, terminal_status, event_json, created_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6)
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM model_request_context_events
+                 WHERE user_id = ? AND session_id = ? LIMIT 1 OFFSET ?
+             )",
+        )
+        .bind(&attempt.user_id)
+        .bind(session_id)
+        .bind(MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE - 1)
+        .execute(&mut *connection)
+        .await
+        .map_err(insert_error)?;
+        if inserted.rows_affected() == 1 {
+            return Ok(());
+        }
+    }
+    insert(
+        "INSERT INTO model_request_context_events
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
+          event_stage, terminal_status, event_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(insert_error)?;
     if stage == ModelRequestEventStage::Terminal {
         compact_model_request_context_scope(connection, &attempt.user_id, session_id).await?;
     }

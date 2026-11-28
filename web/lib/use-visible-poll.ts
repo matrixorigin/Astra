@@ -10,7 +10,7 @@ type UseVisiblePollOptions = {
   refresh: () => Promise<boolean>;
 };
 
-/** Run one sequential, jittered poll loop while the document is visible. */
+/** Run a sequential, jittered poll loop while visible. */
 export function useVisiblePoll({
   enabled,
   intervalMs,
@@ -52,13 +52,7 @@ export function useVisiblePoll({
     };
 
     async function run() {
-      if (
-        cancelled ||
-        inFlight ||
-        document.visibilityState !== "visible"
-      ) {
-        return;
-      }
+      if (cancelled || inFlight || document.visibilityState !== "visible") return;
       inFlight = true;
       let succeeded = false;
       try {

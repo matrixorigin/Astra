@@ -274,19 +274,24 @@ primary navigation model.
 Initial reads remain bounded and revision-pinned: paginate the Work catalog,
 load only the first task-graph page for first paint, and fetch later pages on
 demand. Activity, transcript, branch control, provider health, and task graph
-may advance on separate durable cursors/revisions; the UI must label freshness
-per projection and recover retention gaps with a bounded snapshot. They must
-not scan all events or rebuild the entire Work view for every task update. The
-owner-scoped Server activity read discovers Runs started by other surfaces; a
-local Web composer flag is not evidence that a Run is active. Each visible Work
-detail page polls one exact branch about every 1.2 seconds and its Work event
-head about every 2 seconds while active (10 seconds while idle), so a quiet page
-can discover a Run started elsewhere and a Work started from TUI or another
-Edge can trigger a bounded server snapshot refresh. The latest `/now` page refreshes its first
-20-entry keyset page about every 10 seconds; older pages do not poll. Task graph
-refresh remains bounded to its first page while a Run can change it. Hidden tabs
-pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
-obsolete branch results, and never overlaps polls within a page.
+may advance on separate durable cursors/revisions. The UI labels freshness per
+projection and recovers retention gaps with a bounded snapshot. The Work
+detail page reads the selected branch's root Run activity and its Work's event
+head in one request. It checks about every two seconds while active and every
+ten seconds while idle. A Run started from another surface is visible through
+the same read, and a newer event head triggers a bounded snapshot refresh.
+The detail snapshot reads up to 12 recent semantic events in one bounded
+request. The latest `/now` page refreshes its first 20-entry keyset page about
+every 10 seconds and groups pending decisions using their count. Work detail
+refreshes its task graph while the Run is active. A newly observed Run pause
+position triggers one graph reconciliation, even when the Work event head
+stays the same. If another client archives the selected branch, the page
+refreshes the route and stops observing the old branch. When the Run becomes inactive, an observed running
+or waiting attempt still gets a quiet reconciliation read every 30 seconds
+until its state catches up. Quiescent detail views use the Work
+event head to invalidate the snapshot. Hidden tabs pause refresh. Each visible
+poll loop runs sequentially with jitter and bounded backoff. Work observation
+requests time out after 15 seconds, and obsolete branch results are discarded.
 
 The TUI uses its existing typed Work receipts for live projection and graph
 invalidation, with a 30-second reconciliation interval for a bound session or
@@ -458,9 +463,9 @@ until that execution has settled.
   while visible. Opening a Work loads bounded, revision-pinned Server
   projections, attaches a read-only branch view, and reads the selected
   branch's authoritative activity. Visible Work pages discover remote Run
-  activity with an owner-scoped single-branch read about every 1.2 seconds;
-  active task graphs refresh their first bounded page every 2 seconds even for
-  TUI-originated Runs. Both
+  activity with an owner-scoped single-branch read about every 2 seconds while
+  active and every 10 seconds while idle. Active task graphs refresh their
+  first bounded page about every 2 seconds even for TUI-originated Runs. Both
   loops pause in hidden tabs, add jitter, back off after errors, and avoid
   overlapping requests. The Web page uses one stable read-attachment identity
   per browser instance and Work/branch, and renews it on projection refresh, so

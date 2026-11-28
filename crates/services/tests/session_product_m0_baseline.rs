@@ -204,7 +204,6 @@ fn m0_baseline_has_independent_complete_ledgers_and_fixed_decisions() {
             "GoalRevision",
             "GraphRevision",
             "ItemRevision",
-            "ReadReceipt",
             "Work",
             "WorkBranch",
             "WorkEvent",

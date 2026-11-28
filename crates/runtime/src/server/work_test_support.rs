@@ -20,7 +20,6 @@ pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("work_item_attempts", "owner_id"),
         ("work_establishment_operations", "owner_id"),
         ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
         ("work_event_sequences", "owner_id"),
         ("work_current_gap_acceptances", "owner_id"),
         ("work_acceptance_decisions", "owner_id"),
