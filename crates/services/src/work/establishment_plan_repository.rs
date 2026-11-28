@@ -123,9 +123,9 @@ pub(super) async fn load_graph_mutation_barrier(
         );
         query
             .push_bind(owner.as_str())
-            .push(" AND g.work_id = ")
+            .push(" AND work_id = ")
             .push_bind(snapshot.basis().work_id.as_str())
-            .push(" AND g.patch_ref IN (");
+            .push(" AND patch_ref IN (");
         let mut ids = query.separated(", ");
         for id in &proposal_ids {
             ids.push_bind(id.as_str());
