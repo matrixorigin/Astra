@@ -624,6 +624,39 @@ test("DONE closes an otherwise open HTTP body and releases its reader", async ()
   }
 });
 
+test.each(["live", "replay"] as const)(
+  "%s observation finishes at DONE while another consumer keeps the response open",
+  async (mode) => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("id: 7\ndata: [DONE]\n\n"));
+      },
+    });
+    const [body, otherConsumer] = source.tee();
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(body));
+    const client = new AstraClient({ baseUrl: "https://example.test" });
+    const states: ConnectionState[] = [];
+    const live = mode === "live" ? client.streamChat(
+      { message: "continue", modelSelection: { offeringId: "fixture" } },
+      { onEvent: () => {}, onStateChange: state => states.push(state) },
+    ) : undefined;
+    const onReplay = vi.fn();
+    const replay = mode === "replay" ? client.getRunEventReplay("r1").then(onReplay) : undefined;
+    try {
+      await vi.waitFor(() => {
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+        if (live) expect(states.at(-1)).toBe("disconnected");
+        else expect(onReplay).toHaveBeenCalledWith({ events: [], nextEventIndex: 7 });
+        expect(body.locked).toBe(false);
+      });
+    } finally {
+      live?.close();
+      await otherConsumer.cancel();
+      await replay;
+    }
+  },
+);
+
 test("a POST HTTP408 remains unconfirmed and is never automatically replayed", async () => {
   globalThis.fetch = vi.fn().mockResolvedValue(new Response("Gateway did not confirm the turn", { status: 408 }));
   const events: StreamEvent[] = [];
