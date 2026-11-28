@@ -948,7 +948,7 @@ async fn load_item_verifications(
                            c.coverage_state, c.evidence_ref_count,
                            DATE_FORMAT(c.produced_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS produced_at,
                            DATE_FORMAT(c.expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS expires_at,
-                           s.graph_revision AS current_subject_graph_revision,
+                           b.subject_graph_revision AS current_subject_graph_revision,
                            b.subject_ref AS current_subject_ref,
                            b.subject_revision AS current_subject_revision
                     FROM work_check_runs c
